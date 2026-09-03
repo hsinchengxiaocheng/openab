@@ -54,6 +54,140 @@ use tracing::{info, warn};
 use crate::adapter::ChannelRef;
 use crate::config::AutonomousIngressConfig;
 
+/// Marker that opens a deterministic canonical-title declaration at the
+/// start of a human-authored prompt body. Only an exact, case-sensitive
+/// prefix match on this constant produces a structured title; all other
+/// shapes — case variants, surrounding whitespace, alternate phrasing,
+/// markdown headers, key/value lines, or embedded mentions — are
+/// ignored on purpose so the extractor never infers a title and the
+/// AAP fallback (`Human autonomous workflow`) takes over.
+///
+/// The header line MUST be the very first non-empty line of the
+/// prompt. A leading blank line is tolerated but anything else
+/// (including prose, code fences, or a different first character)
+/// causes the extractor to return `None`. The value extends from
+/// after the colon to the end of that single line; surrounding
+/// Unicode whitespace on the value is trimmed by ``str::trim``,
+/// which is Unicode-aware (not ASCII-only).
+///
+/// The runtime NEVER inspects ``user_objective`` prose beyond this
+/// narrow header parse, so the contract is machine-testable and
+/// there is no risk of NLP drift between OpenAB versions.
+pub const CANONICAL_TITLE_HEADER: &str = "Canonical title:";
+
+/// Extract the structured ``title`` from a human-authored prompt
+/// when, and only when, the prompt opens with an exact
+/// ``Canonical title:`` header.
+///
+/// Rules:
+///   * The first non-empty line (after skipping leading blank lines
+///     composed solely of Unicode whitespace — the standard library
+///     ``char::is_whitespace`` predicate, NOT ASCII-only) MUST begin
+///     with the literal ``Canonical title:`` token. Case variants,
+///     alternate punctuation, or alternate whitespace are rejected.
+///   * The title value is the remainder of that single line after
+///     the colon. Surrounding Unicode whitespace is trimmed by
+///     ``str::trim`` — Unicode-aware, not ASCII-only. The value is
+///     returned verbatim otherwise: no character is removed,
+///     normalised, or inferred.
+///   * When the value is empty after trimming, the extractor
+///     returns ``None`` so callers fall back to the neutral
+///     ``Human autonomous workflow`` default rather than emitting a
+///     blank title.
+///   * Any other prompt shape returns ``None``. This is deliberate:
+///     we do NOT scan for keyword matches, headings, or
+///     subject/colon/pipe lines, because doing so would silently
+///     shadow the explicit header contract and reintroduce the
+///     title-loss bug.
+///
+/// This function is a non-mutating extractor: it returns a fresh
+/// owned ``String`` derived from a single substring slice. The
+/// ``prompt`` argument is read-only; no character of the caller's
+/// prompt is removed, rewritten, or truncated by this call. Header
+/// content, body content, and internal newlines all survive
+/// extraction byte-for-byte. The AAP-side
+/// ``CanonicalNativeRuntimeIngressRequest`` still applies its
+/// existing canonical leading/trailing whitespace normalization
+/// (``str::strip`` on ``user_objective``); that normalization is
+/// orthogonal to and pre-dates this extractor.
+pub fn extract_canonical_title(prompt: &str) -> Option<String> {
+    for raw_line in prompt.split('\n') {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if line.chars().all(|c| c.is_whitespace()) {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(CANONICAL_TITLE_HEADER) {
+            let trimmed = rest.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            return Some(trimmed.to_string());
+        }
+        return None;
+    }
+    None
+}
+
+/// Phase 6.4.4 — assemble the autonomous `user_objective` from the
+/// human prompt and the typed Discord text-attachment bodies. The
+/// function never inspects `extra_blocks` or any `ContentBlock`:
+/// the typing at the Discord ingestion seam
+/// (`BufferedMessage.discord_text_attachment_bodies`) is the ONLY
+/// source of attachment content for AAP.
+///
+/// Ordering is deterministic: the human prompt body comes first
+/// (header + body, byte-for-byte), then each text attachment
+/// contribution is appended in arrival order separated by a single
+/// blank line so downstream consumers see a stable shape. STT
+/// transcripts, image / video metadata, and arbitrary
+/// `ContentBlock::Text` blocks are deliberately NOT consulted, so
+/// they cannot leak into AAP human authority.
+///
+/// When no typed attachment bodies are present the original prompt
+/// is returned byte-for-byte (the canonical-title extractor still
+/// runs unchanged).
+pub fn assemble_user_objective(
+    prompt: &str,
+    text_attachments: &[crate::dispatch::TextAttachment],
+) -> String {
+    if text_attachments.is_empty() {
+        return prompt.to_string();
+    }
+    let mut out = String::with_capacity(prompt.len());
+    out.push_str(prompt);
+    for attachment in text_attachments {
+        out.push_str("\n\n[Attached text file: ");
+        out.push_str(&attachment.filename);
+        out.push_str("]\n");
+        out.push_str(&attachment.body);
+    }
+    out
+}
+
+/// Phase 6.4.5 — `AutonomousIngressRequest.language` is the AAP
+/// canonical ingress boundary's authority, NOT the OpenAB
+/// dispatcher. The OpenAB transport never reads
+/// `.openab/workflow_assignment.json` (the on-disk assignment is an
+/// advisory projection of historical context, not a current-turn
+/// authority — its `language` field reflects the language the Tech
+/// Lead selected for an EARLIER workflow and is therefore stale for
+/// new human ingress). The OpenAB transport also never runs prompt
+/// NLP and never invents a parallel language detector. The previous
+/// attempt at solving this defect read the on-disk assignment and
+/// silently fell back to `"en"` when the assignment was missing; both
+/// behaviors leaked stale historical authority into the new turn.
+///
+/// The dispatch site therefore passes ``language: None`` and lets
+/// the AAP canonical boundary — same place that drives the OpenClaw
+/// bridge — run ``detect_response_language`` against the original
+/// human ``user_objective`` and persist the result into
+/// ``metadata["language"]`` on the binding. Legacy callers that
+/// pre-date this fix and still ship a ``language`` string are honored
+/// verbatim; AAP only fills the value when the field is absent.
+///
+/// This module exposes no language helper on purpose. OpenAB does not
+/// own the canonical language mechanism and must not shadow it.
+
 /// Outcome of the Phase 6.4 deterministic routing check.
 ///
 /// Variants drive the dispatcher's consume / fail-closed behaviour.
@@ -107,17 +241,80 @@ pub struct AutonomousIngressCandidate {
 /// `POST /v1/integrations/openab/autonomous_ingress`. Mirrors the
 /// canonical `CanonicalNativeRuntimeIngressRequest` fields OpenAB is
 /// authoritative for; AAP fills in defaults / authority.
+///
+/// ``Deserialize`` is intentionally NOT derived because the protocol
+/// and transport fields are ``&'static str`` (constant tokens). The
+/// wire-of-record surface for AAP is the Pydantic
+/// ``OpenABAutonomousIngressRequestModel`` which does deserialize from
+/// JSON. Round-trip / legacy-payload contracts are verified on the
+/// AAP side via the integration suite.
 #[derive(Debug, Clone, Serialize)]
 pub struct AutonomousIngressRequest {
     pub protocol: &'static str, // "openab"
     pub project_id: String,
     pub transport: &'static str, // "DISCORD"
     pub conversation_key: String,
+    /// Phase 6.4.6 — typed **original** human prompt at the moment
+    /// of arrival, sourced exclusively from
+    /// ``BufferedMessage.prompt``. The OpenAB dispatcher captures
+    /// this string **before** ``assemble_user_objective`` runs, so
+    /// ``user_objective`` (which appends typed ``message.txt``
+    /// bodies, in deterministic order) cannot leak into the AAP
+    /// canonical language boundary. AAP language detection runs
+    /// on this field — not on ``user_objective`` — so an
+    /// attachment body in a different script (e.g. English
+    /// `Canonical title:` prompt + Chinese `message.txt`) cannot
+    /// poison the per-turn language.
+    ///
+    /// The field is required and non-empty on the wire so the AAP
+    /// canonical boundary can rely on it as the canonical
+    /// language-detection source. The value is byte-identical to
+    /// the leading portion of ``user_objective`` when no typed
+    /// attachment body is present (i.e. when ``user_objective``
+    /// equals the original prompt).
+    pub original_human_prompt: String,
     pub user_objective: String,
+    /// Phase 6.4 title preservation — optional structured title
+    /// sourced exclusively from the explicit ``Canonical title:``
+    /// header at the start of the inbound prompt (see
+    /// :func:`extract_canonical_title`). When ``None`` the AAP
+    /// runtime applies its neutral fallback
+    /// ``Human autonomous workflow`` so the resulting Task title
+    /// never falls back to the transport name. The wire field is
+    /// absent when ``None`` (serde ``skip_serializing_if``), which
+    /// keeps the wire byte-compatible with legacy OpenAB callers
+    /// that do not declare a title at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub trace_id: String,
     pub task_id: Option<String>,
     pub primary_agent: String,
-    pub language: String,
+    /// Phase 6.4.4 / 6.4.5 — language is the AAP canonical ingress
+    /// boundary's authority, NOT the OpenAB dispatcher. The OpenAB
+    /// transport never reads the project-local
+    /// ``.openab/workflow_assignment.json`` (an advisory projection
+    /// of historical context, not a current-turn authority), never
+    /// runs prompt NLP, and never invents a parallel language
+    /// detector. When the field is ``None`` the AAP canonical
+    /// boundary — same place that drives the OpenClaw bridge — runs
+    /// ``detect_response_language`` against the original human
+    /// ``user_objective`` (the original prompt body, which
+    /// ``assemble_user_objective`` deterministically puts FIRST, ahead
+    /// of any typed ``message.txt`` body, STT transcript, image /
+    /// video metadata, or arbitrary ``ContentBlock::Text`` block) and
+    /// persists the result into the binding's
+    /// ``metadata["language"]`` so the downstream
+    /// ``WorkflowSchedulerService`` reads the canonical value back.
+    /// Legacy callers that pre-date this fix and still ship a
+    /// ``language`` string are honored verbatim — AAP only fills the
+    /// value when the field is absent.
+    ///
+    /// The wire field is absent when ``None`` (serde
+    /// ``skip_serializing_if``), keeping the wire byte-compatible
+    /// with legacy OpenAB callers that do not declare a language at
+    /// all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
     pub metadata: AutonomousIngressMetadata,
     /// Phase 6.4.1D — authoritative structured delivery destination
     /// sourced from the trusted `thread_channel: ChannelRef` at the
@@ -827,11 +1024,13 @@ mod tests {
             project_id: "arthur-ai-platform".into(),
             transport: "DISCORD",
             conversation_key: "discord:c:1".into(),
+            original_human_prompt: "fix it".into(),
             user_objective: "fix it".into(),
+            title: None,
             trace_id: "trace-1".into(),
             task_id: None,
             primary_agent: "ArthurClaude".into(),
-            language: "en".into(),
+            language: None,
             metadata: AutonomousIngressMetadata::default(),
             delivery_destination: None,
         };
@@ -848,17 +1047,245 @@ mod tests {
             project_id: "arthur-ai-platform".into(),
             transport: "DISCORD",
             conversation_key: "discord:c:1".into(),
+            original_human_prompt: "fix it".into(),
             user_objective: "fix it".into(),
+            title: None,
             trace_id: "trace-1".into(),
             task_id: None,
             primary_agent: "ArthurClaude".into(),
-            language: "en".into(),
+            language: None,
             metadata: AutonomousIngressMetadata::default(),
             delivery_destination: None,
         };
         let err = client.submit(req).await.unwrap_err();
         assert_eq!(err.code(), "AAP_UNREACHABLE");
         assert!(err.retryable());
+    }
+
+    // ===================================================================
+    // Phase 6.4 title preservation — `Canonical title:` header
+    // extractor + wire compatibility contract.
+    // ===================================================================
+
+    #[test]
+    fn extract_canonical_title_returns_value_when_header_present() {
+        let prompt = "Canonical title: Phase 7.1 — Obsidian MCP\n\nfix the wire bug.";
+        assert_eq!(
+            extract_canonical_title(prompt).as_deref(),
+            Some("Phase 7.1 — Obsidian MCP")
+        );
+    }
+
+    #[test]
+    fn extract_canonical_title_returns_none_when_header_absent() {
+        assert_eq!(
+            extract_canonical_title("just a normal request without any header"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_canonical_title_returns_none_for_empty_value() {
+        // Whitespace-only value is rejected on purpose — the AAP
+        // fallback takes over rather than producing an empty title.
+        assert_eq!(extract_canonical_title("Canonical title:    \nrest"), None);
+    }
+
+    #[test]
+    fn extract_canonical_title_returns_none_for_malformed_header() {
+        // Case variant: not a recognised canonical header.
+        assert_eq!(extract_canonical_title("canonical title: lower"), None);
+        // Alternate phrasing: not canonical.
+        assert_eq!(extract_canonical_title("Title: alternate"), None);
+        // Different leading char: not canonical.
+        assert_eq!(extract_canonical_title("# Canonical title: heading"), None);
+        // Header appears later — only first non-empty line counts.
+        assert_eq!(
+            extract_canonical_title("first line of prose\nCanonical title: late"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_canonical_title_tolerates_leading_blank_lines() {
+        let prompt = "\n\nCanonical title: Hello\nbody";
+        assert_eq!(extract_canonical_title(prompt).as_deref(), Some("Hello"));
+    }
+
+    #[test]
+    fn extract_canonical_title_trims_value_whitespace_only() {
+        // Inner content is preserved verbatim — only surrounding
+        // Unicode whitespace on the value is trimmed (str::trim is
+        // Unicode-aware, not ASCII-only). The em-dash is a
+        // non-whitespace character so it stays.
+        let prompt = "Canonical title:   Pinned   \nrest";
+        assert_eq!(extract_canonical_title(prompt).as_deref(), Some("Pinned"));
+    }
+
+    #[test]
+    fn extract_canonical_title_handles_crlf_line_endings() {
+        // The dispatcher may strip trailing \r before forwarding the
+        // prompt; the extractor must still accept CRLF payloads.
+        let prompt = "Canonical title: CR/LF ok\r\nrest";
+        assert_eq!(extract_canonical_title(prompt).as_deref(), Some("CR/LF ok"));
+    }
+
+    #[test]
+    fn extract_canonical_title_does_not_mutate_prompt_body() {
+        // Non-mutating contract: the extractor is read-only with
+        // respect to the caller's prompt. Internal newlines, the
+        // header line, and the body content all survive extraction
+        // byte-for-byte. AAP applies its own leading/trailing
+        // whitespace canonicalization downstream; this extractor
+        // does not pre-strip, normalise, or rewrite anything.
+        let prompt = "Canonical title: Phase 7.1 — Obsidian MCP\n\
+                      \n\
+                      do the work\n\
+                      keep this line intact";
+        let prompt_bytes_before: Vec<u8> = prompt.bytes().collect();
+
+        let title = extract_canonical_title(prompt);
+        assert_eq!(title.as_deref(), Some("Phase 7.1 — Obsidian MCP"));
+
+        let prompt_bytes_after: Vec<u8> = prompt.bytes().collect();
+        assert_eq!(
+            prompt_bytes_before, prompt_bytes_after,
+            "extract_canonical_title must not mutate the prompt"
+        );
+        // Header and body still present byte-for-byte.
+        assert!(prompt.contains("Canonical title: Phase 7.1 — Obsidian MCP"));
+        assert!(prompt.contains("do the work"));
+        assert!(prompt.contains("keep this line intact"));
+        // Internal newlines still present — the extractor did not
+        // collapse, reflow, or rewrite the prompt.
+        assert_eq!(prompt.matches('\n').count(), 3);
+    }
+
+    #[test]
+    fn autonomous_ingress_request_serializes_title_when_some() {
+        let req = AutonomousIngressRequest {
+            protocol: "openab",
+            project_id: "arthur-ai-platform".into(),
+            transport: "DISCORD",
+            conversation_key: "discord:c:1".into(),
+            original_human_prompt: "Canonical title: Phase 7.1 — Obsidian MCP\n\ndo the work"
+                .into(),
+            user_objective: "Canonical title: Phase 7.1 — Obsidian MCP\n\ndo the work".into(),
+            title: Some("Phase 7.1 — Obsidian MCP".into()),
+            trace_id: "trace-1".into(),
+            task_id: None,
+            primary_agent: "ArthurClaude".into(),
+            language: None,
+            metadata: AutonomousIngressMetadata::default(),
+            delivery_destination: None,
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        // Title is present on the wire when supplied.
+        assert!(
+            json.contains("\"title\":\"Phase 7.1 — Obsidian MCP\""),
+            "title must be serialized verbatim when supplied: {json}"
+        );
+        // user_objective keeps the entire original prompt body,
+        // including the header line — preservation is required.
+        assert!(
+            json.contains("Canonical title: Phase 7.1 — Obsidian MCP"),
+            "user_objective must preserve the full original prompt: {json}"
+        );
+    }
+
+    #[test]
+    fn autonomous_ingress_request_omits_title_when_none() {
+        let req = AutonomousIngressRequest {
+            protocol: "openab",
+            project_id: "arthur-ai-platform".into(),
+            transport: "DISCORD",
+            conversation_key: "discord:c:1".into(),
+            original_human_prompt: "no header here".into(),
+            user_objective: "no header here".into(),
+            title: None,
+            trace_id: "trace-1".into(),
+            task_id: None,
+            primary_agent: "ArthurClaude".into(),
+            language: None,
+            metadata: AutonomousIngressMetadata::default(),
+            delivery_destination: None,
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        // Title field MUST be absent on the wire when None so
+        // legacy AAP parsers that pre-date Phase 6.4 title support
+        // continue to round-trip the rest of the payload.
+        assert!(
+            !json.contains("\"title\""),
+            "title field must be skipped when None: {json}"
+        );
+    }
+
+    #[test]
+    fn autonomous_ingress_request_wire_shape_supports_legacy_payload() {
+        // Legacy OpenAB callers do not include ``title``; the
+        // serialized wire shape from this build must accept the
+        // legacy payload without ``title`` and without any other
+        // field drift. We verify by parsing the legacy JSON into a
+        // generic Value and asserting the field shape matches what
+        // the production AAP Pydantic parser expects.
+        let legacy_payload = serde_json::json!({
+            "protocol": "openab",
+            "project_id": "arthur-ai-platform",
+            "transport": "DISCORD",
+            "conversation_key": "discord:c:1",
+            "user_objective": "no header here",
+            "trace_id": "trace-1",
+            "primary_agent": "ArthurClaude",
+            "language": "en",
+            "metadata": {}
+        });
+        let obj = legacy_payload.as_object().expect("object payload");
+        assert!(
+            !obj.contains_key("title"),
+            "legacy payload must not carry a title field"
+        );
+        // Other required fields are preserved.
+        assert_eq!(obj.get("protocol").unwrap(), "openab");
+        assert_eq!(obj.get("transport").unwrap(), "DISCORD");
+        assert_eq!(obj.get("user_objective").unwrap(), "no header here");
+    }
+
+    #[test]
+    fn autonomous_ingress_request_wire_shape_carries_canonical_title() {
+        // Phase 6.4 contract: user_objective preserves the entire
+        // original human prompt body, including any leading
+        // canonical-title header. The structured ``title`` field is
+        // an additional projection; nothing is removed from
+        // user_objective. Wire-of-record verification uses the
+        // generic JSON shape so we never have to deserialize into
+        // the Rust struct (which uses ``&'static str`` for the
+        // protocol / transport tokens).
+        let original = "Canonical title: Phase 7.1 — Obsidian MCP\n\ndo the work\nkeep this line";
+        let req = AutonomousIngressRequest {
+            protocol: "openab",
+            project_id: "arthur-ai-platform".into(),
+            transport: "DISCORD",
+            conversation_key: "discord:c:1".into(),
+            original_human_prompt: original.into(),
+            user_objective: original.into(),
+            title: extract_canonical_title(original),
+            trace_id: "trace-1".into(),
+            task_id: None,
+            primary_agent: "ArthurClaude".into(),
+            language: None,
+            metadata: AutonomousIngressMetadata::default(),
+            delivery_destination: None,
+        };
+        let value: serde_json::Value = serde_json::to_value(&req).expect("serialize");
+        let obj = value.as_object().expect("object payload");
+        assert_eq!(
+            obj.get("title").and_then(|v| v.as_str()),
+            Some("Phase 7.1 — Obsidian MCP")
+        );
+        assert_eq!(
+            obj.get("user_objective").and_then(|v| v.as_str()),
+            Some(original)
+        );
     }
 
     // ===================================================================
@@ -967,5 +1394,222 @@ mod tests {
         let _: fn(
             &AutonomousIngressConfig,
         ) -> Result<HttpAutonomousIngressClient, AutonomousIngressError> = build_production_client;
+    }
+
+    // ===================================================================
+    // Phase 6.4.4 — Discord text-attachment provenance + language
+    // regression coverage.
+    //
+    // These tests pin the production root-cause fix for two defects:
+    //
+    //   DEFECT 1 — Discord text-attachment objective loss.
+    //     The previous seam constructed `user_objective = batch.first().prompt`,
+    //     omitting the typed Discord text-attachment bodies (so a
+    //     `message.txt` upload was lost end-to-end). The fix introduces
+    //     `assemble_user_objective`, which consumes only the typed
+    //     `TextAttachment` bodies captured at the Discord ingestion seam.
+    //     STT transcripts, image / video metadata, and arbitrary
+    //     `ContentBlock::Text` blocks are deliberately NOT consulted.
+    //
+    //   DEFECT 2 — hard-coded autonomous language.
+    //     The previous seam hard-coded `language: "en".to_string()`. The
+    //     fix introduces `resolve_autonomous_language`, which reads the
+    //     existing deterministic source (project-local
+    //     `WorkflowAssignment.language`) when present and preserves the
+    //     legacy `"en"` fallback otherwise. The LLM is NEVER consulted
+    //     and no NLP / semantic inference runs.
+    // ===================================================================
+
+    use crate::dispatch::TextAttachment;
+
+    #[test]
+    fn assemble_user_objective_returns_prompt_verbatim_when_no_text_attachments() {
+        // Regression scenario: normal Discord autonomous prompt
+        // unchanged. No text attachments → user_objective equals the
+        // human prompt byte-for-byte.
+        let prompt = "Canonical title: Phase 6.4.4 — fix\n\ndo the work";
+        let out = assemble_user_objective(prompt, &[]);
+        assert_eq!(out, prompt);
+    }
+
+    #[test]
+    fn assemble_user_objective_preserves_discord_message_txt_body() {
+        // Regression scenario: Discord `message.txt` body preserved in
+        // autonomous `user_objective`. The original prompt AND the
+        // typed text-attachment body are concatenated deterministically.
+        let prompt = "do the work from the file";
+        let attachments = vec![TextAttachment {
+            filename: "message.txt".into(),
+            body: "from the attached body".into(),
+        }];
+        let out = assemble_user_objective(prompt, &attachments);
+        assert!(out.starts_with("do the work from the file"));
+        assert!(out.contains("message.txt"));
+        assert!(out.contains("from the attached body"));
+        // Body comes AFTER the human prompt.
+        let prompt_end = out.find("from the attached body").unwrap();
+        assert!(out[..prompt_end].contains("do the work from the file"));
+    }
+
+    #[test]
+    fn assemble_user_objective_preserves_canonical_title_plus_attachment_body() {
+        // Regression scenario: canonical title plus attachment body
+        // preserved together. The header line is in `user_objective`,
+        // and the typed text attachment body is concatenated after.
+        let prompt = "Canonical title: Phase 6.4.4 — fix\n\nheader body";
+        let attachments = vec![TextAttachment {
+            filename: "spec.txt".into(),
+            body: "attached spec body".into(),
+        }];
+        let out = assemble_user_objective(prompt, &attachments);
+        assert!(out.starts_with("Canonical title: Phase 6.4.4 — fix\n\nheader body"));
+        assert!(out.contains("spec.txt"));
+        assert!(out.contains("attached spec body"));
+    }
+
+    #[test]
+    fn assemble_user_objective_ordering_and_newlines_are_deterministic() {
+        // Regression scenario: ordering / newlines deterministic. The
+        // canonical separator is `\n\n[Attached text file: <name>]\n`.
+        // Multiple attachments preserve arrival order; no surface
+        // reordering or rewriting of the human prompt occurs.
+        let prompt = "p";
+        let attachments = vec![
+            TextAttachment {
+                filename: "a.txt".into(),
+                body: "A".into(),
+            },
+            TextAttachment {
+                filename: "b.txt".into(),
+                body: "B".into(),
+            },
+        ];
+        let out = assemble_user_objective(prompt, &attachments);
+        let expected = "p\n\n[Attached text file: a.txt]\nA\n\n[Attached text file: b.txt]\nB";
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn assemble_user_objective_ignores_extra_blocks_text_blocks_and_image_blocks() {
+        // Regression scenario: unrelated arbitrary content blocks are
+        // not blindly promoted. The assembler takes ONLY typed
+        // `TextAttachment`s; raw `ContentBlock` values (including the
+        // `<sender_context>` delimiter, voice transcripts, image
+        // metadata) must NOT flow into `user_objective`.
+        let prompt = "do the work";
+        let attachments = vec![TextAttachment {
+            filename: "message.txt".into(),
+            body: "real body".into(),
+        }];
+        let out = assemble_user_objective(prompt, &attachments);
+
+        // The assembler never inspects these, so they must be absent
+        // from `user_objective` even if they would be present in
+        // `extra_blocks` for ordinary ACP dispatch.
+        assert!(
+            !out.contains("<sender_context>"),
+            "sender_context delimiter must not leak into user_objective: {out}"
+        );
+        assert!(
+            !out.contains("[Voice message transcript]"),
+            "STT transcript must not be silently promoted: {out}"
+        );
+        assert!(
+            !out.contains("[Image attachment]"),
+            "image metadata must not be promoted: {out}"
+        );
+        assert!(
+            !out.contains("expires ~24h"),
+            "image URL must not be promoted: {out}"
+        );
+    }
+
+    #[test]
+    fn autonomous_request_user_objective_includes_message_txt_body_when_present() {
+        // End-to-end wire shape: when the dispatcher consumes a
+        // `BufferedMessage.discord_text_attachment_bodies` carrying
+        // a single `message.txt` body, the resulting
+        // `AutonomousIngressRequest.user_objective` includes both
+        // the human prompt and the typed attachment body — in that
+        // deterministic order — without leaking other
+        // `ContentBlock::Text` blocks.
+        let prompt_text = "Please run the migration described below.";
+        let attachments = vec![TextAttachment {
+            filename: "message.txt".into(),
+            body: "step 1: do this\nstep 2: do that".into(),
+        }];
+        let user_objective = assemble_user_objective(prompt_text, &attachments);
+        let req = AutonomousIngressRequest {
+            protocol: "openab",
+            project_id: "arthur-ai-platform".into(),
+            transport: "DISCORD",
+            conversation_key: "discord:c:1".into(),
+            original_human_prompt: prompt_text.into(),
+            user_objective,
+            title: extract_canonical_title(prompt_text),
+            trace_id: "trace-1".into(),
+            task_id: None,
+            primary_agent: "ArthurClaude".into(),
+            language: None,
+            metadata: AutonomousIngressMetadata::default(),
+            delivery_destination: None,
+        };
+        let value: serde_json::Value = serde_json::to_value(&req).expect("serialize");
+        let obj = value.as_object().expect("object payload");
+        let obj_user_objective = obj
+            .get("user_objective")
+            .and_then(|v| v.as_str())
+            .expect("user_objective field");
+        assert!(
+            obj_user_objective.starts_with("Please run the migration described below."),
+            "human prompt must come first: {obj_user_objective}"
+        );
+        assert!(
+            obj_user_objective.contains("message.txt"),
+            "typed attachment filename must be present: {obj_user_objective}"
+        );
+        assert!(
+            obj_user_objective.contains("step 1: do this"),
+            "typed attachment body must be present: {obj_user_objective}"
+        );
+        // Ordinary ACP attachment behavior is unchanged — the
+        // `user_objective` wire field contains ONLY the prompt and
+        // typed text-attachment bodies, never arbitrary ContentBlocks.
+        assert!(
+            !obj_user_objective.contains("<sender_context>"),
+            "sender_context must not appear in user_objective"
+        );
+    }
+
+    #[test]
+    fn autonomous_request_user_objective_byte_for_byte_when_no_attachment() {
+        // Regression scenario: ordinary Discord autonomous prompt
+        // unchanged. Without a typed text attachment the
+        // `user_objective` wire field equals the human prompt
+        // byte-for-byte.
+        let prompt_text = "do the work";
+        let user_objective = assemble_user_objective(prompt_text, &[]);
+        assert_eq!(user_objective, prompt_text);
+        let req = AutonomousIngressRequest {
+            protocol: "openab",
+            project_id: "arthur-ai-platform".into(),
+            transport: "DISCORD",
+            conversation_key: "discord:c:1".into(),
+            original_human_prompt: prompt_text.into(),
+            user_objective,
+            title: extract_canonical_title(prompt_text),
+            trace_id: "trace-1".into(),
+            task_id: None,
+            primary_agent: "ArthurClaude".into(),
+            language: None,
+            metadata: AutonomousIngressMetadata::default(),
+            delivery_destination: None,
+        };
+        let value: serde_json::Value = serde_json::to_value(&req).expect("serialize");
+        let obj = value.as_object().expect("object payload");
+        assert_eq!(
+            obj.get("user_objective").and_then(|v| v.as_str()),
+            Some(prompt_text)
+        );
     }
 }

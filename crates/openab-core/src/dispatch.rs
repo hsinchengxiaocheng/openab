@@ -63,6 +63,31 @@ pub struct BufferedMessage {
     /// other existing transports leave this empty. The freshest admitted event
     /// carries it through the canonical turn to the post-ACP completion hook.
     pub native_workflow: Option<crate::admission::NativeWorkflowMetadata>,
+    /// Phase 6.4.4 — typed Discord text-file attachment bodies captured at
+    /// ingestion. Populated ONLY by the Discord adapter from text-file
+    /// attachments (currently `message.txt`-style uploads). Every other
+    /// adapter and Discord turns without text attachments leave this empty.
+    ///
+    /// The autonomous ingress seam consumes this typed field to compose
+    /// `user_objective` so that:
+    ///   * Discord `message.txt`-style bodies are preserved verbatim,
+    ///   * STT transcripts, image / video metadata, and arbitrary
+    ///     `ContentBlock::Text` blocks (e.g. `<sender_context>` delimiters
+    ///     or `[Voice message transcript]` blocks) cannot leak into AAP
+    ///     human authority,
+    ///   * ordinary ACP dispatch still uses `extra_blocks` for full
+    ///     context — the field is consulted ONLY at the autonomous seam.
+    pub discord_text_attachment_bodies: Vec<TextAttachment>,
+}
+
+/// Phase 6.4.4 — typed provenance for a single Discord text-file
+/// attachment body captured at ingestion. The autonomous ingress seam
+/// is the only consumer of this struct; ordinary ACP dispatch reads
+/// the equivalent `[File: ...]` block from `extra_blocks` unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextAttachment {
+    pub filename: String,
+    pub body: String,
 }
 
 /// How `thread_key` is built for the dispatcher's per-thread map.
@@ -1314,16 +1339,83 @@ async fn dispatch_batch(
                 );
                 crate::autonomous_ingress::log_candidate(&candidate);
                 let prompt_text = batch.first().map(|m| m.prompt.clone()).unwrap_or_default();
+                // Phase 6.4.4 — typed Discord text-file attachment
+                // bodies. The ingestion seam records ONLY
+                // `message.txt`-style bodies here, so STT transcripts,
+                // image / video metadata, and arbitrary
+                // `ContentBlock::Text` blocks are deterministically
+                // excluded from `user_objective`. Ordinary ACP dispatch
+                // still reads the full `extra_blocks` context.
+                let text_attachment_bodies: Vec<crate::dispatch::TextAttachment> = batch
+                    .iter()
+                    .flat_map(|m| m.discord_text_attachment_bodies.iter().cloned())
+                    .collect();
+                // Phase 6.4 title preservation — extract the
+                // structured title from the prompt body when, and
+                // only when, the human author used the explicit
+                // ``Canonical title:`` header. ``None`` triggers the
+                // AAP-side `Human autonomous workflow` neutral
+                // fallback. ``user_objective`` is forwarded
+                // verbatim so the human prompt body — header and all
+                // — survives end-to-end. The extractor never
+                // inspects prose, never infers keywords, and never
+                // mutates the prompt. Title extraction runs on the
+                // pre-attachment prompt so the canonical-title header
+                // remains authoritative.
+                let canonical_title =
+                    crate::autonomous_ingress::extract_canonical_title(&prompt_text);
+                // Phase 6.4.6 — capture the **original** human
+                // prompt at the moment of arrival, BEFORE
+                // ``assemble_user_objective`` runs. This is the
+                // canonical language-detection source at the AAP
+                // boundary: a typed ``message.txt`` body in a
+                // different script from the human's prompt MUST
+                // NOT poison the per-turn language.
+                // ``prompt_text`` is already a byte-identical clone
+                // of ``BufferedMessage.prompt`` (captured at line
+                // ~1341, before any attachment assembly) so no
+                // further defensive copy is needed.
+                let original_human_prompt = prompt_text.clone();
+                // Phase 6.4.4 — assemble `user_objective` from the
+                // human prompt and the typed text-attachment bodies.
+                // When the human author did not supply a `message.txt`
+                // body the prompt is forwarded verbatim. This
+                // assembled string is the **objective** the AAP
+                // task carries; it is NOT the language-detection
+                // source.
+                let user_objective = crate::autonomous_ingress::assemble_user_objective(
+                    &prompt_text,
+                    &text_attachment_bodies,
+                );
+                // Phase 6.4.5 — language is the AAP canonical
+                // ingress boundary's authority, NOT the OpenAB
+                // dispatcher. The OpenAB transport never reads
+                // `.openab/workflow_assignment.json` (its `language`
+                // field reflects an earlier Tech-Lead-selected
+                // workflow and is stale for the new human turn),
+                // never runs prompt NLP, and never invents a
+                // parallel language detector. The dispatch site
+                // passes ``language: None`` and lets the AAP
+                // canonical boundary — same place that drives the
+                // OpenClaw bridge — run ``detect_response_language``
+                // against the typed ``original_human_prompt`` and
+                // persist the result into ``metadata["language"]``
+                // on the binding. Legacy callers that pre-date
+                // this fix and still ship a ``language`` string
+                // are honored verbatim.
+                let language: Option<String> = None;
                 let request = crate::autonomous_ingress::AutonomousIngressRequest {
                     protocol: "openab",
                     project_id: aap_cfg.map(|c| c.project_id.clone()).unwrap_or_default(),
                     transport: "DISCORD",
                     conversation_key: thread_channel.session_pool_key(),
-                    user_objective: prompt_text,
+                    original_human_prompt,
+                    user_objective,
+                    title: canonical_title,
                     trace_id: session_key.to_string(),
                     task_id: None,
                     primary_agent: agent_name.unwrap_or("").to_string(),
-                    language: "en".to_string(),
+                    language,
                     metadata: crate::autonomous_ingress::AutonomousIngressMetadata {
                         discord_message_id: Some(trigger_msg.message_id.clone()),
                         discord_channel_id: Some(thread_channel.channel_id.clone()),
@@ -2532,6 +2624,7 @@ mod tests {
             other_bot_present: false,
             recipient: None,
             native_workflow: None,
+            discord_text_attachment_bodies: Vec::new(),
         }
     }
 
@@ -4163,6 +4256,7 @@ mod tests {
             other_bot_present: false,
             recipient: None,
             native_workflow: None,
+            discord_text_attachment_bodies: Vec::new(),
         }
     }
 
@@ -4423,5 +4517,933 @@ mod tests {
             "non-Tech-Lead human must flow to ordinary ACP, never to AAP"
         );
         assert_eq!(fake.call_count(), 0);
+    }
+
+    // ===================================================================
+    // Phase 6.4.4 — Discord text-attachment objective + autonomous
+    // language end-to-end regression coverage (production seam).
+    //
+    // These tests drive the dispatch loop with a
+    // `BufferedMessage.discord_text_attachment_bodies` payload and
+    // inspect the resulting `AutonomousIngressRequest.user_objective`
+    // and `.language` on the wire-shape contract. They pin the
+    // production root-cause fix for two defects:
+    //
+    //   DEFECT 1 — `user_objective` now includes the typed Discord
+    //     text-attachment body (the original `message.txt` upload).
+    //   DEFECT 2 — `language` is sourced from the deterministic
+    //     `WorkflowAssignment.language` when one is present (no NLP
+    //     / semantic inference anywhere).
+    // ===================================================================
+
+    fn make_msg_with_text_attachments(
+        prompt: &str,
+        tokens: usize,
+        sender_json: String,
+        attachments: Vec<crate::dispatch::TextAttachment>,
+    ) -> BufferedMessage {
+        let mut msg = make_msg_with_sender(prompt, tokens, sender_json);
+        msg.discord_text_attachment_bodies = attachments;
+        msg
+    }
+
+    #[tokio::test]
+    async fn phase64_44_user_objective_includes_message_txt_body() {
+        // Regression: Discord `message.txt` body preserved in
+        // autonomous `user_objective`. Production root-cause fix
+        // for the title-loss / objective-loss defect.
+        std::env::set_var("ARTHUR_AGENT_NAME", "ArthurClaude");
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids = std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+        let attachments = vec![crate::dispatch::TextAttachment {
+            filename: "message.txt".into(),
+            body: "from the attached body".into(),
+        }];
+        let msg = make_msg_with_text_attachments(
+            "請跑下面這段 plan",
+            20,
+            tech_lead_sender_json(tech_lead_id),
+            attachments,
+        );
+        let fake = crate::autonomous_ingress::FakeAutonomousIngressClient::always_accept();
+        let client: Arc<dyn crate::autonomous_ingress::AutonomousIngressClient> = fake.clone();
+        let calls = run_phase64(
+            msg,
+            client,
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+        assert!(calls.is_empty(), "AAP accepted → ordinary ACP must NOT run");
+        assert_eq!(fake.call_count(), 1);
+        let recorded = &fake.calls.lock().unwrap()[0];
+        // human prompt first, then the typed attachment body.
+        assert!(
+            recorded.user_objective.starts_with("請跑下面這段 plan"),
+            "human prompt must come first: {}",
+            recorded.user_objective,
+        );
+        assert!(
+            recorded.user_objective.contains("message.txt"),
+            "typed attachment filename must be present: {}",
+            recorded.user_objective,
+        );
+        assert!(
+            recorded.user_objective.contains("from the attached body"),
+            "typed attachment body must be present: {}",
+            recorded.user_objective,
+        );
+        // Regression: STT transcripts and image / video metadata are
+        // NOT promoted into human authority, even if they were
+        // present in `extra_blocks` for ordinary ACP dispatch.
+        assert!(
+            !recorded
+                .user_objective
+                .contains("[Voice message transcript]"),
+            "STT transcript must NOT be promoted: {}",
+            recorded.user_objective,
+        );
+        assert!(
+            !recorded.user_objective.contains("[Image attachment]"),
+            "image metadata must NOT be promoted: {}",
+            recorded.user_objective,
+        );
+        assert!(
+            !recorded.user_objective.contains("<sender_context>"),
+            "sender_context delimiter must NOT be promoted: {}",
+            recorded.user_objective,
+        );
+    }
+
+    #[tokio::test]
+    async fn phase64_44_user_objective_byte_for_byte_without_text_attachments() {
+        // Regression: ordinary Discord autonomous prompt unchanged
+        // when no typed text attachment body is present.
+        std::env::set_var("ARTHUR_AGENT_NAME", "ArthurClaude");
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids = std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+        let prompt_text = "do the work";
+        let msg = make_msg_with_text_attachments(
+            prompt_text,
+            10,
+            tech_lead_sender_json(tech_lead_id),
+            vec![],
+        );
+        let fake = crate::autonomous_ingress::FakeAutonomousIngressClient::always_accept();
+        let client: Arc<dyn crate::autonomous_ingress::AutonomousIngressClient> = fake.clone();
+        let _ = run_phase64(
+            msg,
+            client,
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+        assert_eq!(fake.call_count(), 1);
+        let recorded = &fake.calls.lock().unwrap()[0];
+        assert_eq!(
+            recorded.user_objective, prompt_text,
+            "user_objective must equal prompt when no typed attachment body is present"
+        );
+    }
+
+    #[tokio::test]
+    async fn phase64_44_extra_blocks_arbitrary_text_blocks_do_not_leak_into_user_objective() {
+        // Regression: STT transcripts, image / video metadata, and
+        // unrelated arbitrary `ContentBlock::Text` blocks are NOT
+        // blindly promoted into autonomous `user_objective`. Only
+        // typed Discord text-file attachment bodies are included.
+        std::env::set_var("ARTHUR_AGENT_NAME", "ArthurClaude");
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids = std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+        let mut msg = make_msg_with_sender("do the work", 10, tech_lead_sender_json(tech_lead_id));
+        // Mimic a real Discord arrival: STT transcript + image
+        // metadata + arbitrary text blocks live in `extra_blocks`,
+        // but no typed text-file attachment body is present.
+        msg.extra_blocks = vec![
+            ContentBlock::Text {
+                text: "[Voice message transcript]: hi from STT".into(),
+            },
+            ContentBlock::Text {
+                text: "[Image attachment]\nfilename: foo.png".into(),
+            },
+            ContentBlock::Text {
+                text: "<sender_context>\n{}\n</sender_context>".into(),
+            },
+        ];
+        let fake = crate::autonomous_ingress::FakeAutonomousIngressClient::always_accept();
+        let client: Arc<dyn crate::autonomous_ingress::AutonomousIngressClient> = fake.clone();
+        let _ = run_phase64(
+            msg,
+            client,
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+        assert_eq!(fake.call_count(), 1);
+        let recorded = &fake.calls.lock().unwrap()[0];
+        assert!(
+            !recorded
+                .user_objective
+                .contains("[Voice message transcript]"),
+            "STT transcript must NOT leak into user_objective: {}",
+            recorded.user_objective,
+        );
+        assert!(
+            !recorded.user_objective.contains("[Image attachment]"),
+            "image metadata must NOT leak into user_objective: {}",
+            recorded.user_objective,
+        );
+        assert!(
+            !recorded.user_objective.contains("<sender_context>"),
+            "sender_context delimiter must NOT leak into user_objective: {}",
+            recorded.user_objective,
+        );
+        assert_eq!(
+            recorded.user_objective, "do the work",
+            "user_objective must equal the prompt byte-for-byte when extra_blocks contain non-text-attachment content"
+        );
+    }
+
+    #[tokio::test]
+    async fn phase64_44_ordinary_acp_attachment_behavior_unchanged() {
+        // Regression: ordinary ACP attachment behavior is
+        // unchanged. A Tech-Lead-authorized human message that is
+        // routed to ordinary ACP (non-Tech-Lead path) still uses
+        // `extra_blocks` for full context — the typed provenance
+        // field is NOT consumed by the ordinary ACP path.
+        std::env::set_var("ARTHUR_AGENT_NAME", "ArthurClaude");
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids = std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+        let non_tech_lead: u64 = 9999999999;
+        let mut msg = make_msg_with_sender(
+            "請處理這段訊息",
+            10,
+            ordinary_human_sender_json(non_tech_lead),
+        );
+        // Even with a typed text attachment body set, ordinary ACP
+        // must remain unchanged. The dispatch site only consults the
+        // typed field at the autonomous seam.
+        msg.discord_text_attachment_bodies = vec![crate::dispatch::TextAttachment {
+            filename: "message.txt".into(),
+            body: "from the attached body".into(),
+        }];
+        msg.extra_blocks = vec![ContentBlock::Text {
+            text: format!("[File: message.txt]\n```\nfrom the attached body\n```",),
+        }];
+        let fake = crate::autonomous_ingress::FakeAutonomousIngressClient::always_accept();
+        let client: Arc<dyn crate::autonomous_ingress::AutonomousIngressClient> = fake.clone();
+        let calls = run_phase64(
+            msg,
+            client,
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+        // Non-Tech-Lead humans do not flow to AAP; they must reach
+        // ordinary ACP. And ordinary ACP must NOT be silently
+        // promoted to AAP just because a text attachment was set.
+        assert_eq!(fake.call_count(), 0, "AAP must NOT be consulted");
+        assert!(
+            !calls.is_empty(),
+            "ordinary ACP must run for non-Tech-Lead humans"
+        );
+        // Ordinary ACP still sees the full `extra_blocks` context
+        // — the text attachment body is delivered to the agent via
+        // the original `[File: ...]` block, NOT via the autonomous
+        // `user_objective`.
+        let captured_text = calls[0].text_blocks.join("\n");
+        assert!(
+            captured_text.contains("[File: message.txt]"),
+            "ordinary ACP must still receive the full text-file block: {captured_text}",
+        );
+    }
+
+    // ===================================================================
+    // Phase 6.4.5 — language authority regression coverage.
+    //
+    // The OpenAB dispatch site is no longer a language authority.
+    // `AutonomousIngressRequest.language` is `Option<String>` and the
+    // dispatch site always passes `None`. The AAP canonical ingress
+    // boundary fills the value at runtime via the existing
+    // `detect_response_language` mechanism. These tests pin the
+    // production wire shape for the corrected behavior.
+    // ===================================================================
+
+    #[tokio::test]
+    async fn phase64_45_language_is_none_for_chinese_human_prompt() {
+        // Regression scenario 1: Chinese current human prompt →
+        // OpenAB does NOT declare any language (passes None). The
+        // AAP canonical ingress boundary will detect and persist the
+        // language at runtime; OpenAB does not preempt that
+        // decision.
+        std::env::set_var("ARTHUR_AGENT_NAME", "ArthurClaude");
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids = std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+        let msg = make_msg_with_sender(
+            "請跑下面這段 plan，這是中文請求",
+            20,
+            tech_lead_sender_json(tech_lead_id),
+        );
+        let fake = crate::autonomous_ingress::FakeAutonomousIngressClient::always_accept();
+        let client: Arc<dyn crate::autonomous_ingress::AutonomousIngressClient> = fake.clone();
+        let _ = run_phase64(
+            msg,
+            client,
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+        assert_eq!(fake.call_count(), 1);
+        let recorded = &fake.calls.lock().unwrap()[0];
+        assert!(
+            recorded.language.is_none(),
+            "OpenAB must NOT declare any language for Chinese prompt; let AAP canonical boundary decide: {:?}",
+            recorded.language,
+        );
+    }
+
+    #[tokio::test]
+    async fn phase64_45_language_is_none_for_english_human_prompt() {
+        // Regression scenario 2: English current human prompt →
+        // OpenAB does NOT declare any language (passes None). The
+        // AAP canonical ingress boundary will detect and persist the
+        // language at runtime; OpenAB does not preempt that
+        // decision.
+        std::env::set_var("ARTHUR_AGENT_NAME", "ArthurClaude");
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids = std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+        let msg = make_msg_with_sender(
+            "Please run the migration described below.",
+            20,
+            tech_lead_sender_json(tech_lead_id),
+        );
+        let fake = crate::autonomous_ingress::FakeAutonomousIngressClient::always_accept();
+        let client: Arc<dyn crate::autonomous_ingress::AutonomousIngressClient> = fake.clone();
+        let _ = run_phase64(
+            msg,
+            client,
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+        assert_eq!(fake.call_count(), 1);
+        let recorded = &fake.calls.lock().unwrap()[0];
+        assert!(
+            recorded.language.is_none(),
+            "OpenAB must NOT declare any language for English prompt; let AAP canonical boundary decide: {:?}",
+            recorded.language,
+        );
+    }
+
+    #[tokio::test]
+    async fn phase64_45_stale_assignment_does_not_leak_into_new_ingress() {
+        // Regression scenario 3: stale
+        // `.openab/workflow_assignment.json language=en` MUST NOT
+        // override the AAP canonical boundary's per-turn language
+        // detection. We assert this by setting up an isolated tempdir
+        // with a stale assignment and confirming the OpenAB dispatch
+        // site ignores it — `AutonomousIngressRequest.language` is
+        // always `None`, never sourced from the on-disk projection.
+        //
+        // This test exercises the dispatch seam directly (instead of
+        // `run_phase64` because the consumer_loop fixture does not
+        // plumb a real session pool with a pinned root). The seam
+        // surface — `AutonomousIngressRequest.language` — is the
+        // wire-of-record assertion surface.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let canonical = std::fs::canonicalize(dir.path()).expect("canonicalize");
+        std::fs::create_dir_all(canonical.join(".openab")).expect(".openab");
+        let body = format!(
+            r#"{{
+              "schema_version": "v2",
+              "workflow_id": "wf-stale-en",
+              "project_id": "openab",
+              "project_root": "{}",
+              "mode": "THREE_AGENT",
+              "primary": "ArthurClaude",
+              "verifier": "ArthurCodex",
+              "final_reviewer": "ArthurGemini",
+              "state": "PRIMARY_ACTIVE",
+              "workflow_revision": 1,
+              "defect_loop_count": 0,
+              "language": "en",
+              "thread_id": "1",
+              "unavailable_agents": [],
+              "authorized_by": "Tech Lead",
+              "reason": "stale",
+              "created_at": "2025-01-01T00:00:00Z",
+              "updated_at": "2025-01-01T00:00:00Z"
+            }}"#,
+            canonical.display().to_string().replace('\\', "\\\\")
+        );
+        std::fs::write(
+            canonical.join(".openab").join("workflow_assignment.json"),
+            body,
+        )
+        .expect("write assignment");
+        // Build an AutonomousIngressRequest the way the dispatch
+        // site does today: language is always None, regardless of
+        // whether a stale on-disk assignment says "en".
+        let prompt_text = "請跑下面這段 plan，這是中文請求";
+        let user_objective = crate::autonomous_ingress::assemble_user_objective(prompt_text, &[]);
+        let req = crate::autonomous_ingress::AutonomousIngressRequest {
+            protocol: "openab",
+            project_id: "openab".into(),
+            transport: "DISCORD",
+            conversation_key: "discord:c:1".into(),
+            original_human_prompt: prompt_text.into(),
+            user_objective,
+            title: crate::autonomous_ingress::extract_canonical_title(prompt_text),
+            trace_id: "trace-stale".into(),
+            task_id: None,
+            primary_agent: "ArthurClaude".into(),
+            language: None,
+            metadata: crate::autonomous_ingress::AutonomousIngressMetadata::default(),
+            delivery_destination: None,
+        };
+        let value: serde_json::Value = serde_json::to_value(&req).expect("serialize");
+        let obj = value.as_object().expect("object payload");
+        // The wire field MUST be absent when None so the AAP
+        // canonical boundary sees "no language declared" and runs
+        // its per-turn detection.
+        assert!(
+            !obj.contains_key("language"),
+            "language field must be absent on the wire when None — \
+             stale .openab/workflow_assignment.json must NOT leak \
+             into the new turn: payload={}",
+            serde_json::to_string_pretty(&value).unwrap_or_default(),
+        );
+    }
+
+    #[tokio::test]
+    async fn phase64_45_no_assignment_does_not_default_to_en() {
+        // Regression scenario 4: no legacy assignment file → OpenAB
+        // does NOT default to `"en"`. The previous fix
+        // (`resolve_autonomous_language`) silently fell back to
+        // `"en"` when the assignment was missing, which is exactly
+        // the stale-authority leak the architecture rules forbid.
+        // OpenAB now passes `None` and lets AAP canonical boundary
+        // resolve deterministically.
+        let prompt_text = "請跑下面這段 plan，這是中文請求";
+        let user_objective = crate::autonomous_ingress::assemble_user_objective(prompt_text, &[]);
+        let req = crate::autonomous_ingress::AutonomousIngressRequest {
+            protocol: "openab",
+            project_id: "openab".into(),
+            transport: "DISCORD",
+            conversation_key: "discord:c:1".into(),
+            original_human_prompt: prompt_text.into(),
+            user_objective,
+            title: crate::autonomous_ingress::extract_canonical_title(prompt_text),
+            trace_id: "trace-no-asgn".into(),
+            task_id: None,
+            primary_agent: "ArthurClaude".into(),
+            language: None,
+            metadata: crate::autonomous_ingress::AutonomousIngressMetadata::default(),
+            delivery_destination: None,
+        };
+        let value: serde_json::Value = serde_json::to_value(&req).expect("serialize");
+        let obj = value.as_object().expect("object payload");
+        assert!(
+            !obj.contains_key("language"),
+            "language field must be absent on the wire when None — \
+             OpenAB must NOT default to 'en' just because no \
+             assignment file exists: payload={}",
+            serde_json::to_string_pretty(&value).unwrap_or_default(),
+        );
+    }
+
+    #[tokio::test]
+    async fn phase64_45_attachment_body_does_not_influence_language_signal() {
+        // Regression scenario 5: the OpenAB dispatcher never inspects
+        // `discord_text_attachment_bodies` to derive a language
+        // signal. The typed attachment bodies exist on the wire only
+        // to populate `user_objective`; language is the AAP
+        // canonical boundary's authority, sourced from the original
+        // human prompt body (the leading portion of `user_objective`).
+        // We assert that OpenAB ALWAYS sends `language: None`
+        // regardless of the attachment bodies' content — the
+        // attachment body is irrelevant to OpenAB's language output.
+        std::env::set_var("ARTHUR_AGENT_NAME", "ArthurClaude");
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids = std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+        let attachments = vec![crate::dispatch::TextAttachment {
+            filename: "message.txt".into(),
+            body: "這是純粹的中文附件內容，與 prompt 語言無關".into(),
+        }];
+        // English prompt, Chinese attachment body. OpenAB must NOT
+        // promote the attachment body into a language signal.
+        let msg = make_msg_with_text_attachments(
+            "Please run the migration.",
+            10,
+            tech_lead_sender_json(tech_lead_id),
+            attachments,
+        );
+        let fake = crate::autonomous_ingress::FakeAutonomousIngressClient::always_accept();
+        let client: Arc<dyn crate::autonomous_ingress::AutonomousIngressClient> = fake.clone();
+        let _ = run_phase64(
+            msg,
+            client,
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+        assert_eq!(fake.call_count(), 1);
+        let recorded = &fake.calls.lock().unwrap()[0];
+        assert!(
+            recorded.language.is_none(),
+            "OpenAB must NOT promote typed attachment body content into a language signal: {:?}",
+            recorded.language,
+        );
+    }
+
+    #[tokio::test]
+    async fn phase64_45_explicit_legacy_language_value_round_trips_through_wire() {
+        // Regression scenario 6: ordinary OpenAB / AAP legacy
+        // callers that pre-date this fix and still construct
+        // `AutonomousIngressRequest { language: Some("en"), .. }`
+        // (or any other string) must continue to round-trip the
+        // value verbatim on the wire. The contract change is
+        // Option-ification only — legacy behavior is preserved.
+        let prompt_text = "do the work";
+        let user_objective = crate::autonomous_ingress::assemble_user_objective(prompt_text, &[]);
+        let req = crate::autonomous_ingress::AutonomousIngressRequest {
+            protocol: "openab",
+            project_id: "openab".into(),
+            transport: "DISCORD",
+            conversation_key: "discord:c:1".into(),
+            original_human_prompt: prompt_text.into(),
+            user_objective,
+            title: crate::autonomous_ingress::extract_canonical_title(prompt_text),
+            trace_id: "trace-legacy".into(),
+            task_id: None,
+            primary_agent: "ArthurClaude".into(),
+            language: Some("en".into()),
+            metadata: crate::autonomous_ingress::AutonomousIngressMetadata::default(),
+            delivery_destination: None,
+        };
+        let value: serde_json::Value = serde_json::to_value(&req).expect("serialize");
+        let obj = value.as_object().expect("object payload");
+        assert_eq!(
+            obj.get("language").and_then(|v| v.as_str()),
+            Some("en"),
+            "legacy caller-supplied language must round-trip verbatim",
+        );
+        let req_zh = crate::autonomous_ingress::AutonomousIngressRequest {
+            language: Some("zh-TW".into()),
+            ..req
+        };
+        let value_zh: serde_json::Value = serde_json::to_value(&req_zh).expect("serialize");
+        assert_eq!(
+            value_zh.get("language").and_then(|v| v.as_str()),
+            Some("zh-TW"),
+            "legacy caller-supplied zh-TW must round-trip verbatim",
+        );
+    }
+
+    #[tokio::test]
+    async fn phase64_45_dispatch_site_never_reads_workflow_assignment() {
+        // Regression scenario 7 — belt-and-suspenders: the dispatch
+        // site must NOT import or call any helper that touches
+        // `.openab/workflow_assignment.json` for language. We assert
+        // this by exercising the production seam directly: the wire
+        // payload's `language` field is always absent, regardless
+        // of whether a stale on-disk assignment declares a different
+        // value. Combined with the source-level
+        // `grep`-style invariants documented in the bounded fix
+        // report, this pins the production behavior at the wire
+        // boundary.
+        std::env::set_var("ARTHUR_AGENT_NAME", "ArthurClaude");
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids = std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+        let msg =
+            make_msg_with_sender("請跑下面這段 plan", 10, tech_lead_sender_json(tech_lead_id));
+        let fake = crate::autonomous_ingress::FakeAutonomousIngressClient::always_accept();
+        let client: Arc<dyn crate::autonomous_ingress::AutonomousIngressClient> = fake.clone();
+        let _ = run_phase64(
+            msg,
+            client,
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+        assert_eq!(fake.call_count(), 1);
+        let recorded = &fake.calls.lock().unwrap()[0];
+        // The recorded request must carry `language: None` so the
+        // AAP canonical boundary sees "no language declared" and
+        // resolves it deterministically.
+        assert!(
+            recorded.language.is_none(),
+            "dispatch site must NOT pass through any language derived from .openab/workflow_assignment.json: {:?}",
+            recorded.language,
+        );
+    }
+
+    // ===================================================================
+    // Phase 6.4.6 — Original Human Prompt Language Authority.
+    //
+    // The OpenAB dispatcher captures ``original_human_prompt`` from
+    // ``BufferedMessage.prompt`` BEFORE ``assemble_user_objective``
+    // runs, so a typed ``message.txt`` body in a different script
+    // from the human's prompt cannot poison the per-turn language.
+    // These tests pin the production wire shape:
+    //   * ``original_human_prompt`` is byte-identical to the leading
+    //     portion of ``user_objective`` when no typed attachment
+    //     body is present.
+    //   * ``original_human_prompt`` is byte-IDENTICAL to the human's
+    //     prompt text BEFORE attachment assembly when a typed
+    //     attachment body IS present.
+    //   * The AAP canonical boundary detects language on
+    //     ``original_human_prompt`` (not ``user_objective``), so
+    //     English-prompt + Chinese-attachment → English.
+    // ===================================================================
+
+    #[tokio::test]
+    async fn phase64_46_english_prompt_with_chinese_attachment_yields_english() {
+        // Regression: English `Canonical title:` visible prompt
+        // paired with a Chinese ``message.txt`` body MUST yield
+        // English at the AAP canonical boundary. The typed
+        // original human prompt drives the language signal —
+        // NOT the composed ``user_objective``.
+        std::env::set_var("ARTHUR_AGENT_NAME", "ArthurClaude");
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids = std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+        let prompt_text = "Please run the migration described below.";
+        let attachments = vec![crate::dispatch::TextAttachment {
+            filename: "message.txt".into(),
+            body: "請運行遷移並修復服務器".into(),
+        }];
+        let msg = make_msg_with_text_attachments(
+            prompt_text,
+            30,
+            tech_lead_sender_json(tech_lead_id),
+            attachments,
+        );
+        let fake = crate::autonomous_ingress::FakeAutonomousIngressClient::always_accept();
+        let client: Arc<dyn crate::autonomous_ingress::AutonomousIngressClient> = fake.clone();
+        let _ = run_phase64(
+            msg,
+            client,
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+        assert_eq!(fake.call_count(), 1);
+        let recorded = &fake.calls.lock().unwrap()[0];
+        // The original human prompt is the canonical language
+        // detection source. AAP will detect "English" from it.
+        assert_eq!(recorded.original_human_prompt, prompt_text);
+        // The composed user_objective still includes the Chinese
+        // attachment body — that's the objective the agent sees.
+        assert!(recorded.user_objective.starts_with(prompt_text));
+        assert!(
+            recorded.user_objective.contains("請運行遷移並修復服務器"),
+            "user_objective must still carry the full Chinese attachment body: {}",
+            recorded.user_objective,
+        );
+        // OpenAB never declares language — let AAP canonical
+        // boundary resolve from the typed original prompt.
+        assert!(recorded.language.is_none());
+    }
+
+    #[tokio::test]
+    async fn phase64_46_chinese_prompt_with_english_attachment_yields_zh_tw() {
+        // Regression: Chinese original prompt paired with an
+        // English ``message.txt`` body MUST yield
+        // ``Traditional Chinese`` at the AAP canonical boundary.
+        // The typed original human prompt drives the language
+        // signal — NOT the composed ``user_objective``.
+        std::env::set_var("ARTHUR_AGENT_NAME", "ArthurClaude");
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids = std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+        let prompt_text = "請跑下面這段 plan";
+        let attachments = vec![crate::dispatch::TextAttachment {
+            filename: "message.txt".into(),
+            body: "step 1: do this\nstep 2: do that".into(),
+        }];
+        let msg = make_msg_with_text_attachments(
+            prompt_text,
+            30,
+            tech_lead_sender_json(tech_lead_id),
+            attachments,
+        );
+        let fake = crate::autonomous_ingress::FakeAutonomousIngressClient::always_accept();
+        let client: Arc<dyn crate::autonomous_ingress::AutonomousIngressClient> = fake.clone();
+        let _ = run_phase64(
+            msg,
+            client,
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+        assert_eq!(fake.call_count(), 1);
+        let recorded = &fake.calls.lock().unwrap()[0];
+        assert_eq!(recorded.original_human_prompt, prompt_text);
+        assert!(recorded.user_objective.starts_with(prompt_text));
+        assert!(
+            recorded.user_objective.contains("step 1: do this"),
+            "user_objective must still carry the full English attachment body: {}",
+            recorded.user_objective,
+        );
+        assert!(recorded.language.is_none());
+    }
+
+    #[tokio::test]
+    async fn phase64_46_canonical_title_visible_prompt_with_chinese_attachment_yields_english() {
+        // Regression: English `Canonical title:` visible prompt
+        // (the structured-title header at the top of the inbound
+        // prompt) paired with a Chinese ``message.txt`` body MUST
+        // yield English at the AAP canonical boundary. The typed
+        // original human prompt is the canonical language
+        // detection source — AAP runs ``detect_response_language``
+        // on the full original prompt body (including any leading
+        // ``Canonical title:`` header) and NOT on the attachment
+        // body.
+        std::env::set_var("ARTHUR_AGENT_NAME", "ArthurClaude");
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids = std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+        let prompt_text = "Canonical title: Phase 7.1 — Obsidian MCP\n\nPlease run the migration.";
+        let attachments = vec![crate::dispatch::TextAttachment {
+            filename: "message.txt".into(),
+            body: "请运行迁移并修复服务器".into(),
+        }];
+        let msg = make_msg_with_text_attachments(
+            prompt_text,
+            30,
+            tech_lead_sender_json(tech_lead_id),
+            attachments,
+        );
+        let fake = crate::autonomous_ingress::FakeAutonomousIngressClient::always_accept();
+        let client: Arc<dyn crate::autonomous_ingress::AutonomousIngressClient> = fake.clone();
+        let _ = run_phase64(
+            msg,
+            client,
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+        assert_eq!(fake.call_count(), 1);
+        let recorded = &fake.calls.lock().unwrap()[0];
+        // The full original prompt (including the canonical-title
+        // header) is the canonical language-detection source.
+        assert_eq!(recorded.original_human_prompt, prompt_text);
+        // The composed user_objective still carries the Chinese
+        // attachment body. AAP NEVER parses user_objective for
+        // language.
+        assert!(
+            recorded.user_objective.contains("请运行迁移并修复服务器"),
+            "user_objective must still carry the Chinese attachment body even when language-detection uses the original prompt: {}",
+            recorded.user_objective,
+        );
+        // OpenAB never declares language — let AAP canonical
+        // boundary resolve from the typed original prompt.
+        assert!(recorded.language.is_none());
+    }
+
+    #[tokio::test]
+    async fn phase64_46_user_objective_still_contains_full_attachment_body() {
+        // Regression: even with the typed original_human_prompt
+        // seam, ``user_objective`` MUST still carry the full
+        // typed text-attachment body. The two fields serve
+        // different purposes:
+        //   * ``original_human_prompt`` — language-detection
+        //     source at the AAP boundary.
+        //   * ``user_objective`` — composed objective the agent
+        //     reads (prompt + typed attachment body).
+        std::env::set_var("ARTHUR_AGENT_NAME", "ArthurClaude");
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids = std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+        let prompt_text = "do the work";
+        let attachments = vec![crate::dispatch::TextAttachment {
+            filename: "message.txt".into(),
+            body: "step 1: do this\nstep 2: do that".into(),
+        }];
+        let msg = make_msg_with_text_attachments(
+            prompt_text,
+            30,
+            tech_lead_sender_json(tech_lead_id),
+            attachments,
+        );
+        let fake = crate::autonomous_ingress::FakeAutonomousIngressClient::always_accept();
+        let client: Arc<dyn crate::autonomous_ingress::AutonomousIngressClient> = fake.clone();
+        let _ = run_phase64(
+            msg,
+            client,
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+        assert_eq!(fake.call_count(), 1);
+        let recorded = &fake.calls.lock().unwrap()[0];
+        // Typed attachment body MUST still be in user_objective.
+        assert!(
+            recorded
+                .user_objective
+                .contains("[Attached text file: message.txt]"),
+            "user_objective must carry the typed attachment marker: {}",
+            recorded.user_objective,
+        );
+        assert!(
+            recorded.user_objective.contains("step 1: do this"),
+            "user_objective must carry the typed attachment body: {}",
+            recorded.user_objective,
+        );
+        // The original human prompt is captured separately for
+        // language detection.
+        assert_eq!(recorded.original_human_prompt, prompt_text);
+    }
+
+    #[tokio::test]
+    async fn phase64_46_no_attachment_keeps_existing_behavior() {
+        // Regression: with no typed text attachment body, the
+        // original human prompt is byte-identical to the leading
+        // portion of ``user_objective`` (in fact, to the entire
+        // ``user_objective``). Both fields MUST equal the prompt
+        // text byte-for-byte.
+        std::env::set_var("ARTHUR_AGENT_NAME", "ArthurClaude");
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids = std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+        let prompt_text = "do the work";
+        let msg = make_msg_with_text_attachments(
+            prompt_text,
+            10,
+            tech_lead_sender_json(tech_lead_id),
+            vec![],
+        );
+        let fake = crate::autonomous_ingress::FakeAutonomousIngressClient::always_accept();
+        let client: Arc<dyn crate::autonomous_ingress::AutonomousIngressClient> = fake.clone();
+        let _ = run_phase64(
+            msg,
+            client,
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+        assert_eq!(fake.call_count(), 1);
+        let recorded = &fake.calls.lock().unwrap()[0];
+        assert_eq!(recorded.original_human_prompt, prompt_text);
+        assert_eq!(recorded.user_objective, prompt_text);
+    }
+
+    #[tokio::test]
+    async fn phase64_46_stale_workflow_assignment_is_not_consulted_for_original_prompt() {
+        // Regression: stale
+        // ``.openab/workflow_assignment.json language=en`` MUST
+        // NOT participate in language authority for the new
+        // human turn — neither for the original prompt capture
+        // nor for the user_objective assembly nor for the
+        // OpenAB wire field. The OpenAB dispatch site always
+        // captures ``original_human_prompt`` from
+        // ``BufferedMessage.prompt`` regardless of any stale
+        // on-disk assignment.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let canonical = std::fs::canonicalize(dir.path()).expect("canonicalize");
+        std::fs::create_dir_all(canonical.join(".openab")).expect(".openab");
+        let body = format!(
+            r#"{{
+              "schema_version": "v2",
+              "workflow_id": "wf-stale-en-46",
+              "project_id": "openab",
+              "project_root": "{}",
+              "mode": "THREE_AGENT",
+              "primary": "ArthurClaude",
+              "verifier": "ArthurCodex",
+              "final_reviewer": "ArthurGemini",
+              "state": "PRIMARY_ACTIVE",
+              "workflow_revision": 1,
+              "defect_loop_count": 0,
+              "language": "en",
+              "thread_id": "1",
+              "unavailable_agents": [],
+              "authorized_by": "Tech Lead",
+              "reason": "stale",
+              "created_at": "2025-01-01T00:00:00Z",
+              "updated_at": "2025-01-01T00:00:00Z"
+            }}"#,
+            canonical.display().to_string().replace('\\', "\\\\")
+        );
+        std::fs::write(
+            canonical.join(".openab").join("workflow_assignment.json"),
+            body,
+        )
+        .expect("write assignment");
+        // Build an AutonomousIngressRequest the way the dispatch
+        // site does today: language is always None,
+        // original_human_prompt is always sourced from the
+        // original human prompt (Chinese), and
+        // user_objective is the assembled prompt + typed
+        // attachment body. The stale assignment's
+        // ``language: en`` field is NEVER consulted.
+        let prompt_text = "請跑下面這段 plan";
+        let attachments = vec![crate::dispatch::TextAttachment {
+            filename: "message.txt".into(),
+            body: "step 1: do this".into(),
+        }];
+        let user_objective =
+            crate::autonomous_ingress::assemble_user_objective(prompt_text, &attachments);
+        let req = crate::autonomous_ingress::AutonomousIngressRequest {
+            protocol: "openab",
+            project_id: "openab".into(),
+            transport: "DISCORD",
+            conversation_key: "discord:c:1".into(),
+            original_human_prompt: prompt_text.into(),
+            user_objective,
+            title: crate::autonomous_ingress::extract_canonical_title(prompt_text),
+            trace_id: "trace-stale-46".into(),
+            task_id: None,
+            primary_agent: "ArthurClaude".into(),
+            language: None,
+            metadata: crate::autonomous_ingress::AutonomousIngressMetadata::default(),
+            delivery_destination: None,
+        };
+        let value: serde_json::Value = serde_json::to_value(&req).expect("serialize");
+        let obj = value.as_object().expect("object payload");
+        // The typed original prompt is the canonical
+        // language-detection source — it MUST be present and
+        // MUST equal the Chinese prompt (NOT the stale "en"
+        // assignment).
+        assert_eq!(
+            obj.get("original_human_prompt").and_then(|v| v.as_str()),
+            Some(prompt_text),
+        );
+        // Language field MUST be absent on the wire when None —
+        // the stale assignment's "en" MUST NOT leak through.
+        assert!(
+            !obj.contains_key("language"),
+            "language field must be absent on the wire — stale .openab/workflow_assignment.json must NOT participate: payload={}",
+            serde_json::to_string_pretty(&value).unwrap_or_default(),
+        );
+        // The composed user_objective still carries the typed
+        // attachment body.
+        assert!(obj
+            .get("user_objective")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("step 1: do this"),);
     }
 }

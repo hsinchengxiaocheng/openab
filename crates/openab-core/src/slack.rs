@@ -1610,7 +1610,7 @@ async fn handle_message(
                 #[cfg(not(feature = "filestore"))]
                 let text_file_result =
                     media::download_and_read_text_file(url, filename, size, Some(bot_token)).await;
-                if let Some((block, actual_bytes)) = text_file_result {
+                if let Some((block, actual_bytes, _body, _safe_filename)) = text_file_result {
                     if text_file_bytes + actual_bytes > TEXT_TOTAL_CAP {
                         debug!(
                             filename,
@@ -1814,6 +1814,7 @@ async fn handle_message(
         other_bot_present,
         recipient: stream_recipient,
         native_workflow: None,
+        discord_text_attachment_bodies: Vec::new(),
     };
     if let Err(e) = dispatcher
         .submit(thread_key, thread_channel, adapter_dyn, buf_msg)

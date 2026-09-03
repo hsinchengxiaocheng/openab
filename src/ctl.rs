@@ -1705,6 +1705,7 @@ impl CtlHandler for RuntimeHandler {
             other_bot_present: false,
             recipient: None,
             native_workflow: Some(metadata.clone()),
+            discord_text_attachment_bodies: Vec::new(),
         };
         let ack = match admission
             .admit_work(WorkAdmissionRequest {

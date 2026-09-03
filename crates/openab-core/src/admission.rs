@@ -627,6 +627,7 @@ mod tests {
                 other_bot_present: false,
                 recipient: None,
                 native_workflow: None,
+                discord_text_attachment_bodies: Vec::new(),
             },
             conversation,
             native_workflow: None,

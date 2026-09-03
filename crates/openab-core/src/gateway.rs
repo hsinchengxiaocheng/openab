@@ -1203,6 +1203,7 @@ pub async fn run_gateway_adapter(
                                             other_bot_present: false,
                                             recipient: None, // Slack-only (assistant mode); N/A for gateway
                                             native_workflow: None,
+                                            discord_text_attachment_bodies: Vec::new(),
                                         };
                                         if let Err(e) = dispatcher
                                             .submit(thread_key, thread_channel, adapter, buf_msg)
@@ -1687,6 +1688,7 @@ pub async fn process_gateway_event(
             other_bot_present: false,
             recipient: None,
             native_workflow: None,
+            discord_text_attachment_bodies: Vec::new(),
         };
         if let Err(e) = dispatcher
             .submit(thread_key, thread_channel, adapter, buf_msg)

@@ -478,6 +478,15 @@ pub fn is_text_file(filename: &str, content_type: Option<&str>) -> bool {
 /// Note: the caller already guards total size via a total cap; the per-file
 /// MAX_SIZE check here is intentional defense-in-depth so this function remains
 /// self-contained and safe when called from other contexts.
+///
+/// Returns `(block, actual_bytes, body, safe_filename)`. The trailing
+/// `body` and `safe_filename` carry the typed text-file attachment
+/// provenance required by the Phase 6.4.4 autonomous ingress seam
+/// (so Discord can compose `user_objective` without leaking STT
+/// transcripts, image / video metadata, or arbitrary
+/// `ContentBlock::Text` blocks into AAP human authority). For
+/// filestore fallbacks the trailing fields are empty — the
+/// autonomous seam only consumes inline-read bodies.
 #[cfg(feature = "filestore")]
 pub async fn download_and_read_text_file(
     url: &str,
@@ -485,11 +494,13 @@ pub async fn download_and_read_text_file(
     size: u64,
     auth_token: Option<&str>,
     filestore: Option<&crate::filestore::Filestore>,
-) -> Option<(ContentBlock, u64)> {
+) -> Option<(ContentBlock, u64, String, String)> {
     if size > TEXT_INLINE_LIMIT {
         // When filestore is available, download the oversized file and upload it.
         if let Some(fs) = filestore {
-            return download_and_upload_to_filestore(url, filename, size, auth_token, fs).await;
+            let (block, actual_bytes) =
+                download_and_upload_to_filestore(url, filename, size, auth_token, fs).await?;
+            return Some((block, actual_bytes, String::new(), String::new()));
         }
         tracing::warn!(filename, size, "text file exceeds inline limit, skipping");
         return None;
@@ -503,16 +514,19 @@ pub async fn download_and_read_text_file(
 ///
 /// Pass `auth_token` for platforms that require authentication (e.g. Slack private files).
 ///
-/// Note: the caller already guards total size via a total cap; the per-file
+/// Note: The caller already guards total size via a total cap; the per-file
 /// MAX_SIZE check here is intentional defense-in-depth so this function remains
 /// self-contained and safe when called from other contexts.
+///
+/// Returns `(block, actual_bytes, body, safe_filename)` — see the
+/// filestore variant above for the typed-provenance rationale.
 #[cfg(not(feature = "filestore"))]
 pub async fn download_and_read_text_file(
     url: &str,
     filename: &str,
     size: u64,
     auth_token: Option<&str>,
-) -> Option<(ContentBlock, u64)> {
+) -> Option<(ContentBlock, u64, String, String)> {
     if size > TEXT_INLINE_LIMIT {
         tracing::warn!(filename, size, "text file exceeds inline limit, skipping");
         return None;
@@ -529,7 +543,7 @@ async fn download_text_file_inner(
     _size: u64,
     auth_token: Option<&str>,
     filestore: Option<&crate::filestore::Filestore>,
-) -> Option<(ContentBlock, u64)> {
+) -> Option<(ContentBlock, u64, String, String)> {
     let safe_filename: String = filename
         .chars()
         .filter(|c| !c.is_control())
@@ -596,7 +610,12 @@ async fn download_text_file_inner(
                             size = actual_bytes,
                             "text file streamed to filestore (inline fallback)"
                         );
-                        Some((ContentBlock::Text { text: hint }, 0))
+                        Some((
+                            ContentBlock::Text { text: hint },
+                            0,
+                            String::new(),
+                            String::new(),
+                        ))
                     }
                     Ok(Err(e)) => {
                         tracing::error!(filename, error = %e, "filestore stream upload failed (inline fallback)");
@@ -606,7 +625,12 @@ async fn download_text_file_inner(
                              This file ({size_kb} KB) could not be uploaded to temporary storage \
                              (upload failed). The file content is unavailable."
                         );
-                        Some((ContentBlock::Text { text: hint }, 0))
+                        Some((
+                            ContentBlock::Text { text: hint },
+                            0,
+                            String::new(),
+                            String::new(),
+                        ))
                     }
                     Err(_) => {
                         tracing::error!(
@@ -619,7 +643,12 @@ async fn download_text_file_inner(
                              This file ({size_kb} KB) upload timed out. \
                              The file content is unavailable."
                         );
-                        Some((ContentBlock::Text { text: hint }, 0))
+                        Some((
+                            ContentBlock::Text { text: hint },
+                            0,
+                            String::new(),
+                            String::new(),
+                        ))
                     }
                 };
             }
@@ -639,7 +668,8 @@ async fn download_text_file_inner(
     if actual_size > TEXT_INLINE_LIMIT {
         // When filestore is available, upload the oversized download.
         if let Some(fs) = filestore {
-            return upload_bytes_to_filestore(filename, &bytes, fs).await;
+            let (block, actual_bytes) = upload_bytes_to_filestore(filename, &bytes, fs).await?;
+            return Some((block, actual_bytes, String::new(), String::new()));
         }
         tracing::warn!(
             filename,
@@ -664,6 +694,8 @@ async fn download_text_file_inner(
             text: format!("[File: {safe_filename}]\n{fence}\n{text}\n{fence}"),
         },
         actual_size,
+        text,
+        safe_filename,
     ))
 }
 
@@ -673,7 +705,7 @@ async fn download_text_file_inner(
     url: &str,
     filename: &str,
     auth_token: Option<&str>,
-) -> Option<(ContentBlock, u64)> {
+) -> Option<(ContentBlock, u64, String, String)> {
     let safe_filename: String = filename
         .chars()
         .filter(|c| !c.is_control())
@@ -730,6 +762,8 @@ async fn download_text_file_inner(
             text: format!("[File: {safe_filename}]\n{fence}\n{text}\n{fence}"),
         },
         actual_size,
+        text,
+        safe_filename,
     ))
 }
 

@@ -1450,6 +1450,13 @@ impl EventHandler for Handler {
         // Build extra content blocks from attachments (audio -> STT, text -> inline,
         // image -> encode, video -> URL for agent-side inspection).
         let mut extra_blocks = Vec::new();
+        // Phase 6.4.4 — typed text-file attachment bodies for the
+        // autonomous ingress seam. Populated only when Discord
+        // downloads a text-file attachment inline; voice transcripts,
+        // image / video metadata, and arbitrary ContentBlocks never
+        // appear here. The field is consumed ONLY by the autonomous
+        // seam; ordinary ACP dispatch continues to read `extra_blocks`.
+        let mut discord_text_attachment_bodies: Vec<crate::dispatch::TextAttachment> = Vec::new();
         let mut echo_entries: Vec<crate::stt::EchoEntry> = Vec::new();
         let mut failed_image_files: Vec<String> = Vec::new();
         let mut text_file_bytes: u64 = 0;
@@ -1529,11 +1536,31 @@ impl EventHandler for Handler {
                     None,
                 )
                 .await;
-                if let Some((block, actual_bytes)) = text_file_result {
+                if let Some((block, actual_bytes, body, safe_filename)) = text_file_result {
                     text_file_bytes += actual_bytes;
                     text_file_count += 1;
                     debug!(filename = %attachment.filename, "adding text file attachment");
                     extra_blocks.push(block);
+                    // Phase 6.4.4 — typed provenance: capture the
+                    // body for the autonomous ingress seam so the
+                    // original Discord `message.txt` body survives
+                    // end-to-end without leaking STT transcripts,
+                    // image/video metadata, or arbitrary
+                    // `ContentBlock::Text` blocks into AAP human
+                    // authority. The body is empty for filestore
+                    // fallbacks (oversized uploads); the autonomous
+                    // seam treats that as no provenance contribution.
+                    if !body.is_empty() {
+                        let tracked_filename = if safe_filename.is_empty() {
+                            attachment.filename.clone()
+                        } else {
+                            safe_filename
+                        };
+                        discord_text_attachment_bodies.push(crate::dispatch::TextAttachment {
+                            filename: tracked_filename,
+                            body,
+                        });
+                    }
                 }
             } else {
                 match media::download_and_encode_image(
@@ -1737,6 +1764,7 @@ impl EventHandler for Handler {
                 other_bot_present: other_bot_present_flag,
                 recipient: None, // Slack-only (assistant mode); N/A for Discord
                 native_workflow: None,
+                discord_text_attachment_bodies,
             };
             Handler::admit_after_discord_gates(
                 admission,
@@ -1995,6 +2023,7 @@ impl EventHandler for Handler {
                 other_bot_present,
                 recipient: None,
                 native_workflow: None,
+                discord_text_attachment_bodies: Vec::new(),
             };
 
             if let Err(e) = admission
@@ -4149,6 +4178,7 @@ mod tests {
                 other_bot_present: false,
                 recipient: None,
                 native_workflow: None,
+                discord_text_attachment_bodies: Vec::new(),
             },
             conversation,
             native_workflow: None,
