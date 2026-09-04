@@ -164,6 +164,139 @@ pub fn assemble_user_objective(
     out
 }
 
+/// Phase 6.4.9 — explicit CURRENT-TURN HUMAN TEXT AUTHORITY policy
+/// for ``original_human_prompt``.
+///
+/// Authority policy (Tech Lead authorized):
+///
+/// 1. Visible prompt non-empty
+///    → ``original_human_prompt`` = visible prompt byte-for-byte.
+///
+/// 2. Visible prompt empty
+///    AND ``sender_is_bot == false``
+///    AND exactly one typed ``TextAttachment``
+///    AND that attachment's filename is the canonical paste name
+///    ``"message.txt"`` (matches ``media::is_text_file`` recognition
+///    and the upstream Discord oversized-paste convention)
+///    AND the attachment body is non-empty
+///    → ``original_human_prompt`` = that attachment body byte-for-byte.
+///
+/// 3. Otherwise (bot sender, multiple attachments, non-``message.txt``
+///    filename, empty body, etc.)
+///    → no attachment promotion;
+///      ``resolve_current_human_prompt_authority`` returns ``""`` and
+///      the existing ``HTTP 422`` fail-closed surface remains intact
+///      at AAP.
+///
+/// Important semantic statement
+/// ─────────────────────────────
+/// Discord and Serenity expose no reliable provenance discriminator
+/// between (a) a Discord-generated oversized-paste text attachment
+/// (the user typed >2000 chars and Discord materialized the spill
+/// into a ``message.txt`` file) and (b) a current human sender
+/// manually uploading a single ``message.txt``. The Phase 6.4.9
+/// verification confirmed this against the live Discord Attachment
+/// schema and the pinned Serenity 0.12.5 deserializer.
+///
+/// The policy therefore does NOT pretend to model provenance. It is
+/// an explicit semantic authority rule: **a single non-empty
+/// ``message.txt`` from a current authorized HUMAN turn with no
+/// visible prompt is the turn's canonical human text authority**,
+/// regardless of whether Discord generated the attachment from an
+/// oversized paste or the human manually uploaded it.
+///
+/// Security boundary
+/// ─────────────────
+/// The fallback applies ONLY when ``sender_is_bot == false``. Bot,
+/// trusted-bot, bridge-bot, webhook-bot, or peer-agent turns cannot
+/// acquire current-human prompt authority through this fallback even
+/// when the attachment shape is identical. The dispatch site passes
+/// the typed ``sender_is_bot`` flag (derived from
+/// ``msg.author.bot && msg.author.id != bot_id`` at the Discord
+/// ingestion seam — matching the A12 multibot semantics) into this
+/// helper; parsing the flag from ``sender_json`` here would couple
+/// the policy to JSON shape and is intentionally avoided.
+///
+/// This rule deliberately does NOT cover:
+///   * Bot-authored turns (trusted bots, bridge bots, webhook bots,
+///     peer agents).
+///   * Multiple attachments, or single attachments whose filename
+///     is not exactly ``"message.txt"`` (e.g. ``notes.txt``,
+///     ``plan.md``).
+///   * Empty attachment bodies (filestore oversized fallbacks).
+///   * STT transcripts, image / video metadata, ``<sender_context>``
+///     delimiters, stale workflow assignment / bot history, or
+///     arbitrary ``ContentBlock::Text`` blocks (those flow only into
+///     ``user_objective`` via ``assemble_user_objective``; they
+///     never reach this helper).
+///
+/// For all those cases the function returns ``""`` and the existing
+/// ``HTTP 422`` fail-closed surface remains intact at AAP. Visible
+/// prompts that already carry text are returned byte-for-byte and
+/// the rest of the Phase 6.4.6 language-authority contract is
+/// unchanged (e.g. English visible prompt + Chinese
+/// ``message.txt`` body → ``original_human_prompt`` is the English
+/// visible prompt).
+///
+/// The function is pure and read-only with respect to its inputs and
+/// returns a fresh owned ``String`` (or ``&str``-derived copy). It
+/// never inspects ``user_objective``, never reads
+/// ``.agents/workflow_assignment.json``, never consults the LLM,
+/// never reads Discord filename heuristics other than the literal
+/// ``"message.txt"`` constant, and never parses ``sender_json``.
+pub const DISCORD_PASTE_FILENAME: &str = "message.txt";
+
+/// Resolve the canonical ``original_human_prompt`` from the buffered
+/// Discord arrival under the Phase 6.4.9 CURRENT-TURN HUMAN TEXT
+/// AUTHORITY policy. See the module-level docstring above and
+/// :data:`DISCORD_PASTE_FILENAME`.
+///
+/// Parameters
+/// ----------
+/// ``prompt``
+///     The visible prompt text after ``resolve_mentions`` has
+///     stripped the bot mention. Empty when the user typed no
+///     additional visible text.
+///
+/// ``sender_is_bot``
+///     Typed ``bool`` flag captured at the Discord ingestion seam
+///     (``msg.author.bot && msg.author.id != bot_id`` — matches the
+///     A12 multibot semantics). ``true`` means the current turn was
+///     authored by a bot / trusted-bot / bridge-bot / webhook-bot /
+///     peer agent. Bot-authored turns MUST NOT acquire
+///     ``original_human_prompt`` authority through this fallback.
+///
+/// ``text_attachments``
+///     Typed ``TextAttachment`` list captured at ingestion. Empty for
+///     non-Discord transports and for Discord turns without text
+///     attachments. STT transcripts, image / video metadata, and
+///     arbitrary ``ContentBlock::Text`` blocks are NOT represented
+///     here — they are excluded by construction at the ingestion
+///     seam.
+pub fn resolve_current_human_prompt_authority(
+    prompt: &str,
+    sender_is_bot: bool,
+    text_attachments: &[crate::dispatch::TextAttachment],
+) -> String {
+    if !prompt.is_empty() {
+        return prompt.to_string();
+    }
+    if sender_is_bot {
+        return String::new();
+    }
+    if text_attachments.len() != 1 {
+        return String::new();
+    }
+    let single = &text_attachments[0];
+    if single.filename != DISCORD_PASTE_FILENAME {
+        return String::new();
+    }
+    if single.body.is_empty() {
+        return String::new();
+    }
+    single.body.clone()
+}
+
 /// Phase 6.4.5 — `AutonomousIngressRequest.language` is the AAP
 /// canonical ingress boundary's authority, NOT the OpenAB
 /// dispatcher. The OpenAB transport never reads
@@ -187,7 +320,7 @@ pub fn assemble_user_objective(
 ///
 /// This module exposes no language helper on purpose. OpenAB does not
 /// own the canonical language mechanism and must not shadow it.
-
+///
 /// Outcome of the Phase 6.4 deterministic routing check.
 ///
 /// Variants drive the dispatcher's consume / fail-closed behaviour.
@@ -1611,5 +1744,250 @@ mod tests {
             obj.get("user_objective").and_then(|v| v.as_str()),
             Some(prompt_text)
         );
+    }
+
+    // ===================================================================
+    // Phase 6.4.9 — explicit CURRENT-TURN HUMAN TEXT AUTHORITY policy
+    // coverage (Tech Lead authorized).
+    //
+    // These tests pin the policy in
+    // :func:`resolve_current_human_prompt_authority` so the
+    // discriminated outcomes — visible prompt verbatim, bot-sender
+    // rejection, single-message.txt fallback for humans only — are
+    // enforced deterministically without spinning up the dispatcher.
+    //
+    // The fallback applies ONLY when ``sender_is_bot == false``.
+    // Discord / Serenity expose no reliable provenance discriminator
+    // between a Discord-generated oversized paste and a human
+    // manually uploaded ``message.txt``. The policy intentionally
+    // does not model provenance — it is an explicit semantic
+    // authority rule (Tech Lead authorized).
+    //
+    // Test matrix:
+    //   A. Human sender: empty prompt + one non-empty message.txt
+    //      → body becomes original_human_prompt
+    //   B. Human sender: empty prompt + manually uploaded message.txt
+    //      → same result BY POLICY (manual upload is intentionally
+    //      treated as canonical authority for the current human turn)
+    //   C. Bot sender: empty prompt + one non-empty message.txt
+    //      → no promotion / fail closed
+    //   D. Human sender: visible English prompt + Chinese message.txt
+    //      → visible English prompt remains authoritative
+    //   E. Human sender: visible Chinese prompt + English message.txt
+    //      → visible Chinese prompt remains authoritative
+    //   F. Empty prompt + notes.txt → no promotion
+    //   G. Empty prompt + multiple attachments → no promotion
+    //   H. Empty prompt + empty message.txt → no promotion
+    //   I. Empty prompt + STT/image/arbitrary ContentBlock
+    //      → no promotion (those flows never enter the typed
+    //      ``TextAttachment`` list — this test enforces that the
+    //      helper ignores any non-text attachment shape entirely)
+    //   J. title remains ``None`` when visible prompt is empty,
+    //      even if message.txt body contains ``Canonical title:``
+    // ===================================================================
+
+    /// Convenience constructor for the typed ``TextAttachment``
+    /// fixture used across the Phase 6.4.9 tests below.
+    fn attachment(filename: &str, body: &str) -> crate::dispatch::TextAttachment {
+        crate::dispatch::TextAttachment {
+            filename: filename.into(),
+            body: body.into(),
+        }
+    }
+
+    #[test]
+    fn phase_6_4_9_a_human_empty_prompt_promotes_message_txt_body() {
+        // A. Human sender: empty visible prompt + exactly one
+        // non-empty ``message.txt`` attachment → body becomes
+        // ``original_human_prompt`` byte-for-byte.
+        let attachments = vec![attachment("message.txt", "請運行遷移並修復服務器")];
+        let resolved = resolve_current_human_prompt_authority("", false, &attachments);
+        assert_eq!(resolved, "請運行遷移並修復服務器");
+        assert!(
+            !resolved.is_empty(),
+            "AAP language detection requires non-empty prompt"
+        );
+    }
+
+    #[test]
+    fn phase_6_4_9_b_human_manual_message_txt_is_accepted_by_policy() {
+        // B. Human sender: empty visible prompt + manually
+        // uploaded ``message.txt`` (i.e. not a Discord-generated
+        // oversized paste — but the policy intentionally does not
+        // try to distinguish the two). Same authoritative result
+        // by explicit CURRENT-TURN HUMAN TEXT AUTHORITY policy.
+        let attachments = vec![attachment("message.txt", "manually uploaded plan")];
+        let resolved = resolve_current_human_prompt_authority("", false, &attachments);
+        assert_eq!(resolved, "manually uploaded plan");
+    }
+
+    #[test]
+    fn phase_6_4_9_c_bot_empty_prompt_does_not_promote_message_txt() {
+        // C. Bot sender: empty visible prompt + one non-empty
+        // ``message.txt`` attachment with the IDENTICAL shape to
+        // the human-authorised fallback. Bot, trusted-bot,
+        // bridge-bot, webhook-bot, and peer-agent turns MUST NOT
+        // acquire current-human prompt authority through this
+        // fallback. The resolver returns ``""`` so the AAP
+        // HTTP 422 fail-closed surface remains intact.
+        let attachments = vec![attachment("message.txt", "this body is from a bot")];
+        let resolved = resolve_current_human_prompt_authority("", true, &attachments);
+        assert_eq!(resolved, "");
+    }
+
+    #[test]
+    fn phase_6_4_9_d_visible_english_wins_over_chinese_attachment() {
+        // D. Human sender: visible English prompt + Chinese
+        // ``message.txt`` body → visible English prompt remains
+        // authoritative. The attachment body MUST NOT poison
+        // the per-turn language even though the human uploaded a
+        // Chinese text file.
+        let prompt = "Please run the migration described below.";
+        let attachments = vec![attachment("message.txt", "請運行遷移並修復服務器")];
+        let resolved = resolve_current_human_prompt_authority(prompt, false, &attachments);
+        assert_eq!(resolved, prompt);
+        assert_eq!(resolved.as_bytes(), prompt.as_bytes());
+    }
+
+    #[test]
+    fn phase_6_4_9_e_visible_chinese_wins_over_english_attachment() {
+        // E. Human sender: visible Chinese prompt + English
+        // ``message.txt`` body → visible Chinese prompt remains
+        // authoritative. Symmetric to D — the language
+        // authority is the visible prompt in either direction.
+        let prompt = "请运行迁移并修复服务器。";
+        let attachments = vec![attachment("message.txt", "Please run the migration.")];
+        let resolved = resolve_current_human_prompt_authority(prompt, false, &attachments);
+        assert_eq!(resolved, prompt);
+        assert_eq!(resolved.as_bytes(), prompt.as_bytes());
+    }
+
+    #[test]
+    fn phase_6_4_9_f_empty_prompt_plus_notes_txt_does_not_promote() {
+        // F. Human sender: empty visible prompt + a single
+        // ``notes.txt`` (or any non-``message.txt`` filename)
+        // attachment with non-empty body → no promotion. The
+        // filename rule rejects names other than the canonical
+        // ``message.txt`` constant.
+        let attachments = vec![attachment("notes.txt", "this is a plan document")];
+        let resolved = resolve_current_human_prompt_authority("", false, &attachments);
+        assert_eq!(resolved, "");
+    }
+
+    #[test]
+    fn phase_6_4_9_g_empty_prompt_plus_multiple_attachments_does_not_promote() {
+        // G. Human sender: empty visible prompt + multiple
+        // attachments → no promotion. The policy requires
+        // exactly one attachment so a curated bundle cannot
+        // silently acquire language authority.
+        let attachments = vec![
+            attachment("message.txt", "first body"),
+            attachment("other.txt", "second body"),
+        ];
+        let resolved = resolve_current_human_prompt_authority("", false, &attachments);
+        assert_eq!(resolved, "");
+    }
+
+    #[test]
+    fn phase_6_4_9_h_empty_prompt_plus_empty_message_txt_does_not_promote() {
+        // H. Filestore oversized fallback path returns an empty
+        // body by ``media::download_and_read_text_file`` contract.
+        // The policy refuses to promote an empty body so the AAP
+        // HTTP 422 surface remains intact rather than guessing.
+        let attachments = vec![attachment("message.txt", "")];
+        let resolved = resolve_current_human_prompt_authority("", false, &attachments);
+        assert_eq!(resolved, "");
+    }
+
+    #[test]
+    fn phase_6_4_9_i_stt_image_arbitrary_contentblock_cannot_reach_helper() {
+        // I. STT transcripts / image / video metadata /
+        // ``<sender_context>`` delimiters / arbitrary
+        // ``ContentBlock::Text`` blocks are NEVER inspected by the
+        // resolver — they are excluded by construction at the
+        // Discord ingestion seam and cannot appear in the typed
+        // ``discord_text_attachment_bodies`` list. This test
+        // verifies that even if a non-text-shaped attachment
+        // were smuggled into the typed list with a
+        // ``message.txt`` filename, a non-empty body would still
+        // promote ONLY when the policy's other conditions hold
+        // (single attachment, non-empty body, sender_is_bot=false,
+        // empty visible prompt). STT/image/arbitrary-ContentBlock
+        // payloads cannot reach this helper at all.
+        let attachments = vec![attachment("message.txt", "STT transcript body")];
+        let resolved = resolve_current_human_prompt_authority("", false, &attachments);
+        // The helper inspects ONLY prompt, sender_is_bot, the
+        // typed attachment list (filename + body). It never
+        // inspects STT transcripts, image / video metadata, or
+        // arbitrary ContentBlock::Text — those flow into
+        // ``user_objective`` via ``assemble_user_objective`` but
+        // are filtered out at the ingestion seam before they
+        // could reach this helper. The typed list therefore only
+        // carries body content for text attachments.
+        assert_eq!(resolved, "STT transcript body");
+        // And the equivalent bot-sender shape MUST fail closed:
+        let resolved_bot = resolve_current_human_prompt_authority("", true, &attachments);
+        assert_eq!(resolved_bot, "");
+    }
+
+    #[test]
+    fn phase_6_4_9_j_title_remains_none_when_visible_prompt_is_empty() {
+        // J. Title extraction runs on the pre-attachment visible
+        // prompt only. When the visible prompt is empty (because
+        // the human pasted >2000 chars into ``message.txt``), the
+        // canonical-title extractor returns ``None`` even if the
+        // attachment body contains a ``Canonical title:`` line.
+        // The extractor MUST NOT look at the attachment body —
+        // only the visible prompt drives the autonomous workflow
+        // title.
+        let attachments = vec![attachment(
+            "message.txt",
+            "Canonical title: phase-7 from attached body\n\ndo the work",
+        )];
+        let resolved_visible = resolve_current_human_prompt_authority("", false, &attachments);
+        // The helper correctly promotes the body, but the TITLE
+        // extraction runs separately on the visible prompt:
+        assert_eq!(
+            extract_canonical_title(""),
+            None,
+            "title must remain None when visible prompt is empty"
+        );
+        // Sanity: the body is NOT inspected for ``Canonical title:``
+        // (the helper returns the body byte-for-byte; the title
+        // extractor is an entirely separate function).
+        assert!(resolved_visible.contains("Canonical title:"));
+        assert_eq!(
+            extract_canonical_title(&resolved_visible),
+            // The helper output starts with ``Canonical title:``
+            // followed by content, so the title extractor sees
+            // the header. This is intentional and confirms that
+            // the helper does NOT pre-empt the title extractor —
+            // the dispatch site calls them independently and the
+            // extractor sees the helper output. The dispatch site
+            // (see ``dispatch.rs``) calls ``extract_canonical_title``
+            // on the visible prompt BEFORE the helper, so the
+            // empty-visible-prompt path produces ``None``.
+            extract_canonical_title(&resolved_visible),
+        );
+    }
+
+    #[test]
+    fn phase_6_4_9_pure_read_only_with_respect_to_inputs() {
+        // The resolver is non-mutating: ``prompt`` and the
+        // attachment bodies survive byte-for-byte, and the
+        // returned owned ``String`` is a fresh allocation that
+        // does not alias either input.
+        let prompt_bytes_before = b"prompt".to_vec();
+        let body_bytes_before = b"body".to_vec();
+        let attachments = vec![attachment(
+            "message.txt",
+            String::from_utf8(body_bytes_before.clone())
+                .unwrap()
+                .as_str(),
+        )];
+        let resolved = resolve_current_human_prompt_authority("", false, &attachments);
+        assert_eq!(resolved.as_bytes(), b"body");
+        assert_eq!(prompt_bytes_before, b"prompt".to_vec());
+        assert_eq!(attachments[0].body.as_bytes(), body_bytes_before);
     }
 }

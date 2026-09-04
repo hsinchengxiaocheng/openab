@@ -1204,6 +1204,13 @@ pub async fn run_gateway_adapter(
                                             recipient: None, // Slack-only (assistant mode); N/A for gateway
                                             native_workflow: None,
                                             discord_text_attachment_bodies: Vec::new(),
+                                            // Phase 6.4.9 — gateway adapter has
+                                            // no inbound bot context; default
+                                            // ``false``. The Discord adapter
+                                            // computes this flag from
+                                            // ``msg.author.bot && msg.author.id
+                                            // != bot_id`` at ingestion.
+                                            sender_is_bot: false,
                                         };
                                         if let Err(e) = dispatcher
                                             .submit(thread_key, thread_channel, adapter, buf_msg)
@@ -1689,6 +1696,9 @@ pub async fn process_gateway_event(
             recipient: None,
             native_workflow: None,
             discord_text_attachment_bodies: Vec::new(),
+            // Phase 6.4.9 — gateway adapter has no inbound bot
+            // context; default ``false``.
+            sender_is_bot: false,
         };
         if let Err(e) = dispatcher
             .submit(thread_key, thread_channel, adapter, buf_msg)

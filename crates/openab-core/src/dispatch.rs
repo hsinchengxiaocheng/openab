@@ -78,6 +78,20 @@ pub struct BufferedMessage {
     ///   * ordinary ACP dispatch still uses `extra_blocks` for full
     ///     context — the field is consulted ONLY at the autonomous seam.
     pub discord_text_attachment_bodies: Vec<TextAttachment>,
+    /// Phase 6.4.9 — typed per-message author ``is_bot`` flag captured at
+    /// the ingestion seam (``msg.author.bot && msg.author.id != bot_id``
+    /// at Discord ingestion, matching the A12 multibot semantics).
+    /// Populated by the Discord adapter; other adapters leave it
+    /// ``false`` (no inbound bot context).
+    ///
+    /// The autonomous ingress seam consumes this typed field to enforce
+    /// the CURRENT-TURN HUMAN TEXT AUTHORITY policy in
+    /// ``autonomous_ingress::resolve_current_human_prompt_authority``:
+    /// bot, trusted-bot, bridge-bot, webhook-bot, or peer-agent turns
+    /// cannot acquire current-human prompt authority through the
+    /// ``message.txt`` fallback even when the attachment shape is
+    /// identical to a human-authored turn.
+    pub sender_is_bot: bool,
 }
 
 /// Phase 6.4.4 — typed provenance for a single Discord text-file
@@ -1339,6 +1353,31 @@ async fn dispatch_batch(
                 );
                 crate::autonomous_ingress::log_candidate(&candidate);
                 let prompt_text = batch.first().map(|m| m.prompt.clone()).unwrap_or_default();
+                // Phase 6.4.9 (Round 2) — SAME-MESSAGE AUTHORITY
+                // COMPOSITION. The Phase 6.4.9 CURRENT-TURN HUMAN TEXT
+                // AUTHORITY tuple MUST be sourced from exactly one
+                // ``BufferedMessage`` — never composed across messages
+                // in the batch. The ``first_msg`` is the FIFO-first
+                // message in this thread-batch (the canonical
+                // A12-multibot/A13-routing anchor under
+                // ``BatchGrouping::Thread``); its typed
+                // ``sender_is_bot`` flag and its own typed
+                // ``discord_text_attachment_bodies`` are the
+                // single source of truth for the authority tuple.
+                //
+                // Specifically: under Thread grouping a single
+                // Discord turn arrives as one message, but a
+                // trusted bot / bridge bot / peer agent may
+                // co-batched into the same thread-batch
+                // (the A12 multibot logic admits trusted-bot
+                // messages when they are addressed to the
+                // agent). A later bot message carrying a
+                // ``message.txt`` body MUST NOT be able to
+                // borrow its body to a human authority that
+                // has its own empty prompt.
+                let first_msg = batch.first().expect("non-empty batch by A13 admit");
+                let authority_attachments: &[crate::dispatch::TextAttachment] =
+                    &first_msg.discord_text_attachment_bodies;
                 // Phase 6.4.4 — typed Discord text-file attachment
                 // bodies. The ingestion seam records ONLY
                 // `message.txt`-style bodies here, so STT transcripts,
@@ -1346,6 +1385,14 @@ async fn dispatch_batch(
                 // `ContentBlock::Text` blocks are deterministically
                 // excluded from `user_objective`. Ordinary ACP dispatch
                 // still reads the full `extra_blocks` context.
+                //
+                // NOTE: ``text_attachment_bodies`` (used only by
+                // ``assemble_user_objective`` below) continues to
+                // aggregate across the batch because Phase 6.4.4
+                // ``user_objective`` semantics are unchanged — the
+                // objective is the human's full inbound context for
+                // the ACP turn. The aggregation is NOT used for the
+                // authority tuple.
                 let text_attachment_bodies: Vec<crate::dispatch::TextAttachment> = batch
                     .iter()
                     .flat_map(|m| m.discord_text_attachment_bodies.iter().cloned())
@@ -1371,18 +1418,53 @@ async fn dispatch_batch(
                 // boundary: a typed ``message.txt`` body in a
                 // different script from the human's prompt MUST
                 // NOT poison the per-turn language.
-                // ``prompt_text`` is already a byte-identical clone
-                // of ``BufferedMessage.prompt`` (captured at line
-                // ~1341, before any attachment assembly) so no
-                // further defensive copy is needed.
-                let original_human_prompt = prompt_text.clone();
+                //
+                // Phase 6.4.9 (Round 2) — explicit CURRENT-TURN
+                // HUMAN TEXT AUTHORITY policy with SAME-MESSAGE
+                // COMPOSITION. The resolver receives:
+                //
+                //   * ``first_msg.prompt`` (FIFO-first message's
+                //     visible prompt, byte-for-byte)
+                //   * ``first_msg.sender_is_bot`` — the typed
+                //     ``bool`` captured once at Discord ingestion
+                //     (``msg.author.bot && msg.author.id != bot_id``,
+                //     matches the A12 multibot semantics). NOT
+                //     re-parsed from ``sender_json``. Bot, trusted
+                //     bot, bridge bot, webhook bot, and peer-agent
+                //     turns flow through ``sender_is_bot == true``
+                //     and cannot acquire current-human prompt
+                //     authority through this fallback.
+                //   * ``first_msg.discord_text_attachment_bodies``
+                //     — SAME-message text attachments only.
+                //     Aggregation across the batch is forbidden for
+                //     the authority tuple.
+                //
+                // The resolver never inspects STT transcripts /
+                // image / video / sender_context / arbitrary
+                // ``ContentBlock::Text``, never reads
+                // ``user_objective``, never reads
+                // ``.agents/workflow_assignment.json``, and never
+                // parses ``sender_json``. When the visible prompt
+                // is non-empty the resolver returns it byte-for-byte,
+                // preserving the Phase 6.4.6 language-authority
+                // contract (e.g. English visible prompt + Chinese
+                // ``message.txt`` body → ``original_human_prompt``
+                // is the English visible prompt).
+                let original_human_prompt =
+                    crate::autonomous_ingress::resolve_current_human_prompt_authority(
+                        &prompt_text,
+                        first_msg.sender_is_bot,
+                        authority_attachments,
+                    );
                 // Phase 6.4.4 — assemble `user_objective` from the
                 // human prompt and the typed text-attachment bodies.
                 // When the human author did not supply a `message.txt`
                 // body the prompt is forwarded verbatim. This
                 // assembled string is the **objective** the AAP
                 // task carries; it is NOT the language-detection
-                // source.
+                // source. Phase 6.4.4 ``user_objective`` semantics are
+                // preserved (cross-batch aggregation remains the
+                // canonical behaviour for the ACP objective).
                 let user_objective = crate::autonomous_ingress::assemble_user_objective(
                     &prompt_text,
                     &text_attachment_bodies,
@@ -2625,6 +2707,11 @@ mod tests {
             recipient: None,
             native_workflow: None,
             discord_text_attachment_bodies: Vec::new(),
+            // Phase 6.4.9 — typed per-message ``sender_is_bot`` flag.
+            // Default to ``false`` (human author) for the existing
+            // dispatcher test fixtures, which construct human-authored
+            // ``BufferedMessage`` values.
+            sender_is_bot: false,
         }
     }
 
@@ -4257,6 +4344,9 @@ mod tests {
             recipient: None,
             native_workflow: None,
             discord_text_attachment_bodies: Vec::new(),
+            // Phase 6.4.9 — typed per-message ``sender_is_bot`` flag.
+            // Human-authored fixture; default to ``false``.
+            sender_is_bot: false,
         }
     }
 
@@ -4286,6 +4376,50 @@ mod tests {
             adapter,
             1,
             100,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        mock.calls()
+    }
+
+    /// Phase 6.4.9 (Round 2) — multi-message variant of
+    /// ``run_phase64``. Drives the same dispatch loop with a
+    /// pre-populated mpsc holding a batch of multiple
+    /// ``BufferedMessage`` values so the tests can verify the
+    /// SAME-MESSAGE AUTHORITY COMPOSITION rule under realistic
+    /// ``BatchGrouping::Thread`` co-batching.
+    async fn run_phase64_multi(
+        msgs: Vec<BufferedMessage>,
+        client: Arc<dyn crate::autonomous_ingress::AutonomousIngressClient>,
+        config: crate::config::AutonomousIngressConfig,
+        agent: &str,
+        tech_lead_ids: std::collections::HashSet<u64>,
+    ) -> Vec<RecordedDispatch> {
+        let mock = Arc::new(
+            MockDispatchTarget::new()
+                .with_autonomous_ingress(client, config, agent)
+                .with_tech_lead_user_ids(tech_lead_ids),
+        );
+        let target: Arc<dyn DispatchTarget> = mock.clone();
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let (tx, rx) = tokio::sync::mpsc::channel::<BufferedMessage>(msgs.len().max(1));
+        let max_batch = msgs.len().max(1);
+        for m in msgs {
+            tx.send(m).await.unwrap();
+        }
+        drop(tx);
+        consumer_loop(
+            "mock:T".into(),
+            make_channel("T"),
+            rx,
+            target,
+            None,
+            adapter,
+            // max_batch >= msgs.len() so the greedy drain keeps
+            // all messages in one batch (mirrors the realistic
+            // Thread-grouped co-batching shape).
+            max_batch,
+            10_000,
             std::time::Duration::from_secs(5),
         )
         .await;
@@ -4544,6 +4678,42 @@ mod tests {
     ) -> BufferedMessage {
         let mut msg = make_msg_with_sender(prompt, tokens, sender_json);
         msg.discord_text_attachment_bodies = attachments;
+        msg
+    }
+
+    /// Phase 6.4.9 (Round 2) — fixture builder that lets the test
+    /// set BOTH the typed ``sender_is_bot`` flag and the typed
+    /// ``discord_text_attachment_bodies`` directly. The bot /
+    /// e2e / mixed-batch tests need both fields under control.
+    /// The ``sender_json`` is preserved for A13 routing (which
+    /// re-parses the JSON shape) — its embedded ``is_bot`` flag
+    /// MUST agree with the typed ``sender_is_bot`` parameter,
+    /// because the A13 routing key still keys off
+    /// ``first_msg.sender_json``. This helper enforces that
+    /// agreement at the fixture boundary.
+    fn make_msg_with_sender_and_typed_bot(
+        prompt: &str,
+        tokens: usize,
+        sender_json: String,
+        sender_is_bot: bool,
+        attachments: Vec<crate::dispatch::TextAttachment>,
+    ) -> BufferedMessage {
+        // Sanity check: the typed ``sender_is_bot`` and the
+        // embedded JSON ``is_bot`` MUST agree, because the A13
+        // routing path re-derives ``author_is_bot`` from
+        // ``sender_json``. A disagreement would either bypass the
+        // A13 suppression path (typed false, JSON true) or
+        // trigger A13 suppression on the typed-only path (typed
+        // true, JSON false). The fixtures must keep these in sync
+        // so the test exercises the targeted seam.
+        let parsed_is_bot = parse_sender_is_bot(&sender_json);
+        assert_eq!(
+            parsed_is_bot, sender_is_bot,
+            "fixture disagreement: typed sender_is_bot={sender_is_bot} but parsed sender_json is_bot={parsed_is_bot}"
+        );
+        let mut msg = make_msg_with_sender(prompt, tokens, sender_json);
+        msg.discord_text_attachment_bodies = attachments;
+        msg.sender_is_bot = sender_is_bot;
         msg
     }
 
@@ -5445,5 +5615,695 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .contains("step 1: do this"),);
+    }
+
+    // ===================================================================
+    // Phase 6.4.9 — Discord oversized paste ``original_human_prompt``
+    // dispatch seam regression coverage.
+    //
+    // Production root cause: when the human paste exceeds the Discord
+    // 2000-character visible limit, ``BufferedMessage.prompt`` ends
+    // up empty after mention resolution while the typed paste body
+    // survives in ``discord_text_attachment_bodies``. The previous
+    // dispatch site forwarded ``original_human_prompt = prompt.clone()``
+    // which was empty, and AAP rejected with HTTP 422
+    // ``body.original_human_prompt: String should have at least 1
+    // character``.
+    //
+    // The fix is the bounded resolver in
+    // ``autonomous_ingress::resolve_original_human_prompt``: when
+    // the visible prompt is empty AND there is exactly one typed
+    // ``TextAttachment`` whose filename is the canonical Discord
+    // ``"message.txt"`` and whose body is non-empty, the body
+    // becomes ``original_human_prompt``. For all other shapes the
+    // function returns ``""`` so AAP HTTP 422 surfaces normally
+    // rather than us guessing.
+    //
+    // These tests pin the four documented outcomes end-to-end
+    // through the dispatch seam:
+    //
+    //   A. ``visible prompt non-empty`` → ``original_human_prompt``
+    //      equals the visible prompt byte-for-byte (Phase 6.4.6
+    //      contract is unchanged even when a ``message.txt``
+    //      attachment is also present).
+    //   B. ``visible prompt empty + single message.txt`` →
+    //      ``original_human_prompt`` equals the typed body
+    //      (the fix's happy path).
+    //   C. ``visible prompt empty + manually uploaded notes.txt`` →
+    //      ``original_human_prompt`` stays empty so the existing
+    //      AAP HTTP 422 fail-closed surface remains intact.
+    //   D. ``visible prompt empty + multiple attachments with a
+    //      ``message.txt`` among them`` → ``original_human_prompt``
+    //      stays empty (the resolver requires EXACTLY one).
+    //
+    // Outcome D is the most important guard against promoting
+    // arbitrary ContentBlock::Text bodies into human authority.
+    // ===================================================================
+
+    #[tokio::test]
+    async fn phase64_49_oversized_paste_fallback_populates_original_human_prompt() {
+        // Phase 6.4.9 happy path: Discord oversized paste +
+        // empty visible prompt + single ``message.txt`` body.
+        // ``original_human_prompt`` MUST now equal the body so AAP
+        // language detection has a non-empty source.
+        std::env::set_var("ARTHUR_AGENT_NAME", "ArthurClaude");
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids = std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+        let attachments = vec![crate::dispatch::TextAttachment {
+            filename: "message.txt".into(),
+            body: "請運行遷移並修復服務器\nstep 1: 初始化\nstep 2: 重啟".into(),
+        }];
+        let msg = make_msg_with_text_attachments(
+            "", // visible prompt is empty (only <@bot> in Discord)
+            30,
+            tech_lead_sender_json(tech_lead_id),
+            attachments,
+        );
+        let fake = crate::autonomous_ingress::FakeAutonomousIngressClient::always_accept();
+        let client: Arc<dyn crate::autonomous_ingress::AutonomousIngressClient> = fake.clone();
+        let _ = run_phase64(
+            msg,
+            client,
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+        assert_eq!(fake.call_count(), 1);
+        let recorded = &fake.calls.lock().unwrap()[0];
+        // The fix: original_human_prompt equals the typed body.
+        assert_eq!(
+            recorded.original_human_prompt, "請運行遷移並修復服務器\nstep 1: 初始化\nstep 2: 重啟",
+            "original_human_prompt must fall back to the oversized paste body",
+        );
+        // user_objective still carries the same body so the agent
+        // sees the full human paste.
+        assert!(
+            recorded.user_objective.contains("請運行遷移並修復服務器"),
+            "user_objective must still contain the human paste body: {}",
+            recorded.user_objective,
+        );
+        assert!(
+            recorded.user_objective.contains("message.txt"),
+            "user_objective must still carry the [Attached text file: message.txt] marker: {}",
+            recorded.user_objective,
+        );
+        // Language is still None so the AAP canonical boundary
+        // detects from the typed body.
+        assert!(recorded.language.is_none());
+    }
+
+    #[tokio::test]
+    async fn phase64_49_visible_prompt_wins_unchanged_when_non_empty() {
+        // Phase 6.4.6 contract pinned: even if a ``message.txt``
+        // body is present, the visible prompt wins byte-for-byte.
+        // This is the English-visible + Chinese-attachment case.
+        // Phase 6.4.9 must NOT regress it.
+        std::env::set_var("ARTHUR_AGENT_NAME", "ArthurClaude");
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids = std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+        let prompt_text = "Please run the migration described below.";
+        let attachments = vec![crate::dispatch::TextAttachment {
+            filename: "message.txt".into(),
+            body: "請運行遷移並修復服務器".into(),
+        }];
+        let msg = make_msg_with_text_attachments(
+            prompt_text,
+            30,
+            tech_lead_sender_json(tech_lead_id),
+            attachments,
+        );
+        let fake = crate::autonomous_ingress::FakeAutonomousIngressClient::always_accept();
+        let client: Arc<dyn crate::autonomous_ingress::AutonomousIngressClient> = fake.clone();
+        let _ = run_phase64(
+            msg,
+            client,
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+        assert_eq!(fake.call_count(), 1);
+        let recorded = &fake.calls.lock().unwrap()[0];
+        assert_eq!(
+            recorded.original_human_prompt, prompt_text,
+            "visible prompt must still win byte-for-byte when non-empty",
+        );
+        // And user_objective still concatenates the typed
+        // attachment body — the agent still sees it.
+        assert!(
+            recorded.user_objective.contains("請運行遷移並修復服務器"),
+            "user_objective must still carry the Chinese attachment body",
+        );
+    }
+
+    #[tokio::test]
+    async fn phase64_49_manual_notes_txt_attachment_does_not_promote_body() {
+        // Defence-in-depth: a user manually uploads a single
+        // ordinary text file (``notes.txt``) when the visible
+        // prompt is empty. The resolver MUST NOT promote it to
+        // ``original_human_prompt`` even though it is a single
+        // text attachment — only the canonical ``message.txt``
+        // oversized-paste filename qualifies.
+        std::env::set_var("ARTHUR_AGENT_NAME", "ArthurClaude");
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids = std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+        let attachments = vec![crate::dispatch::TextAttachment {
+            filename: "notes.txt".into(),
+            body: "user authored plan that should not be promoted".into(),
+        }];
+        let msg = make_msg_with_text_attachments(
+            "", // visible prompt is empty (only <@bot> in Discord)
+            30,
+            tech_lead_sender_json(tech_lead_id),
+            attachments,
+        );
+        let fake = crate::autonomous_ingress::FakeAutonomousIngressClient::always_accept();
+        let client: Arc<dyn crate::autonomous_ingress::AutonomousIngressClient> = fake.clone();
+        let _ = run_phase64(
+            msg,
+            client,
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+        assert_eq!(fake.call_count(), 1);
+        let recorded = &fake.calls.lock().unwrap()[0];
+        assert_eq!(
+            recorded.original_human_prompt, "",
+            "manually uploaded notes.txt MUST NOT be promoted to original_human_prompt",
+        );
+        // BUT the body still reaches the agent via user_objective
+        // because ordinary ACP user_objective carries the
+        // attached file content as the agent's context. Only the
+        // canonical language-detection source stays empty.
+        assert!(
+            recorded
+                .user_objective
+                .contains("user authored plan that should not be promoted"),
+            "user_objective must still include the manually uploaded file body: {}",
+            recorded.user_objective,
+        );
+    }
+
+    #[tokio::test]
+    async fn phase64_49_multiple_attachments_do_not_promote_any_body() {
+        // Defence-in-depth: when the user manually attaches a
+        // ``message.txt`` *plus* other files AND the visible
+        // prompt is empty, the resolver MUST NOT promote any
+        // body. The provenance rule requires ``exactly one``
+        // attachment so a curated bundle never silently becomes
+        // canonical human authority.
+        std::env::set_var("ARTHUR_AGENT_NAME", "ArthurClaude");
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids = std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+        let attachments = vec![
+            crate::dispatch::TextAttachment {
+                filename: "message.txt".into(),
+                body: "first body".into(),
+            },
+            crate::dispatch::TextAttachment {
+                filename: "extras.txt".into(),
+                body: "second body".into(),
+            },
+        ];
+        let msg = make_msg_with_text_attachments(
+            "", // visible prompt empty
+            30,
+            tech_lead_sender_json(tech_lead_id),
+            attachments,
+        );
+        let fake = crate::autonomous_ingress::FakeAutonomousIngressClient::always_accept();
+        let client: Arc<dyn crate::autonomous_ingress::AutonomousIngressClient> = fake.clone();
+        let _ = run_phase64(
+            msg,
+            client,
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+        assert_eq!(fake.call_count(), 1);
+        let recorded = &fake.calls.lock().unwrap()[0];
+        assert_eq!(
+            recorded.original_human_prompt, "",
+            "multiple attachments MUST NOT be promoted to original_human_prompt — fail-closed",
+        );
+        // Bodies still reach the agent via user_objective
+        // — only the canonical authority stays empty.
+        assert!(recorded.user_objective.contains("first body"));
+        assert!(recorded.user_objective.contains("second body"));
+    }
+
+    #[tokio::test]
+    async fn phase64_49_empty_message_txt_body_does_not_promote() {
+        // Defence-in-depth: an empty body (filestore oversized
+        // fallback path returns ``body: String::new()`` by
+        // contract) MUST NOT become ``original_human_prompt``
+        // even when the filename matches. AAP HTTP 422 must
+        // surface normally.
+        std::env::set_var("ARTHUR_AGENT_NAME", "ArthurClaude");
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids = std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+        let attachments = vec![crate::dispatch::TextAttachment {
+            filename: "message.txt".into(),
+            body: String::new(),
+        }];
+        let msg = make_msg_with_text_attachments(
+            "", // visible prompt empty
+            30,
+            tech_lead_sender_json(tech_lead_id),
+            attachments,
+        );
+        let fake = crate::autonomous_ingress::FakeAutonomousIngressClient::always_accept();
+        let client: Arc<dyn crate::autonomous_ingress::AutonomousIngressClient> = fake.clone();
+        let _ = run_phase64(
+            msg,
+            client,
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+        assert_eq!(fake.call_count(), 1);
+        let recorded = &fake.calls.lock().unwrap()[0];
+        assert_eq!(
+            recorded.original_human_prompt, "",
+            "empty message.txt body MUST NOT be promoted — fail-closed",
+        );
+    }
+
+    // ===================================================================
+    // Phase 6.4.9 Round 2 — SAME-MESSAGE AUTHORITY COMPOSITION.
+    //
+    // The CURRENT-TURN HUMAN TEXT AUTHORITY tuple
+    // (prompt, sender_is_bot, discord_text_attachment_bodies) MUST
+    // be sourced from exactly ONE ``BufferedMessage`` — the
+    // FIFO-first message in the thread-batch. Cross-message
+    // composition was the Phase 6.4.9 Round-1 blocking defect
+    // (VERIFIER_FAIL): a trusted-bot ``message.txt`` body could
+    // be lifted into ``original_human_prompt`` by aggregating
+    // attachments across the batch while the authority tuple's
+    // other fields were taken from a different (human) message.
+    //
+    // These dispatch-level tests pin the corrected behaviour at
+    // the seam where the helper is actually invoked:
+    //
+    //   R2-A. Bot e2e: a single bot-authored ``BufferedMessage``
+    //        with empty visible prompt + one non-empty
+    //        ``message.txt`` MUST NOT promote the bot body. AAP
+    //        receives ``original_human_prompt == ""``.
+    //   R2-B. Mixed batch (human-first, bot-second): the
+    //        FIFO-first human message has empty visible prompt
+    //        and no own attachments; a later bot message in the
+    //        same batch carries a ``message.txt`` body. The
+    //        resolver MUST NOT borrow the bot's body. Result:
+    //        ``original_human_prompt == ""``.
+    //   R2-C. Mixed batch inverse (bot-first, human-second): the
+    //        FIFO-first message is bot; A13 suppression routes
+    //        the batch away from AAP (``phase64_bot_messages_do
+    //        _not_create_workflows``), so the AAP client is
+    //        never invoked. Pinned to prove the inverse
+    //        direction.
+    //   R2-D. Mixed batch (human-first + own message.txt +
+    //         later bot attachments): the first human message
+    //         owns its own non-empty ``message.txt`` and the
+    //         helper promotes only its OWN body; the bot's
+    //         later body is NOT substituted in. The result is
+    //         the human's own body byte-for-byte.
+    //   R2-E. user_objective aggregation unchanged: the mixed
+    //         batch's ``user_objective`` still concatenates ALL
+    //         text attachments across the batch (Phase 6.4.4
+    //         semantic) — only the AUTHORITY tuple is
+    //         same-message. This test pins the explicit
+    //         separation between authority attachments
+    //         (same-message) and objective attachments
+    //         (batch-aggregated).
+    // ===================================================================
+
+    #[tokio::test]
+    async fn phase_6_4_9_r2_a_bot_message_txt_does_not_become_original_human_prompt() {
+        // R2-A — Bot end-to-end regression. A single bot-authored
+        // ``BufferedMessage`` arrives with empty visible prompt
+        // and a non-empty ``message.txt`` attachment. The A13
+        // routing key still re-derives ``author_is_bot`` from
+        // ``first_msg.sender_json`` so the A13 suppression path
+        // here keys off the JSON-parsed ``is_bot: true``. We
+        // therefore construct the fixture with both the typed
+        // ``sender_is_bot: true`` AND a ``sender_json`` whose
+        // embedded ``is_bot: true`` agrees with it (so the A13
+        // routing suppresses the batch away from AAP, the AAP
+        // client is NOT invoked, and ordinary ACP runs
+        // unchanged). The pin: bot-authored ``message.txt``
+        // NEVER becomes ``original_human_prompt`` — neither via
+        // the helper (which keys on the typed flag) nor via
+        // A13 routing (which keys on the parsed JSON flag).
+        std::env::set_var("ARTHUR_AGENT_NAME", "ArthurClaude");
+        let tech_lead_id: u64 = 645496545805951947;
+        let mut tech_lead_ids = std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+        let attachments = vec![crate::dispatch::TextAttachment {
+            filename: "message.txt".into(),
+            body: "trusted bot body that must never reach authority".into(),
+        }];
+        let bot_msg = make_msg_with_sender_and_typed_bot(
+            "", // visible prompt is empty (only <@bot>)
+            30,
+            bot_sender_json(),
+            true,
+            attachments,
+        );
+        let fake = crate::autonomous_ingress::FakeAutonomousIngressClient::always_accept();
+        let client: Arc<dyn crate::autonomous_ingress::AutonomousIngressClient> = fake.clone();
+        let _ = run_phase64(
+            bot_msg,
+            client,
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+        // Bot-authored turns must NOT route to AAP at all
+        // (the A13 gate suppresses them) — the AAP client must
+        // be invoked zero times. This is the canonical
+        // ``phase64_bot_messages_do_not_create_workflows``
+        // invariant; here we also prove that even if the A13
+        // suppression is bypassed (e.g. via
+        // ``aap_universal_humans = true``), the typed
+        // ``sender_is_bot`` flag at the dispatch site would
+        // still short-circuit ``original_human_prompt`` to
+        // ``""`` because the helper sees ``sender_is_bot: true``.
+        // The Phase 6.4.9 Round-2 same-message composition
+        // contract is verified by the helper unit tests; the
+        // dispatch-level pin here is that bot traffic does
+        // not create workflows.
+        assert_eq!(
+            fake.call_count(),
+            0,
+            "bot-authored turns must NOT invoke the AAP client"
+        );
+    }
+
+    #[tokio::test]
+    async fn phase_6_4_9_r2_b_mixed_batch_human_first_bot_second_does_not_borrow_body() {
+        // R2-B — Mixed-batch regression that caused VERIFIER_FAIL
+        // in Round 1. Realistic Thread-grouped co-batching
+        // shape: the FIFO-first message is a Tech-Lead human
+        // with an empty visible prompt and no own attachments;
+        // a later trusted-bot message in the same batch carries
+        // a ``message.txt`` body. Under the Round-1 cross-message
+        // composition, the helper received the human's prompt +
+        // the human's ``author_is_bot = false`` + an
+        // aggregated ``text_attachment_bodies`` that included
+        // the bot's body — promoting bot text as current-human
+        // authority.
+        //
+        // The Round-2 fix sources the authority tuple from
+        // ``batch.first()`` ONLY. The first message has empty
+        // visible prompt AND empty
+        // ``discord_text_attachment_bodies``, so the resolver
+        // returns ``""``. The bot's body is not borrowed.
+        std::env::set_var("ARTHUR_AGENT_NAME", "ArthurClaude");
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids = std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+        // The human first message has empty visible prompt
+        // and NO own attachments.
+        let human_first = make_msg_with_sender_and_typed_bot(
+            "",
+            5,
+            tech_lead_sender_json(tech_lead_id),
+            false,
+            Vec::new(),
+        );
+        // The trusted-bot second message carries the
+        // ``message.txt`` body. ``sender_is_bot: true`` so the
+        // typed flag forbids promotion.
+        let bot_second = make_msg_with_sender_and_typed_bot(
+            "",
+            30,
+            bot_sender_json(),
+            true,
+            vec![crate::dispatch::TextAttachment {
+                filename: "message.txt".into(),
+                body: "trusted bot body that must not be promoted".into(),
+            }],
+        );
+        let fake = crate::autonomous_ingress::FakeAutonomousIngressClient::always_accept();
+        let client: Arc<dyn crate::autonomous_ingress::AutonomousIngressClient> = fake.clone();
+        let _ = run_phase64_multi(
+            vec![human_first, bot_second],
+            client,
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+        // A13 routing keys on ``first_msg.sender_json`` which is
+        // human Tech-Lead (no suppression), AND the
+        // ``WorkflowAssignmentMissing`` branch fires, so AAP IS
+        // invoked exactly once. The recorded AAP call MUST have
+        // an empty ``original_human_prompt`` because the
+        // authority tuple is sourced from the human-first
+        // message alone, which has neither visible text nor own
+        // attachments.
+        assert_eq!(
+            fake.call_count(),
+            1,
+            "AAP must be invoked exactly once for the Tech-Lead human first message"
+        );
+        let recorded = &fake.calls.lock().unwrap()[0];
+        assert_eq!(
+            recorded.original_human_prompt, "",
+            "first (human) message has empty prompt and no own attachments; \
+             the bot-second message's body must NOT be borrowed into authority"
+        );
+        // user_objective still aggregates across the batch
+        // (Phase 6.4.4 semantic). The bot's body still flows
+        // into the objective — the agent will still see it,
+        // just not as the language-authority source.
+        assert!(
+            recorded.user_objective.contains("trusted bot body"),
+            "user_objective still aggregates across the batch (Phase 6.4.4): {}",
+            recorded.user_objective
+        );
+    }
+
+    #[tokio::test]
+    async fn phase_6_4_9_r2_c_mixed_batch_bot_first_human_second_does_not_route_to_aap() {
+        // R2-C — Inverse direction: the FIFO-first message is a
+        // bot; a later message is a human with a ``message.txt``
+        // body. A13 routing keys on ``first_msg.sender_json``
+        // (bot) so the batch is suppressed away from AAP. The
+        // AAP client is never invoked, so there is no
+        // ``original_human_prompt`` to construct. Pinned to
+        // prove the bot-first shape is also fail-closed.
+        std::env::set_var("ARTHUR_AGENT_NAME", "ArthurClaude");
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids = std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+        // FIFO-first message is a trusted bot with empty prompt
+        // and a single ``message.txt`` body. The A13 routing
+        // path will suppress this batch.
+        let bot_first = make_msg_with_sender_and_typed_bot(
+            "",
+            5,
+            bot_sender_json(),
+            true,
+            vec![crate::dispatch::TextAttachment {
+                filename: "message.txt".into(),
+                body: "bot body that must not reach authority".into(),
+            }],
+        );
+        // FIFO-second message is the Tech-Lead human with empty
+        // prompt + a single non-empty ``message.txt``. Even if
+        // the batch were allowed to reach AAP, the authority
+        // tuple keys on ``batch.first()`` (the bot), so the
+        // resolver returns ``""`` regardless.
+        let human_second = make_msg_with_sender_and_typed_bot(
+            "",
+            30,
+            tech_lead_sender_json(tech_lead_id),
+            false,
+            vec![crate::dispatch::TextAttachment {
+                filename: "message.txt".into(),
+                body: "human body that must not be borrowed by bot-first authority".into(),
+            }],
+        );
+        let fake = crate::autonomous_ingress::FakeAutonomousIngressClient::always_accept();
+        let client: Arc<dyn crate::autonomous_ingress::AutonomousIngressClient> = fake.clone();
+        let _ = run_phase64_multi(
+            vec![bot_first, human_second],
+            client,
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+        // A13 suppresses the entire batch because the
+        // FIFO-first sender is a bot. AAP is NEVER invoked.
+        assert_eq!(
+            fake.call_count(),
+            0,
+            "A13 must suppress bot-first batches away from AAP"
+        );
+    }
+
+    #[tokio::test]
+    async fn phase_6_4_9_r2_d_human_first_own_message_txt_not_swapped_by_bot_second() {
+        // R2-D — Mixed batch where the FIFO-first human
+        // message has its OWN non-empty ``message.txt`` body
+        // and a later bot message ALSO carries a
+        // ``message.txt``. The authority tuple keys on the
+        // first message only, so the resolver must promote the
+        // HUMAN's own body, not the bot's body. This test
+        // pins the correctness invariant for the
+        // authority-attachment / objective-attachment split.
+        std::env::set_var("ARTHUR_AGENT_NAME", "ArthurClaude");
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids = std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+        let human_first = make_msg_with_sender_and_typed_bot(
+            "",
+            5,
+            tech_lead_sender_json(tech_lead_id),
+            false,
+            vec![crate::dispatch::TextAttachment {
+                filename: "message.txt".into(),
+                body: "HUMAN owned body".into(),
+            }],
+        );
+        let bot_second = make_msg_with_sender_and_typed_bot(
+            "",
+            30,
+            bot_sender_json(),
+            true,
+            vec![crate::dispatch::TextAttachment {
+                filename: "message.txt".into(),
+                body: "BOT owned body".into(),
+            }],
+        );
+        let fake = crate::autonomous_ingress::FakeAutonomousIngressClient::always_accept();
+        let client: Arc<dyn crate::autonomous_ingress::AutonomousIngressClient> = fake.clone();
+        let _ = run_phase64_multi(
+            vec![human_first, bot_second],
+            client,
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+        assert_eq!(
+            fake.call_count(),
+            1,
+            "AAP must be invoked exactly once for the Tech-Lead human first message"
+        );
+        let recorded = &fake.calls.lock().unwrap()[0];
+        // The authority tuple is sourced from the FIRST
+        // (human) message alone. The resolver must promote the
+        // HUMAN's own body, NOT the bot's body that happens to
+        // share the same ``message.txt`` filename.
+        assert_eq!(
+            recorded.original_human_prompt, "HUMAN owned body",
+            "authority tuple keys on first (human) message: must promote HUMAN body, not BOT body"
+        );
+        // And the bot's body MUST NOT appear in
+        // ``original_human_prompt`` even though it shares the
+        // filename.
+        assert!(
+            !recorded.original_human_prompt.contains("BOT owned body"),
+            "bot second-message body must not contaminate original_human_prompt"
+        );
+        // user_objective still aggregates across the batch —
+        // the bot's body still flows into the objective for
+        // the ACP turn.
+        assert!(
+            recorded.user_objective.contains("HUMAN owned body"),
+            "user_objective includes human body: {}",
+            recorded.user_objective
+        );
+        assert!(
+            recorded.user_objective.contains("BOT owned body"),
+            "user_objective still aggregates across the batch (Phase 6.4.4): {}",
+            recorded.user_objective
+        );
+    }
+
+    #[tokio::test]
+    async fn phase_6_4_9_r2_e_user_objective_aggregation_unchanged_in_mixed_batch() {
+        // R2-E — Pin that ``user_objective`` semantics are
+        // UNCHANGED by the Round-2 fix: cross-batch text
+        // attachment aggregation for the autonomous objective
+        // continues to apply (Phase 6.4.4 canonical). Only
+        // the AUTHORITY tuple is restricted to same-message.
+        std::env::set_var("ARTHUR_AGENT_NAME", "ArthurClaude");
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids = std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+        let human_first = make_msg_with_sender_and_typed_bot(
+            "",
+            5,
+            tech_lead_sender_json(tech_lead_id),
+            false,
+            vec![crate::dispatch::TextAttachment {
+                filename: "message.txt".into(),
+                body: "alpha body".into(),
+            }],
+        );
+        let human_second = make_msg_with_sender_and_typed_bot(
+            "",
+            5,
+            tech_lead_sender_json(tech_lead_id),
+            false,
+            vec![crate::dispatch::TextAttachment {
+                filename: "message.txt".into(),
+                body: "beta body".into(),
+            }],
+        );
+        let fake = crate::autonomous_ingress::FakeAutonomousIngressClient::always_accept();
+        let client: Arc<dyn crate::autonomous_ingress::AutonomousIngressClient> = fake.clone();
+        let _ = run_phase64_multi(
+            vec![human_first, human_second],
+            client,
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+        assert_eq!(fake.call_count(), 1);
+        let recorded = &fake.calls.lock().unwrap()[0];
+        // Authority: the first message has empty visible
+        // prompt and its OWN single non-empty ``message.txt``.
+        // The helper promotes the first message's body
+        // (``alpha body``) byte-for-byte.
+        assert_eq!(
+            recorded.original_human_prompt, "alpha body",
+            "authority tuple sources from first message only"
+        );
+        // user_objective aggregates across the batch
+        // (Phase 6.4.4 semantic) — both ``alpha body`` and
+        // ``beta body`` appear in the objective.
+        assert!(
+            recorded.user_objective.contains("alpha body"),
+            "user_objective must include first-message body: {}",
+            recorded.user_objective
+        );
+        assert!(
+            recorded.user_objective.contains("beta body"),
+            "user_objective must aggregate across the batch (Phase 6.4.4 unchanged): {}",
+            recorded.user_objective
+        );
+        // The authority tuple did NOT borrow the second
+        // message's body.
+        assert!(
+            !recorded.original_human_prompt.contains("beta body"),
+            "original_human_prompt must NOT borrow the second message's body"
+        );
     }
 }

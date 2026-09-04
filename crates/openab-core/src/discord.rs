@@ -1686,6 +1686,15 @@ impl EventHandler for Handler {
                 cache.contains_key(&msg.channel_id.to_string())
             } || self.multibot_cache.is_multibot(&msg.channel_id.to_string());
 
+        // Phase 6.4.9 — typed per-message ``sender_is_bot`` flag for
+        // the CURRENT-TURN HUMAN TEXT AUTHORITY policy. ``true`` when
+        // the inbound ``Message``'s author is a Discord bot AND is not
+        // our own bot user — matching the A12 multibot semantics used
+        // elsewhere in this adapter (``msg.author.bot &&
+        // msg.author.id != bot_id``). Trusted bots, bridge bots,
+        // webhook bots, and peer agents all flow through this branch.
+        let sender_is_bot = msg.author.bot && msg.author.id != bot_id;
+
         // Backfill thread_id: when OAB just created a new thread, the sender
         // was built before the thread existed. Patch it so the agent sees
         // thread_id on the very first turn.
@@ -1765,6 +1774,7 @@ impl EventHandler for Handler {
                 recipient: None, // Slack-only (assistant mode); N/A for Discord
                 native_workflow: None,
                 discord_text_attachment_bodies,
+                sender_is_bot,
             };
             Handler::admit_after_discord_gates(
                 admission,
@@ -2024,6 +2034,11 @@ impl EventHandler for Handler {
                 recipient: None,
                 native_workflow: None,
                 discord_text_attachment_bodies: Vec::new(),
+                // Second-bot wake path — the inbound author is never
+                // a bot here (the multibot_mentions branch only fires
+                // for human-authored turns), so ``sender_is_bot`` is
+                // ``false`` by construction.
+                sender_is_bot: false,
             };
 
             if let Err(e) = admission
@@ -4179,6 +4194,10 @@ mod tests {
                 recipient: None,
                 native_workflow: None,
                 discord_text_attachment_bodies: Vec::new(),
+                // Admission test fixture — the inbound author is the
+                // human fixture user (``sender_id: "human"``), so the
+                // typed ``sender_is_bot`` flag is ``false``.
+                sender_is_bot: false,
             },
             conversation,
             native_workflow: None,

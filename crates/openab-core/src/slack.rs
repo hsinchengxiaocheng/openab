@@ -1815,6 +1815,9 @@ async fn handle_message(
         recipient: stream_recipient,
         native_workflow: None,
         discord_text_attachment_bodies: Vec::new(),
+        // Phase 6.4.9 — typed per-message ``sender_is_bot`` flag.
+        // Slack adapter has no inbound bot context; default ``false``.
+        sender_is_bot: false,
     };
     if let Err(e) = dispatcher
         .submit(thread_key, thread_channel, adapter_dyn, buf_msg)

@@ -628,6 +628,9 @@ mod tests {
                 recipient: None,
                 native_workflow: None,
                 discord_text_attachment_bodies: Vec::new(),
+                // Phase 6.4.9 — admission test fixture is a human
+                // author; ``sender_is_bot`` defaults to ``false``.
+                sender_is_bot: false,
             },
             conversation,
             native_workflow: None,
