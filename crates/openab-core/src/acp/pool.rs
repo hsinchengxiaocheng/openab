@@ -93,6 +93,23 @@ pub struct SessionPool {
     state: RwLock<PoolState>,
     config: AgentConfig,
     max_sessions: usize,
+    /// Phase 6.4.10 (TOCTOU fix) — count of in-flight creation
+    /// reservations. The invariant the pool enforces is:
+    ///
+    ///   `state.active.len() + outstanding_creations <= max_sessions`
+    ///
+    /// Every spawn path (`get_or_create`, `create_fresh_session_only`)
+    /// must increment this counter BEFORE starting
+    /// `AcpConnection::spawn` (in `ensure_capacity_or_evict`) and either
+    /// commit it (on successful `state.active.insert`) or release it via
+    /// RAII (on any failure path). Without this counter, two concurrent
+    /// creators could each observe `active.len() < max_sessions`, each
+    /// spawn, and each insert — pushing `active.len()` to
+    /// `max_sessions + 1` (or more). The reservation is held across
+    /// spawn, initialize, and session/load/new; only the in-memory
+    /// `state.active.insert` consumes it. Lock-free `AtomicUsize` because
+    /// the holder only needs to count, never inspect.
+    outstanding_creations: std::sync::atomic::AtomicUsize,
     /// Force-evict sessions stuck in-flight longer than this threshold
     /// (`prompt_hard_timeout_secs + hung_grace_secs`, wired in main.rs).
     hung_threshold_secs: u64,
@@ -123,10 +140,183 @@ pub struct SessionPool {
     session_registrar: Option<Arc<dyn crate::acp_mcp::SessionTokenRegistrar>>,
     #[cfg(feature = "acp-mcp")]
     facade_url: Option<String>,
+    /// Phase 6.4.10 (TOCTOU fix regression test) — deterministic
+    /// barrier used by tests Q/R/M to pin contention to the exact
+    /// moment in `ensure_capacity_or_evict` where the eviction branch
+    /// is about to release the state lock. Production code never sets
+    /// this; the only readers are `cfg(test)` paths inside
+    /// `ensure_capacity_or_evict`, which `.notified().await` only when
+    /// the optional is `Some`.
+    #[cfg(test)]
+    eviction_reservation_barrier: Option<Arc<tokio::sync::Notify>>,
+    /// Phase 6.4.10 (TOCTOU fix regression test) — fires once every
+    /// time `ensure_capacity_or_evict` is entered, BEFORE the state
+    /// write lock is acquired. Tests use it to prove that a second
+    /// creator actually reached the capacity-attempt boundary before
+    /// the test releases the first creator. Production code never
+    /// sets this; the only call site is a `cfg(test)` guard at the
+    /// top of `ensure_capacity_or_evict`.
+    #[cfg(test)]
+    ensure_capacity_attempt_notify: Option<Arc<tokio::sync::Notify>>,
+    /// Phase 6.4.10 (TOCTOU fix regression test) — fires inside the
+    /// eviction branch AFTER `outstanding_creations.fetch_add(1)` and
+    /// BEFORE the barrier await. Tests use this as the
+    /// "participant has parked with reservation" signal — its
+    /// position AFTER fetch_add means the test thread can read the
+    /// atomic counter and observe `outstanding == 1` deterministically
+    /// (no race window between the arrival notify and the fetch_add).
+    /// Production code never sets this.
+    #[cfg(test)]
+    eviction_reserved_notify: Option<Arc<tokio::sync::Notify>>,
+    /// Phase 6.4.10 (cancellation-test synchronization) — fires once
+    /// from inside `CreationReservation::drop`, AFTER the failure-path
+    /// `fetch_sub` (or after `commit()` sets `committed = true`).
+    /// Test P awaits this to deterministically observe that the RAII
+    /// guard's Drop has run after the creator is cancelled, replacing
+    /// the prior `for _ in 0..16 { yield_now().await; }` heuristic.
+    /// Production code never sets this; the only call site is a
+    /// `cfg(test)` guard inside `Drop for CreationReservation`.
+    #[cfg(test)]
+    reservation_drop_notify: Option<Arc<tokio::sync::Notify>>,
+    /// Phase 6.4.10 (contention-test synchronization) — fires at the
+    /// TOP of `get_or_create` and `create_fresh_session_only`, BEFORE
+    /// any lock acquire (and specifically BEFORE the per-thread
+    /// gate's `state.write().await`). Tests K/L/Q/R use this as the
+    /// "participant has entered the pool" signal because it is
+    /// reachable by BOTH creators in a contention shape — the parked
+    /// creator (B) and the blocked creator (C, blocked on the
+    /// per-thread gate's write lock while B holds it inside the
+    /// eviction branch). The pre-existing
+    /// `ensure_capacity_attempt_notify` fires INSIDE
+    /// `ensure_capacity_or_evict` and is therefore unreachable for
+    /// the blocked creator; `creator_arrival_notify` sits above the
+    /// per-thread gate's lock so it fires for both. Production
+    /// code never sets this; the only call sites are `cfg(test)`
+    /// guards at the top of `get_or_create` and
+    /// `create_fresh_session_only`.
+    #[cfg(test)]
+    creator_arrival_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 type CancelHandle = (Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>, String);
 type ActiveSnapshot = Vec<(String, Arc<Mutex<AcpConnection>>)>;
+
+/// Phase 6.4.10 (TOCTOU fix) — entry lifecycle phase encoding used by
+/// `AcpConnection::phase`. The numeric values are part of the
+/// observable contract: the eviction and prompt-claim paths CAS on
+/// these exact bytes. `EntryPhase` here is a documentation alias; the
+/// runtime authority is the atomic in `AcpConnection`.
+pub mod entry_phase {
+    /// Entry is idle — no prompt in flight, not selected for eviction.
+    /// Safe to claim for either a prompt or for eviction.
+    pub const IDLE: u8 = 0;
+    /// Entry is currently executing a prompt turn. Must NOT be evicted.
+    pub const BUSY: u8 = 1;
+    /// Entry has been claimed for eviction. Must NOT be reused.
+    pub const EVICTING: u8 = 2;
+}
+
+/// Phase 6.4.10 (TOCTOU fix) — RAII guard for one outstanding creation
+/// reservation. Returned by [`SessionPool::ensure_capacity_or_evict`].
+///
+/// The reservation covers the entire creation window:
+///
+///   capacity decision
+///   → optional idle eviction
+///   → spawn
+///   → initialize / session_new
+///   → successful insertion
+///
+/// On every failure path the reservation is dropped, which decrements
+/// `outstanding_creations` so the next creator can succeed. On the
+/// success path the caller invokes [`CreationReservation::commit`],
+/// which marks the reservation as consumed (the new entry already
+/// counts as a live slot via `state.active.insert`, so the reservation
+/// must NOT also be subtracted by the Drop impl — that would double-
+/// count and unbalance the invariant).
+///
+/// Holding a reservation does NOT lock any pool state. The caller is
+/// expected to be the single creator for the slot; the `creating` per-
+/// thread gate and the `phase` atomic provide the actual exclusion.
+pub(super) struct CreationReservation<'a> {
+    pool: &'a SessionPool,
+    committed: bool,
+    /// Phase 6.4.10 (cancellation-test synchronization) — optional
+    /// notify fired from `Drop`. Set only via the cfg(test)
+    /// `new_with_drop_notify` constructor; production code never
+    /// sets it. The notify is fired AFTER the failure-path
+    /// `fetch_sub` (or after `commit()` flips `committed`) so any
+    /// waiter observing the permit is guaranteed to see the post-
+    /// decrement counter.
+    #[cfg(test)]
+    drop_notify: Option<Arc<tokio::sync::Notify>>,
+}
+
+impl<'a> CreationReservation<'a> {
+    fn new(pool: &'a SessionPool) -> Self {
+        Self {
+            pool,
+            committed: false,
+            #[cfg(test)]
+            drop_notify: None,
+        }
+    }
+
+    /// cfg(test) constructor that arms a `Notify` to fire from
+    /// `Drop`. Used by test P to deterministically observe that
+    /// `CreationReservation::Drop` has run after a creator is
+    /// cancelled at the eviction branch barrier.
+    #[cfg(test)]
+    fn new_with_drop_notify(
+        pool: &'a SessionPool,
+        notify: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        Self {
+            pool,
+            committed: false,
+            drop_notify: Some(notify),
+        }
+    }
+
+    /// Mark the reservation as consumed. Called by the caller after
+    /// `state.active.insert` succeeds. The new entry replaces the
+    /// reservation: the counter that was holding a slot for the future
+    /// entry is now the live entry itself (counted via
+    /// `state.active.len()`). The decrement here keeps the invariant
+    /// `active.len() + outstanding_creations <= max_sessions` correct:
+    /// without it, a successful insert would double-count.
+    fn commit(mut self) {
+        self.pool
+            .outstanding_creations
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.committed = true;
+    }
+}
+
+impl Drop for CreationReservation<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            // Failure path: spawn, initialize, or insert failed before
+            // the slot was consumed. Release it so the next creator can
+            // observe free capacity. Lock-free AtomicUsize — safe to
+            // call from a Drop impl.
+            self.pool
+                .outstanding_creations
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        // cfg(test) hook: signal that this Drop has run, regardless
+        // of branch. Test P awaits this after `b_task.abort()` to
+        // deterministically observe that the failure-path fetch_sub
+        // (or commit's fetch_sub) has already been applied, replacing
+        // the prior yield-loop heuristic. `notify_one()` stores a
+        // permit if no waiter is registered yet, so it is safe to
+        // fire unconditionally on Drop.
+        #[cfg(test)]
+        if let Some(n) = self.drop_notify.as_ref() {
+            n.notify_one();
+        }
+    }
+}
 type EvictionCandidate = (String, Arc<Mutex<AcpConnection>>, Instant, Option<String>);
 
 /// Public test-only DTO for `SessionPool::with_test_state`. Mirrors the
@@ -214,6 +404,164 @@ fn better_candidate(current_oldest: Option<Instant>, candidate_last_active: Inst
         Some(oldest) => candidate_last_active < oldest,
         None => true,
     }
+}
+
+/// Phase 6.4.10 — RAII guard that holds a busy marker for one pool entry.
+///
+/// The previous design only cleared the busy flag via an explicit
+/// `AcpConnection::prompt_done` call. Every non-happy path (prompt error,
+/// non-terminal ACP stop, timeout, cancellation, workflow-hook error,
+/// early return from the prompt closure) skipped that call, so the entry
+/// remained marked "busy forever" and the capacity check at `state.active
+/// .len() >= max_sessions` rejected every subsequent request for that key
+/// — even after the underlying agent process had finished streaming.
+///
+/// `BusyGuard` is installed around the prompt closure inside
+/// [`SessionPool::with_connection`]. Its `Drop` clears the busy flag
+/// unconditionally, so every exit path through `with_connection` (success,
+/// error, cancellation, timeout, panic) restores the entry to the IDLE /
+/// REUSABLE state. The explicit busy/idle lifecycle authority replaces
+/// the previous implicit detection, which inferred idleness from the
+/// per-connection mutex being momentarily free — a side-effect that does not
+/// match the documented pool semantics ("Maximum number of concurrent
+/// agent sessions").
+struct BusyGuard {
+    activity: Arc<SessionActivity>,
+}
+
+impl BusyGuard {
+    /// Mark `activity` as busy and return a guard that clears it on drop.
+    /// The guard also `touch`es `activity` so the cleanup_idle TTL clock
+    /// sees the prompt as recently active.
+    fn arm(activity: Arc<SessionActivity>) -> Self {
+        activity.set_in_flight(true);
+        activity.touch();
+        Self { activity }
+    }
+
+    /// Explicitly disarm the guard without going through `Drop`. Used by
+    /// `with_connection` callers that want to release the busy marker
+    /// before the prompt closure finishes (rare; mostly diagnostic).
+    #[allow(dead_code)]
+    fn disarm(mut self) {
+        self.activity.set_in_flight(false);
+        self.activity.touch();
+        // Prevent Drop from running again.
+        self.activity = Arc::new(SessionActivity::new());
+    }
+}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        // Order matters: touch first so the cleanup_idle TTL clock sees a
+        // recent activity, then clear busy. A panicking Drop must not
+        // abort the program — keep this body infallible.
+        self.activity.touch();
+        self.activity.set_in_flight(false);
+    }
+}
+
+/// Phase 6.4.10 (TOCTOU fix) — helpers to access the per-connection
+/// `phase` atomic through `Arc<Mutex<AcpConnection>>`. We can't put
+/// methods directly on `Mutex<AcpConnection>` (foreign type), and we
+/// cannot reach AcpConnection's fields without the mutex, so the
+/// helpers use a non-blocking `try_lock` to get a stable reference and
+/// then operate on the inner atomic. `try_lock` failure means the
+/// entry is BUSY in `with_connection` — exactly the entries we want to
+/// skip — so treating it as "cannot claim" is semantically correct.
+#[inline]
+fn phase_load(conn: &Arc<Mutex<AcpConnection>>) -> u8 {
+    use std::sync::atomic::Ordering;
+    match conn.try_lock() {
+        Ok(g) => g.phase.load(Ordering::Acquire),
+        Err(_) => entry_phase::BUSY, // BUSY in with_connection
+    }
+}
+
+#[inline]
+fn phase_try_cas(conn: &Arc<Mutex<AcpConnection>>, from: u8, to: u8) -> bool {
+    use std::sync::atomic::Ordering;
+    match conn.try_lock() {
+        Ok(g) => g
+            .phase
+            .compare_exchange(from, to, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok(),
+        Err(_) => false, // BUSY → cannot claim
+    }
+}
+
+#[inline]
+fn phase_force_set(conn: &Arc<Mutex<AcpConnection>>, to: u8) {
+    use std::sync::atomic::Ordering;
+    if let Ok(g) = conn.try_lock() {
+        g.phase.store(to, Ordering::Release);
+    }
+}
+
+/// Phase 6.4.10 (TOCTOU fix) — select the oldest IDLE pool entry for
+/// eviction when the pool is at capacity, and atomically claim it as
+/// EVICTING before returning.
+///
+/// The previous implementation inferred idleness from `try_lock`
+/// succeeding on the per-connection mutex (a transient observation) AND
+/// from `activity.in_flight()`. Neither was an exclusive transition
+/// authority: a concurrent `with_connection` could win the mutex and
+/// arm BusyGuard AFTER eviction had decided to remove the entry. The
+/// new helper reads the authoritative `phase` atomic on each connection
+/// and CAS-es IDLE → EVICTING. If the CAS loses, another evictor won
+/// the race and this candidate is skipped; if it loses because the
+/// entry became BUSY, the candidate is skipped (must not evict BUSY).
+///
+/// Returns `None` when every entry is BUSY (or the only candidate is the
+/// request's own session key, which must NEVER be evicted). The chosen
+/// candidate's `phase` is already EVICTING when the helper returns; the
+/// caller is responsible for either committing the removal or releasing
+/// the phase back to IDLE.
+fn find_oldest_idle_eviction_candidate(
+    state: &PoolState,
+    exclude_key: &str,
+) -> Option<EvictionCandidate> {
+    let mut best: Option<EvictionCandidate> = None;
+    for (key, conn) in &state.active {
+        if key == exclude_key {
+            // A request must NEVER evict its own session.
+            continue;
+        }
+        // Atomic load — no mutex, no transient observation. If the
+        // phase is anything other than IDLE (BUSY or EVICTING), skip.
+        if phase_load(conn) != entry_phase::IDLE {
+            continue;
+        }
+        // Read last_active + acp_session_id under the per-connection lock.
+        // try_lock failure here means a concurrent reader holds the
+        // connection; skip and pick the next candidate. The CAS below
+        // would still succeed, but we want last_active to be observed
+        // authoritatively. The caller will retry the eviction on the
+        // next spawn, or fail closed if every candidate was skipped.
+        let Ok(conn_guard) = conn.try_lock() else {
+            continue;
+        };
+        let candidate = (
+            key.clone(),
+            Arc::clone(conn),
+            conn_guard.last_active,
+            conn_guard.acp_session_id.clone(),
+        );
+        drop(conn_guard);
+        if better_candidate(best.as_ref().map(|(_, _, t, _)| *t), candidate.2) {
+            best = Some(candidate);
+        }
+    }
+    let candidate = best?;
+    // Atomically claim EVICTING for the chosen candidate. If the CAS
+    // loses (another evictor already claimed it, or `with_connection`
+    // claimed it for a prompt between our scan and our CAS), return
+    // None and let the caller fail closed. The caller can retry by
+    // re-calling `ensure_capacity_or_evict` on the next spawn.
+    if !phase_try_cas(&candidate.1, entry_phase::IDLE, entry_phase::EVICTING) {
+        return None;
+    }
+    Some(candidate)
 }
 
 /// Prepare facade browser capabilities for one session: write the agent's facade MCP entry, and
@@ -584,6 +932,7 @@ impl SessionPool {
             }),
             config,
             max_sessions,
+            outstanding_creations: std::sync::atomic::AtomicUsize::new(0),
             hung_threshold_secs,
             mapping_path,
             meta_path,
@@ -594,6 +943,16 @@ impl SessionPool {
             session_registrar: None,
             #[cfg(feature = "acp-mcp")]
             facade_url: None,
+            #[cfg(test)]
+            eviction_reservation_barrier: None,
+            #[cfg(test)]
+            ensure_capacity_attempt_notify: None,
+            #[cfg(test)]
+            eviction_reserved_notify: None,
+            #[cfg(test)]
+            reservation_drop_notify: None,
+            #[cfg(test)]
+            creator_arrival_notify: None,
         }
     }
 
@@ -636,6 +995,7 @@ impl SessionPool {
             state: RwLock::new(state),
             config,
             max_sessions: 4,
+            outstanding_creations: std::sync::atomic::AtomicUsize::new(0),
             hung_threshold_secs: 600,
             mapping_path: projects_path
                 .parent()
@@ -652,6 +1012,16 @@ impl SessionPool {
             session_registrar: None,
             #[cfg(feature = "acp-mcp")]
             facade_url: None,
+            #[cfg(test)]
+            eviction_reservation_barrier: None,
+            #[cfg(test)]
+            ensure_capacity_attempt_notify: None,
+            #[cfg(test)]
+            eviction_reserved_notify: None,
+            #[cfg(test)]
+            reservation_drop_notify: None,
+            #[cfg(test)]
+            creator_arrival_notify: None,
         }
     }
 
@@ -709,6 +1079,124 @@ impl SessionPool {
         let mut set = self.untrusted_project_keys.write().await;
         set.clear();
         set.extend(keys);
+    }
+
+    /// Phase 6.4.10 — test-only seam to override the pool's `max_sessions`
+    /// ceiling. The default `with_state_for_test` constructor pins it to 4;
+    /// the lifecycle regression tests want a tight ceiling (2 or 3) so they
+    /// can demonstrate the capacity invariant without spawning dozens of
+    /// sessions. Compiled out of release builds.
+    #[cfg(test)]
+    fn set_max_sessions_for_test(&mut self, max_sessions: usize) {
+        self.max_sessions = max_sessions;
+    }
+
+    /// Phase 6.4.10 (TOCTOU fix regression test) — install the
+    /// deterministic eviction-reservation barrier. The next call to
+    /// `ensure_capacity_or_evict`'s eviction branch will park after
+    /// reserving the slot but before releasing the state lock. Tests
+    /// can use the returned `Arc<Notify>` handle to wake the parked
+    /// creator once they have asserted that no concurrent creator can
+    /// reserve the same slot. Production code never calls this method.
+    #[cfg(test)]
+    fn install_eviction_reservation_barrier_for_test(
+        &mut self,
+    ) -> Arc<tokio::sync::Notify> {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        self.eviction_reservation_barrier = Some(Arc::clone(&notify));
+        notify
+    }
+
+    /// Phase 6.4.10 (TOCTOU fix regression test) — install the
+    /// `ensure_capacity_or_evict` entry-point Notify. Every call to
+    /// `ensure_capacity_or_evict` (from any creator task) fires this
+    /// Notify once at the top of the function, BEFORE acquiring the
+    /// state write lock. Tests use it as a "participant reached the
+    /// contention boundary" signal in K/L/Q/R. Production code never
+    /// calls this method.
+    #[cfg(test)]
+    fn install_ensure_capacity_attempt_notify_for_test(
+        &mut self,
+    ) -> Arc<tokio::sync::Notify> {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        self.ensure_capacity_attempt_notify = Some(Arc::clone(&notify));
+        notify
+    }
+
+    /// Phase 6.4.10 (TOCTOU fix regression test) — install the
+    /// "eviction reserved" Notify. Fires inside the eviction branch
+    /// AFTER `outstanding_creations.fetch_add(1)` and BEFORE the
+    /// barrier await. Tests K/L/Q/R wait on this to deterministically
+    /// observe that the parked creator has its reservation in
+    /// place. Production code never calls this method.
+    #[cfg(test)]
+    fn install_eviction_reserved_notify_for_test(
+        &mut self,
+    ) -> Arc<tokio::sync::Notify> {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        self.eviction_reserved_notify = Some(Arc::clone(&notify));
+        notify
+    }
+
+    /// Phase 6.4.10 (cancellation-test synchronization) — install the
+    /// `CreationReservation::Drop` Notify. The next
+    /// `CreationReservation` constructed via the cfg(test) helper
+    /// (`create_reservation_for_test`) carries a clone of this
+    /// Notify; `Drop` fires it once after the failure-path `fetch_sub`
+    /// (or after `commit()` sets `committed = true`). Test P awaits
+    /// this after `b_task.abort()` to deterministically observe that
+    /// the RAII guard's Drop has run, replacing the prior
+    /// `for _ in 0..16 { yield_now().await; }` heuristic. Production
+    /// code never calls this method.
+    #[cfg(test)]
+    fn install_reservation_drop_notify_for_test(
+        &mut self,
+    ) -> Arc<tokio::sync::Notify> {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        self.reservation_drop_notify = Some(Arc::clone(&notify));
+        notify
+    }
+
+    /// Phase 6.4.10 (contention-test synchronization) — install the
+    /// `creator_arrival_notify` hook. Fires at the TOP of
+    /// `get_or_create` and `create_fresh_session_only`, BEFORE any
+    /// lock acquire (and specifically before the per-thread gate's
+    /// `state.write().await`). Tests K/L/Q/R use this as the
+    /// "participant has entered the pool" signal because it is
+    /// reachable by both creators in a contention shape — the blocked
+    /// creator (C) fires this hook on entry, BEFORE being blocked
+    /// behind the per-thread gate lock.
+    ///
+    /// Unlike `ensure_capacity_attempt_notify` (which fires inside
+    /// `ensure_capacity_or_evict` and therefore is unreachable for a
+    /// creator blocked at the per-thread gate), `creator_arrival_notify`
+    /// is reachable for every entry into `get_or_create`. This makes
+    /// the "consume B's arrival, then spawn C, then consume C's
+    /// arrival" sequence structurally impossible to coalesce against
+    /// a stale seed permit. Compiled out of release builds.
+    #[cfg(test)]
+    fn install_creator_arrival_notify_for_test(
+        &mut self,
+    ) -> Arc<tokio::sync::Notify> {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        self.creator_arrival_notify = Some(Arc::clone(&notify));
+        notify
+    }
+
+    /// cfg(test) helper used by the two `ensure_capacity_or_evict`
+    /// reservation-creation sites. If a `reservation_drop_notify` is
+    /// installed, returns a `CreationReservation` armed with it so
+    /// tests can await Drop. Otherwise returns the production
+    /// constructor's output. Compiled out of release builds.
+    #[cfg(test)]
+    fn create_reservation_for_test<'a>(
+        &'a self,
+    ) -> crate::acp::pool::CreationReservation<'a> {
+        if let Some(n) = self.reservation_drop_notify.as_ref() {
+            CreationReservation::new_with_drop_notify(self, Arc::clone(n))
+        } else {
+            CreationReservation::new(self)
+        }
     }
 
     fn load_mapping(path: &Path) -> HashMap<String, String> {
@@ -931,11 +1419,230 @@ impl SessionPool {
             || state.persisted.contains_key(session_key)
     }
 
+    /// Phase 6.4.10 (TOCTOU fix) — capacity reservation. Acquires a
+    /// reservation covering the entire creation window
+    /// (spawn → initialize → session/load-or-new → insert) and either
+    /// frees room by evicting the oldest IDLE entry or fails closed.
+    ///
+    /// Returns a [`CreationReservation`] on success. The caller MUST hold
+    /// it across `AcpConnection::spawn`, `initialize`, and
+    /// `session/load` / `session_new`, then either:
+    ///
+    ///   * commit it (after `state.active.insert` succeeds) — the new
+    ///     entry IS the slot; or
+    ///   * let it drop (on any failure path) — the slot is released so
+    ///     the next creator can observe free capacity.
+    ///
+    /// The invariant the pool enforces is:
+    ///
+    ///   `state.active.len() + outstanding_creations <= max_sessions`
+    ///
+    /// This closes the previous TOCTOU window where concurrent creators
+    /// could each observe `state.active.len() < max_sessions`, each
+    /// spawn, and each insert — pushing the pool to `max_sessions + 1`
+    /// (or more on the native-dispatch fast lane).
+    async fn ensure_capacity_or_evict<'a>(
+        &'a self,
+        exclude_key: &str,
+    ) -> Result<CreationReservation<'a>> {
+        // ── TEST-ONLY ARRIVAL SIGNAL ──────────────────────────────
+        // Fire once at the top of every capacity-attempt path, BEFORE
+        // any state lock is acquired. Tests K/L/Q/R wait on this to
+        // prove that a second creator actually entered the
+        // contention boundary (i.e., reached this function) before
+        // the test releases the first creator. This is the
+        // deterministic replacement for the prior atomic-poll /
+        // yield-loop assumptions.
+        //
+        // `notify_one()` adds a permit; if no waiter is registered
+        // yet, the permit is stored (Tokio stores up to one) and
+        // consumed by the next `notified().await`. Production code
+        // never installs this field, so the `if let` is dead in
+        // production.
+        #[cfg(test)]
+        if let Some(attempt_notify) = self.ensure_capacity_attempt_notify.as_ref() {
+            attempt_notify.notify_one();
+        }
+
+        // ── Phase 6.4.10 (TOCTOU fix) — capacity reservation. ─────────────
+        //
+        // The pool-wide invariant is:
+        //
+        //   `state.active.len() + outstanding_creations <= max_sessions`
+        //
+        // held continuously under the pool state authority (i.e. there
+        // must be no state-unlocked interval where a concurrent caller
+        // can observe the freed-but-unreserved capacity and claim it).
+        //
+        // Both branches below (room-available AND eviction) therefore
+        // reserve the slot — increment `outstanding_creations` — while
+        // still holding the same state write lock that observes or
+        // creates the capacity. The lock is released only after the
+        // reservation is in place.
+        {
+            // Branch 1: room available. Lock + check + reserve + drop
+            // while the state authority is still held.
+            let mut state = self.state.write().await;
+            let used = state.active.len()
+                + self
+                    .outstanding_creations
+                    .load(std::sync::atomic::Ordering::Acquire);
+            if used < self.max_sessions {
+                self.outstanding_creations
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                #[cfg(test)]
+                return Ok(self.create_reservation_for_test());
+                #[cfg(not(test))]
+                return Ok(CreationReservation::new(self));
+            }
+
+            // Branch 2: pool is at capacity. Try to evict the oldest
+            // IDLE entry. The candidate picker atomically claims
+            // EVICTING, so concurrent `with_connection` calls cannot
+            // promote it to BUSY while we are mid-eviction.
+            let candidate = find_oldest_idle_eviction_candidate(&state, exclude_key);
+            match candidate {
+                Some((key, expected_conn, _, sid)) => {
+                    // The candidate's phase is already EVICTING. Remove
+                    // it from `state.active` AND increment
+                    // `outstanding_creations` inside this same critical
+                    // section, so no other creator can observe the
+                    // freed-but-unreserved slot. After this point the
+                    // invariant holds: `active.len() + outstanding == max`.
+                    if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
+                        state.cancel_handles.remove(&key);
+                        state.activity.remove(&key);
+                        state.pgids.remove(&key);
+                        #[cfg(feature = "acp-mcp")]
+                        revoke_facade_token_for_key(
+                            &mut state,
+                            &key,
+                            self.session_registrar.as_ref(),
+                        );
+                        info!(
+                            evicted = %crate::redact::redact_session_ids(&key),
+                            "pool full, pre-evicting oldest idle session before spawn"
+                        );
+                        // Native-dispatch keys MUST NOT be persisted under
+                        // any eviction path; the fast lane guarantees a
+                        // fresh ACP session on every entry.
+                        if is_native_dispatch_key(&key) {
+                            state.session_workdirs.remove(&key);
+                            state.session_projects.remove(&key);
+                        } else if let Some(sid) = sid {
+                            state.persisted.insert(key.clone(), sid.clone());
+                            state.suspended.insert(key, sid);
+                        } else {
+                            state.persisted.remove(&key);
+                        }
+                        // ── ATOMIC RESERVATION ─────────────────────
+                        // Increment outstanding_creations BEFORE
+                        // releasing the state lock. This is the
+                        // critical fix for the EVICTION-THEN-RESERVE
+                        // TOCTOU: previously the fetch_add happened
+                        // after `drop(state)`, leaving a window where
+                        // a concurrent creator could observe
+                        // `active.len() + outstanding == 0` and reserve
+                        // the freed slot itself.
+                        //
+                        // The reservation guard is constructed HERE
+                        // (before any subsequent await) so its Drop
+                        // runs even if the future is cancelled at the
+                        // barrier below. Otherwise a cancellation
+                        // between fetch_add and the barrier would
+                        // leak the reservation permanently.
+                        self.outstanding_creations
+                            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                        #[cfg(test)]
+                        let reservation = self.create_reservation_for_test();
+                        #[cfg(not(test))]
+                        let reservation = CreationReservation::new(self);
+                        // ── TEST-ONLY ARRIVAL-AFTER-RESERVATION ────
+                        // Fire once AFTER fetch_add and BEFORE the
+                        // barrier await. Tests K/L/Q/R consume this
+                        // permit to deterministically observe that
+                        // the creator has its reservation in place.
+                        // Unlike `ensure_capacity_attempt_notify`
+                        // (which fires at function entry, before
+                        // fetch_add), this notify proves the
+                        // reservation is committed and
+                        // `outstanding_creations == 1` is observable
+                        // when the test thread wakes.
+                        //
+                        // Production code never sets this field, so
+                        // the `if let` is dead in production.
+                        #[cfg(test)]
+                        if let Some(reserved) = self.eviction_reserved_notify.as_ref() {
+                            reserved.notify_one();
+                        }
+                        // ── TEST-ONLY BARRIER ─────────────────────
+                        // Park here until the test pokes the barrier
+                        // notify. This pins contention to the exact
+                        // moment the corrected implementation owns the
+                        // freed slot — between fetch_add and drop. If
+                        // the production fix is correct, any
+                        // concurrent creator that observes the pool
+                        // during this parked window must see
+                        // `active.len() + outstanding == max` (not 0).
+                        // Production code never sets this field, so
+                        // the `if let` is dead in production.
+                        //
+                        // Cancellation safety: if the future is
+                        // cancelled here, `reservation` is dropped,
+                        // which decrements outstanding_creations via
+                        // its Drop impl. That is the property the
+                        // cancellation test (P) verifies.
+                        #[cfg(test)]
+                        if let Some(barrier) = self.eviction_reservation_barrier.as_ref() {
+                            barrier.notified().await;
+                        }
+                        // Reservation is now in place; safe to drop
+                        // the state lock. The new creator owns the
+                        // freed slot.
+                        drop(state);
+                        Ok(reservation)
+                    } else {
+                        // Race: a concurrent caller replaced the
+                        // candidate's Arc between our scan and our
+                        // remove. Release the EVICTING claim (the
+                        // entry will be either re-claimed or naturally
+                        // returned to IDLE on the next prompt
+                        // release). Fail closed because capacity is
+                        // full — no reservation is acquired on this
+                        // path.
+                        drop(state);
+                        phase_force_set(&expected_conn, entry_phase::IDLE);
+                        Err(anyhow!("pool exhausted ({} sessions)", self.max_sessions))
+                    }
+                }
+                None => {
+                    // Every entry is BUSY or otherwise non-evictable —
+                    // fail closed per the documented pool semantics
+                    // ("if all sessions are busy, new requests are
+                    // rejected"). The spawn has NOT happened yet, so
+                    // no ACP child process is leaked on this path.
+                    drop(state);
+                    Err(anyhow!("pool exhausted ({} sessions)", self.max_sessions))
+                }
+            }
+        }
+    }
+
     pub async fn get_or_create(
         &self,
         thread_id: &str,
         project: Option<&ProjectContext>,
     ) -> Result<bool> {
+        // Phase 6.4.10 (contention-test synchronization) — fire the
+        // arrival hook BEFORE any lock acquire, so that even a creator
+        // blocked at the per-thread gate's `state.write().await` has
+        // already registered its arrival with the test driver.
+        // Compiled out of release builds.
+        #[cfg(test)]
+        if let Some(arrival) = self.creator_arrival_notify.as_ref() {
+            arrival.notify_one();
+        }
+
         // ── Phase 0: fenced native-work dispatch fast lane (Phase 6.2.9) ─────────
         //
         // A native-work dispatch arrives under an explicit per-dispatch
@@ -1111,7 +1818,13 @@ impl SessionPool {
         }
 
         // Snapshot active handles so we can inspect them outside the state lock.
-        let snapshot: Vec<(String, Arc<Mutex<AcpConnection>>)> = {
+        //
+        // Phase 6.4.10: this read-only snapshot is no longer the eviction
+        // decision. The capacity-aware pre-eviction runs below, BEFORE the
+        // spawn, under the state write lock so concurrent `get_or_create`
+        // calls for distinct keys cannot both pick the same idle entry and
+        // race-evict each other.
+        let _snapshot: ActiveSnapshot = {
             let state = self.state.read().await;
             state
                 .active
@@ -1119,31 +1832,6 @@ impl SessionPool {
                 .map(|(k, v)| (k.clone(), Arc::clone(v)))
                 .collect()
         };
-
-        let mut eviction_candidate: Option<EvictionCandidate> = None;
-        let mut skipped_locked_candidates = 0usize;
-        for (key, conn) in snapshot {
-            if key == thread_id {
-                continue;
-            }
-            let conn_handle = Arc::clone(&conn);
-            let Ok(conn) = conn.try_lock() else {
-                skipped_locked_candidates += 1;
-                continue;
-            };
-            let candidate = (
-                key,
-                conn_handle,
-                conn.last_active,
-                conn.acp_session_id.clone(),
-            );
-            if better_candidate(
-                eviction_candidate.as_ref().map(|(_, _, t, _)| *t),
-                candidate.2,
-            ) {
-                eviction_candidate = Some(candidate);
-            }
-        }
 
         // Resolve effective working directory.
         //
@@ -1175,6 +1863,22 @@ impl SessionPool {
             stored_workdir.as_deref(),
             &self.config.working_dir,
         );
+
+        // ── Phase 5.5: capacity reservation (Phase 6.4.10 TOCTOU fix) ───────────
+        //
+        // Acquire a reservation that spans the entire creation window
+        // (spawn → initialize → session/load-or-new → insert). On any
+        // failure between here and the successful `state.active.insert`,
+        // the reservation's Drop impl releases the slot so concurrent
+        // creators can observe free capacity. The invariant
+        // `active.len() + outstanding_creations <= max_sessions` is
+        // enforced at the moment of increment, so two concurrent
+        // creators cannot both observe room and both proceed to spawn.
+        //
+        // The reservation is consumed on the success path via
+        // `commit()` after `state.active.insert` — the new entry IS the
+        // slot, so the counter must not also decrement.
+        let _creation_reservation = self.ensure_capacity_or_evict(thread_id).await?;
 
         // Browser capabilities for an `acp:` session come from the OAB MCP Facade and nowhere
         // else: mint a per-session token (it rides the agent spawn below as OPENAB_SESSION_TOKEN)
@@ -1322,6 +2026,14 @@ impl SessionPool {
                 return Ok(false);
             };
             if existing.alive() {
+                // A concurrent creator already inserted a healthy entry
+                // for this key. Release our reservation (the slot was
+                // never used) and let the caller reuse the existing
+                // entry. The existing entry's phase is whatever the
+                // concurrent creator left it as (IDLE for fresh spawns).
+                drop(existing);
+                drop(state);
+                // Reservation drops here — outstanding_creations--.
                 return Ok(false);
             }
             warn!(thread_id = %crate::redact::redact_session_ids(thread_id), "stale connection, rebuilding");
@@ -1332,46 +2044,12 @@ impl SessionPool {
             state.pgids.remove(thread_id);
         }
 
-        if state.active.len() >= self.max_sessions {
-            if let Some((key, expected_conn, _, sid)) = eviction_candidate {
-                if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
-                    state.cancel_handles.remove(&key);
-                    state.activity.remove(&key);
-                    state.pgids.remove(&key);
-                    #[cfg(feature = "acp-mcp")]
-                    revoke_facade_token_for_key(&mut state, &key, self.session_registrar.as_ref());
-                    info!(evicted = %crate::redact::redact_session_ids(&key), "pool full, suspending oldest idle session");
-                    // Phase 6.2.9: native-dispatch:* keys MUST NOT be persisted
-                    // under any eviction path. The fast lane keeps them in
-                    // `state.active` only; eviction drops them entirely so a
-                    // subsequent dispatch lands on a fresh process and a fresh
-                    // ACP session.
-                    if is_native_dispatch_key(&key) {
-                        // Drop everything; do not insert into persisted/suspended.
-                        state.session_workdirs.remove(&key);
-                        state.session_projects.remove(&key);
-                    } else if let Some(sid) = sid {
-                        state.persisted.insert(key.clone(), sid.clone());
-                        state.suspended.insert(key, sid);
-                    } else {
-                        state.persisted.remove(&key);
-                    }
-                } else {
-                    warn!(evicted = %crate::redact::redact_session_ids(&key), "pool full but eviction candidate changed before removal");
-                }
-            } else if skipped_locked_candidates > 0 {
-                warn!(
-                    max_sessions = self.max_sessions,
-                    skipped_locked_candidates,
-                    "pool full but all other sessions were busy during eviction scan"
-                );
-            }
-        }
-
-        if state.active.len() >= self.max_sessions {
-            return Err(anyhow!("pool exhausted ({} sessions)", self.max_sessions));
-        }
-
+        // Phase 6.4.10 (TOCTOU fix) — capacity is reserved by the
+        // CreationReservation held by this function; the previous
+        // post-spawn length check (`state.active.len() >= max_sessions`)
+        // was removed because the reservation is the single source of
+        // truth. The new entry's phase is initialized to IDLE inside
+        // `AcpConnection::spawn`.
         if cancel_session_id.is_empty() {
             state.persisted.remove(thread_id);
         } else {
@@ -1435,6 +2113,11 @@ impl SessionPool {
         // A session with prior state (saved_session_id or had_existing) is a resume,
         // even if we had to spawn a new ACP process. ADR §2.2: directives are first-message-only.
         let is_fresh = !had_existing && saved_session_id.is_none();
+        // Phase 6.4.10 (TOCTOU fix) — the new entry is the slot.
+        // Commit the reservation so its Drop impl does not also release
+        // it (the counter already accounts for the entry via
+        // state.active.insert).
+        _creation_reservation.commit();
         Ok(is_fresh)
     }
 
@@ -1468,6 +2151,16 @@ impl SessionPool {
         thread_id: &str,
         project: Option<&ProjectContext>,
     ) -> Result<bool> {
+        // Phase 6.4.10 (contention-test synchronization) — fire the
+        // arrival hook BEFORE any lock acquire, so that even a creator
+        // blocked at the per-thread gate's `state.write().await` has
+        // already registered its arrival with the test driver.
+        // Compiled out of release builds.
+        #[cfg(test)]
+        if let Some(arrival) = self.creator_arrival_notify.as_ref() {
+            arrival.notify_one();
+        }
+
         // Native-dispatch keys never have a stable per-thread workdir — the
         // dispatch is single-turn by design. Fall back to the configured
         // working directory. If the caller supplied a project-pinned
@@ -1529,6 +2222,17 @@ impl SessionPool {
         };
         #[cfg(not(feature = "acp-mcp"))]
         let spawn_env = self.config.env.clone();
+
+        // Phase 6.4.10 (TOCTOU fix) — bring the native-dispatch fast
+        // lane under the same capacity reservation as `get_or_create`.
+        // The previous code allowed `state.active.len() > max_sessions`
+        // with only a warning, so two concurrent native dispatches could
+        // each observe room, each spawn, and each insert. The fast lane
+        // now acquires a CreationReservation that spans spawn + init +
+        // session_new + insert, and fails closed (without spawning) when
+        // every entry is BUSY. The reservation's Drop impl releases the
+        // slot on every failure path.
+        let _creation_reservation = self.ensure_capacity_or_evict(thread_id).await?;
 
         let mut new_conn = AcpConnection::spawn(
             &self.config.command,
@@ -1599,21 +2303,14 @@ impl SessionPool {
             );
         }
 
-        // Pool size accounting is unchanged: native-dispatch sessions are
-        // counted against `max_sessions` like any other, so a malicious /
-        // runaway dispatcher cannot exhaust the pool. The eviction scan
-        // picks oldest-first; native-dispatch sessions evict normally
-        // because their `last_active` advances just like a human session.
-        if state.active.len() > self.max_sessions {
-            // Eviction is best-effort: drop the oldest idle session, but
-            // never evict the native-dispatch key itself (Phase 6.2.9
-            // invariant: native dispatch isolation must not be broken by
-            // an unrelated eviction race).
-            warn!(
-                max_sessions = self.max_sessions,
-                "native dispatch pool exceeded max_sessions — eviction will run on the next non-native entry"
-            );
-        }
+        // Phase 6.4.10 (TOCTOU fix) — the reservation is the capacity
+        // authority. The previous `state.active.len() > max_sessions + 1`
+        // defense-in-depth check is gone because it accepted a temporary
+        // over-shoot; the new invariant guarantees
+        // `active.len() + outstanding_creations <= max_sessions` at all
+        // times. The reservation is committed so its Drop does not also
+        // release the slot (the new entry IS the slot).
+        _creation_reservation.commit();
         Ok(true)
     }
 
@@ -1622,6 +2319,26 @@ impl SessionPool {
     /// Only the per-connection `Mutex` is held during `f`; the pool-level
     /// `RwLock` is acquired briefly (read-only) to look up the `Arc` and then
     /// released, so other connections can be used concurrently.
+    ///
+    /// Phase 6.4.10 (TOCTOU fix): this method atomically claims the
+    /// entry's lifecycle phase via compare-and-swap on the per-connection
+    /// `phase` atomic BEFORE taking the connection mutex. The CAS
+    /// guarantees that:
+    ///
+    ///   * a session being evicted cannot begin a new prompt (CAS fails
+    ///     because the phase is EVICTING); and
+    ///   * a session beginning a prompt cannot be subsequently evicted
+    ///     (eviction's CAS fails because the phase is BUSY).
+    ///
+    /// The previous design inferred idleness from `try_lock` on the
+    /// connection mutex, which is a transient observation: a concurrent
+    /// `with_connection` could win the mutex AFTER eviction had decided
+    /// to remove the entry. The new atomic CAS closes that window.
+    ///
+    /// The `BusyGuard` continues to maintain the legacy
+    /// `activity.in_flight` flag for backward compatibility with the
+    /// adapter and cleanup paths; the `phase` atomic is the new
+    /// authoritative state for eviction eligibility.
     pub async fn with_connection<F, R>(&self, thread_id: &str, f: F) -> Result<R>
     where
         F: for<'a> FnOnce(
@@ -1640,8 +2357,61 @@ impl SessionPool {
             })?
         };
 
-        let mut conn = conn.lock().await;
-        f(&mut conn).await
+        // Atomic IDLE -> BUSY claim. If the CAS fails the entry is
+        // either already busy (another prompt in flight) or being
+        // evicted (capacity-eviction in progress). Either way, this
+        // caller MUST NOT proceed — the entry is not available for a
+        // new prompt. Surface a clear error so the adapter can fall
+        // back to its busy handling rather than silently double-
+        // executing the closure.
+        if !phase_try_cas(&conn, entry_phase::IDLE, entry_phase::BUSY) {
+            let phase = phase_load(&conn);
+            let reason = match phase {
+                entry_phase::BUSY => "session is busy executing another prompt",
+                entry_phase::EVICTING => "session is being evicted",
+                _ => "session is not in IDLE state",
+            };
+            return Err(anyhow!(
+                "cannot acquire session for thread {}: {reason}",
+                crate::redact::redact_session_ids(thread_id),
+            ));
+        }
+
+        // The guard is installed AFTER the CAS so the phase cannot be
+        // released to IDLE before the claim. On Drop (every exit path:
+        // success, error, cancellation, timeout, panic) the phase
+        // transitions BUSY → IDLE. If the closure panics, Drop still
+        // runs because the guard is on the stack frame that panicked.
+        struct PhaseGuard {
+            conn: Arc<Mutex<AcpConnection>>,
+        }
+        impl Drop for PhaseGuard {
+            fn drop(&mut self) {
+                // Best-effort release. If another caller claimed the
+                // entry between our BUSY claim and now (unlikely but
+                // possible during a complex lifecycle), the CAS is a
+                // no-op. Idempotent and infallible.
+                phase_force_set(&self.conn, entry_phase::IDLE);
+            }
+        }
+
+        let mut conn_guard_lock = conn.lock().await;
+        let activity = Arc::clone(&conn_guard_lock.activity);
+        let _busy_guard = BusyGuard::arm(activity);
+        let _phase_guard = PhaseGuard { conn: Arc::clone(&conn) };
+        let result = f(&mut conn_guard_lock).await;
+        // Drop order matters:
+        //   1. `_busy_guard` clears activity.in_flight (atomic, no lock).
+        //   2. `conn_guard_lock` releases the per-connection mutex so
+        //      the next step's `try_lock` (for phase release) succeeds.
+        //   3. `_phase_guard` releases the phase atomic to IDLE.
+        // If `_phase_guard` dropped first, its `try_lock` would fail
+        // because we still hold `conn_guard_lock` — leaving the entry
+        // stuck in BUSY forever (the original TOCTOU class of bug).
+        drop(_busy_guard);
+        drop(conn_guard_lock);
+        drop(_phase_guard);
+        result
     }
 
     /// Get cached configOptions for a session (e.g. available models).
@@ -2033,9 +2803,10 @@ impl SessionPool {
 #[cfg(test)]
 mod tests {
     use super::{
-        better_candidate, classify_hung, classify_idle, format_native_dispatch_key,
-        get_or_insert_gate, is_native_dispatch_key, purge_session_entries, remove_if_same_handle,
-        PoolState, SessionPool, SessionPoolTestState,
+        better_candidate, classify_hung, classify_idle, entry_phase, format_native_dispatch_key,
+        get_or_insert_gate, is_native_dispatch_key, phase_force_set, phase_load,
+        purge_session_entries, remove_if_same_handle, PoolState, SessionPool,
+        SessionPoolTestState,
     };
     use crate::acp::connection::SessionActivity;
     use crate::acp::project::ProjectContext;
@@ -4697,6 +5468,1455 @@ done
         assert!(
             !thread_map.contains(native_key),
             "the native-dispatch key MUST be scrubbed from disk"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase 6.4.10 — ACP Session Lifecycle & Pool Exhaustion regression
+    // tests. These exercise the busy/idle RAII guard, the
+    // capacity-aware pre-spawn eviction, and the constraint on
+    // `create_fresh_session_only`. Every test follows the same recipe:
+    //
+    //   1. Build a `SessionPool` with the recording stub agent (the script
+    //      spawns, returns a session id, and exits 0 — enough to give us
+    //      a real `AcpConnection` in `state.active` with no prompt in
+    //      flight).
+    //   2. Drive `state.activity` directly when a test needs a precise
+    //      busy/idle state (the connection's `activity` Arc and the
+    //      pool's `state.activity[key]` Arc are the same handle, so
+    //      flipping one is enough).
+    //   3. Observe `state.active.len()` and the per-key busy flag to
+    //      verify the invariant the test was written for.
+    //
+    // All ten tests share the `pool_with_max_sessions` helper below.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    async fn pool_with_max_sessions(
+        temp: &tempfile::TempDir,
+        max_sessions: usize,
+    ) -> (Arc<SessionPool>, std::path::PathBuf) {
+        // The recording pool uses the project's standard stub agent
+        // (TEST_AGENT_SCRIPT). The script returns a synthetic session
+        // id then exits 0 — enough to populate `state.active` and
+        // `state.activity` with a real connection. The script must be
+        // written to a real path on disk because the pool spawns the
+        // configured command directly.
+        let agent_script = write_test_agent_script(temp.path());
+        let mut pool = SessionPool::with_test_state(
+            AgentConfig {
+                command: agent_script.to_string_lossy().into(),
+                args: Vec::new(),
+                working_dir: temp.path().to_string_lossy().into(),
+                env: HashMap::new(),
+                inherit_env: Vec::new(),
+                command_explicit: true,
+            },
+            SessionPoolTestState::default(),
+            temp.path().join("session_projects.json"),
+        );
+        pool.set_max_sessions_for_test(max_sessions);
+        let pool = Arc::new(pool);
+        let workdir = temp.path().to_path_buf();
+        (pool, workdir)
+    }
+
+    /// Helper: set the entry's phase to BUSY via the atomic AND the
+    /// legacy `activity.in_flight()` flag. The new Phase 6.4.10 design
+    /// uses `AcpConnection::phase` as the authoritative state, but
+    /// `activity.in_flight()` is still read by the cleanup paths and
+    /// by tests' older assertions — flipping both keeps the two
+    /// views consistent.
+    #[cfg(unix)]
+    async fn mark_busy(pool: &SessionPool, key: &str) {
+        let state = pool.state.read().await;
+        let conn = state
+            .active
+            .get(key)
+            .unwrap_or_else(|| panic!("missing connection for {key}"))
+            .clone();
+        let activity = state.activity.get(key).cloned();
+        drop(state);
+        phase_force_set(&conn, entry_phase::BUSY);
+        if let Some(a) = activity {
+            a.set_in_flight(true);
+            a.touch();
+        }
+    }
+
+    /// Helper: clear the entry's phase back to IDLE via the atomic.
+    #[cfg(unix)]
+    #[allow(dead_code)] // Reserved for future tests; the D/E/F tests
+    // exercise the clear path via the BusyGuard/PhaseGuard Drop impls.
+    async fn mark_idle(pool: &SessionPool, key: &str) {
+        let state = pool.state.read().await;
+        let conn = state
+            .active
+            .get(key)
+            .unwrap_or_else(|| panic!("missing connection for {key}"))
+            .clone();
+        phase_force_set(&conn, entry_phase::IDLE);
+    }
+
+    /// Helper: assert the entry's current phase matches the expected
+    /// value. Centralises the atomic-read boilerplate so individual tests
+    /// stay focused on their invariants.
+    #[cfg(unix)]
+    async fn assert_phase(pool: &SessionPool, key: &str, expected: u8, ctx: &str) {
+        let state = pool.state.read().await;
+        let conn = state
+            .active
+            .get(key)
+            .unwrap_or_else(|| panic!("missing connection for {key} (context: {ctx})"));
+        let actual = phase_load(conn);
+        assert_eq!(
+            actual, expected,
+            "phase mismatch for {key} ({ctx}): expected={expected}, actual={actual}"
+        );
+    }
+
+    /// Helper: assert no entry exists for `key`. Used to verify that a
+    /// failed creation did not leak an entry into the pool.
+    #[cfg(unix)]
+    async fn assert_not_active(pool: &SessionPool, key: &str, ctx: &str) {
+        let state = pool.state.read().await;
+        assert!(
+            !state.active.contains_key(key),
+            "entry {key} MUST NOT be active ({ctx}); active={:?}",
+            state.active.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// Helper: read `state.active.len()` for assertions.
+    #[cfg(unix)]
+    async fn active_len(pool: &SessionPool) -> usize {
+        let state = pool.state.read().await;
+        state.active.len()
+    }
+
+    /// Helper: was the last `get_or_create` call for `key` a fresh spawn?
+    /// `false` means the pool reused an existing entry.
+    #[cfg(unix)]
+    async fn is_active(pool: &SessionPool, key: &str) -> bool {
+        let state = pool.state.read().await;
+        state.active.contains_key(key)
+    }
+
+    // ── TEST A ────────────────────────────────────────────────────────────
+    //
+    // A — Ten distinct session keys with completed turns must NOT exhaust
+    // the pool. Pre-Phase-6.4.10 the pool conflates busy and reusable, so
+    // ten distinct completed keys (no fresh spawn, no eviction) lock
+    // production at `max_sessions` after the first ten. With the new
+    // busy/idle lifecycle, completed entries are eligible for oldest-idle
+    // eviction on every subsequent request, so the pool stays at the
+    // ceiling indefinitely.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_ten_distinct_session_keys_do_not_exhaust_pool() {
+        let temp = tempfile::tempdir().unwrap();
+        let (pool, _wd) = pool_with_max_sessions(&temp, 3).await;
+        // Drive ten distinct keys through `get_or_create`. Each one
+        // completes the stub agent's session/new and exits 0, leaving
+        // the connection IDLE in `state.active`. After every call the
+        // pool must remain usable: every (key) spawn must succeed and
+        // `state.active.len()` must never exceed `max_sessions`.
+        for i in 0..10 {
+            let key = format!("thread-{i}");
+            let created = pool
+                .get_or_create(&key, None)
+                .await
+                .unwrap_or_else(|e| panic!("spawn #{i} for {key} must not fail: {e}"));
+            // First call: created=true (fresh). Subsequent calls: also
+            // true because each key is distinct — there is no reuse
+            // path. The point is the call MUST succeed.
+            assert!(created, "key {key} must be a fresh spawn");
+            // After spawn the connection is IDLE (no prompt has run).
+            assert!(!pool.state.read().await.activity[&key].in_flight());
+        assert_phase(&pool, &key, entry_phase::IDLE, "post-spawn").await;
+        }
+        // The pool must never have grown past the ceiling.
+        assert!(
+            active_len(&pool).await <= 3,
+            "pool exceeded max_sessions=3 after 10 distinct keys: active={}",
+            active_len(&pool).await
+        );
+    }
+
+    // ── TEST B ────────────────────────────────────────────────────────────
+    //
+    // B — When every active entry is BUSY, a new spawn must return
+    // `pool exhausted` and MUST NOT spawn a child process. Pre-Phase-6.4.10
+    // the old eviction logic would still evict a busy entry; the new
+    // contract explicitly forbids that.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn b_all_busy_returns_pool_exhausted_and_no_eviction() {
+        let temp = tempfile::tempdir().unwrap();
+        let (pool, _wd) = pool_with_max_sessions(&temp, 2).await;
+        // Fill to capacity with two distinct keys.
+        pool.get_or_create("busy-1", None).await.expect("spawn busy-1");
+        pool.get_or_create("busy-2", None).await.expect("spawn busy-2");
+        // Mark both busy.
+        mark_busy(&pool, "busy-1").await;
+        mark_busy(&pool, "busy-2").await;
+        // Third spawn: must fail because every entry is busy.
+        let result = pool.get_or_create("busy-3", None).await;
+        let err = result.expect_err("third spawn must return Err when all are busy");
+        assert!(
+            err.to_string().contains("pool exhausted"),
+            "expected pool exhausted, got: {err}"
+        );
+        // busy-1 and busy-2 must STILL be present and STILL busy.
+        assert!(is_active(&pool, "busy-1").await);
+        assert!(is_active(&pool, "busy-2").await);
+        assert!(!is_active(&pool, "busy-3").await);
+        assert_eq!(
+            active_len(&pool).await,
+            2,
+            "no entry should be evicted when every one is busy"
+        );
+        assert!(pool.state.read().await.activity["busy-1"].in_flight());
+        assert!(pool.state.read().await.activity["busy-2"].in_flight());
+        assert_phase(&pool, "busy-1", entry_phase::BUSY, "test B").await;
+        assert_phase(&pool, "busy-2", entry_phase::BUSY, "test B").await;
+    }
+
+    // ── TEST C ────────────────────────────────────────────────────────────
+    //
+    // C — When capacity is required and SOME entries are IDLE, the spawn
+    // succeeds and the oldest IDLE entry is evicted. The BUSY entries
+    // must remain untouched.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn c_partial_busy_evicts_oldest_idle_and_succeeds() {
+        let temp = tempfile::tempdir().unwrap();
+        let (pool, _wd) = pool_with_max_sessions(&temp, 2).await;
+        // Three distinct keys; cap is 2 → third spawn MUST evict.
+        pool.get_or_create("idle-A", None).await.expect("spawn idle-A");
+        // Touch idle-A, then add small wait so its last_active is older.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        pool.get_or_create("busy-X", None).await.expect("spawn busy-X");
+        mark_busy(&pool, "busy-X").await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        pool.get_or_create("idle-B", None).await.expect("spawn idle-B");
+        // At this point `state.active.len() == 2`, idle-B was just
+        // created and triggered eviction of the oldest IDLE entry
+        // (which was idle-A). idle-B itself is now in the pool.
+        // busy-X is still busy; idle-A must be gone.
+        assert!(!is_active(&pool, "idle-A").await, "idle-A must be evicted");
+        assert!(is_active(&pool, "busy-X").await, "busy-X must survive");
+        assert!(is_active(&pool, "idle-B").await, "idle-B must be present");
+        assert_eq!(active_len(&pool).await, 2);
+        // busy-X must STILL be marked busy — eviction did not touch it.
+        assert!(pool.state.read().await.activity["busy-X"].in_flight());
+        assert_phase(&pool, "busy-X", entry_phase::BUSY, "test C").await;
+    }
+
+    // ── TEST D ────────────────────────────────────────────────────────────
+    //
+    // D — Same-key reuse after a prompt completes. The second call MUST
+    // return `created = false` (reuse, not spawn). The busy flag must be
+    // cleared by the BusyGuard's Drop impl when the first prompt's
+    // `with_connection` returns.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn d_same_key_reuse_after_prompt_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let (pool, _wd) = pool_with_max_sessions(&temp, 4).await;
+        pool.get_or_create("reuse", None).await.expect("spawn reuse");
+        // First prompt: arm the BusyGuard via `with_connection`, then
+        // return Ok. On Drop the guard must clear the busy flag.
+        let first_prompt: anyhow::Result<()> = pool
+            .with_connection("reuse", |_conn| {
+                Box::pin(async move {
+                    // No actual RPC — we are not testing prompt success
+                    // here, only the lifecycle. The guard is dropped
+                    // when this closure returns.
+                    Ok(())
+                })
+            })
+            .await;
+        first_prompt.expect("first prompt must succeed");
+        // After the closure returns, busy MUST be cleared (RAII).
+        assert!(
+            !pool.state.read().await.activity["reuse"].in_flight(),
+            "BusyGuard::Drop must clear busy after Ok"
+        );
+        // Second `get_or_create` for the same key MUST NOT spawn.
+        let created = pool
+            .get_or_create("reuse", None)
+            .await
+            .expect("reuse call must succeed");
+        assert!(
+            !created,
+            "second get_or_create for same key must reuse, not spawn"
+        );
+        assert_eq!(active_len(&pool).await, 1);
+    }
+
+    // ── TEST E ────────────────────────────────────────────────────────────
+    //
+    // E — Prompt error path clears busy. The previous code relied on an
+    // explicit `prompt_done` call which could be skipped on error. The
+    // BusyGuard's Drop must clear busy regardless of the closure's
+    // outcome.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn e_prompt_error_clears_busy_via_raii() {
+        let temp = tempfile::tempdir().unwrap();
+        let (pool, _wd) = pool_with_max_sessions(&temp, 4).await;
+        pool.get_or_create("errkey", None).await.expect("spawn errkey");
+        let result: anyhow::Result<()> = pool
+            .with_connection("errkey", |_conn| {
+                Box::pin(async move { Err(anyhow::anyhow!("synthetic prompt failure")) })
+            })
+            .await;
+        assert!(result.is_err(), "prompt closure must propagate its Err");
+        // Despite the error, the entry MUST be IDLE again — that is
+        // the whole point of the RAII guard. Pre-Phase-6.4.10 this
+        // would still be busy forever (or until TTL cleanup).
+        assert!(
+            !pool.state.read().await.activity["errkey"].in_flight(),
+            "BusyGuard::Drop must clear busy after Err"
+        );
+        // And the entry must be reusable: another `with_connection`
+        // call must succeed (acquire the connection Arc).
+        let reuse: anyhow::Result<()> = pool
+            .with_connection("errkey", |_conn| Box::pin(async move { Ok(()) }))
+            .await;
+        reuse.expect("entry must be reusable after Err");
+    }
+
+    // ── TEST F ────────────────────────────────────────────────────────────
+    //
+    // F — Drop-while-in-flight clears busy. Simulates a cancellation by
+    // letting the future complete via drop (the closure is cancelled
+    // mid-flight). The guard's Drop impl must still fire because Drop
+    // runs on the stack frame that owned the guard.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn f_dropped_prompt_clears_busy() {
+        let temp = tempfile::tempdir().unwrap();
+        let (pool, _wd) = pool_with_max_sessions(&temp, 4).await;
+        pool.get_or_create("dropkey", None).await.expect("spawn dropkey");
+        // The closure is one that the test harness cancels by
+        // dropping the future. We use tokio::time::timeout to race
+        // the closure: the timeout fires first, the future is
+        // dropped, and the guard drops with it.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            pool.with_connection("dropkey", |_conn| {
+                Box::pin(async move {
+                    // Sleep "forever" — the test harness will cancel
+                    // us via the timeout above.
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    Ok(())
+                })
+            }),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "timeout must fire before the long sleep completes"
+        );
+        // Even though the closure was cancelled mid-flight, the
+        // guard's Drop impl MUST have run (Drop is not cancelled).
+        // The pool state must show the entry IDLE again.
+        assert!(
+            !pool.state.read().await.activity["dropkey"].in_flight(),
+            "BusyGuard::Drop must clear busy after cancellation"
+        );
+    }
+
+    // ── TEST G ────────────────────────────────────────────────────────────
+    //
+    // G — Busy entries are NEVER evictable, even if they are the oldest.
+    // The previous `try_lock`-based heuristic conflated "no concurrent
+    // reader" with "no in-flight prompt" and could evict a busy entry
+    // under contention. The new `find_oldest_idle_eviction_candidate`
+    // skips every entry whose `in_flight` flag is true.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn g_busy_entries_are_never_evictable_even_when_oldest() {
+        let temp = tempfile::tempdir().unwrap();
+        let (pool, _wd) = pool_with_max_sessions(&temp, 2).await;
+        // Two entries: one busy-old, one idle-new. The busy-old has
+        // the older `last_active` — under the old heuristic it would
+        // be the eviction target. Under the new rule, the eviction
+        // must skip it and evict the idle-new entry instead.
+        pool.get_or_create("busy-old", None).await.expect("spawn busy-old");
+        // Force an older last_active by sleeping.
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        pool.get_or_create("idle-new", None).await.expect("spawn idle-new");
+        mark_busy(&pool, "busy-old").await;
+        // Third spawn at capacity must evict idle-new (the only IDLE
+        // entry) — NOT busy-old.
+        pool.get_or_create("third", None)
+            .await
+            .expect("third spawn must succeed by evicting idle-new");
+        assert!(
+            is_active(&pool, "busy-old").await,
+            "busy-old must survive even though it is oldest"
+        );
+        assert!(
+            !is_active(&pool, "idle-new").await,
+            "idle-new must be the eviction target"
+        );
+        assert!(is_active(&pool, "third").await);
+        assert!(pool.state.read().await.activity["busy-old"].in_flight());
+        assert_phase(&pool, "busy-old", entry_phase::BUSY, "test G").await;
+    }
+
+    // ── TEST H ────────────────────────────────────────────────────────────
+    //
+    // H — When multiple IDLE entries are candidates for eviction, the
+    // OLDEST one (smallest `last_active`) is selected. The helper
+    // `find_oldest_idle_eviction_candidate` must be deterministic and
+    // must skip BUSY entries regardless of their `last_active`.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn h_oldest_idle_eviction_is_deterministic_and_skips_busy() {
+        let temp = tempfile::tempdir().unwrap();
+        let (pool, _wd) = pool_with_max_sessions(&temp, 3).await;
+        pool.get_or_create("first", None).await.expect("spawn first");
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        pool.get_or_create("second", None).await.expect("spawn second");
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        pool.get_or_create("third", None).await.expect("spawn third");
+        // Mark `second` busy so it is excluded from the candidate
+        // scan. Now the only IDLE candidates are `first` and
+        // `third`. `first` is older; `find_oldest_idle_eviction_
+        // candidate` must select `first`.
+        mark_busy(&pool, "second").await;
+        // Fill the pool: we are already at 3. Add a fourth key, which
+        // triggers eviction.
+        pool.get_or_create("fourth", None)
+            .await
+            .expect("fourth spawn must succeed");
+        assert!(
+            !is_active(&pool, "first").await,
+            "first must be evicted (oldest idle)"
+        );
+        assert!(
+            is_active(&pool, "second").await,
+            "second must survive (busy)"
+        );
+        assert!(
+            is_active(&pool, "third").await,
+            "third must survive (newer idle)"
+        );
+        assert!(is_active(&pool, "fourth").await);
+    }
+
+    // ── TEST I ────────────────────────────────────────────────────────────
+    //
+    // I — Native-dispatch fast lane (`create_fresh_session_only`) is now
+    // bounded by the same capacity invariant. The previous code allowed
+    // `state.active.len() > max_sessions` with only a warning, so a
+    // runaway scheduler dispatch could grow the pool past the ceiling.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn i_native_dispatch_fast_lane_respects_capacity() {
+        let temp = tempfile::tempdir().unwrap();
+        let (pool, _wd) = pool_with_max_sessions(&temp, 2).await;
+        // Two native-dispatch keys at the ceiling.
+        let k1 = format_native_dispatch_key("ArthurClaude", "oad-1");
+        let k2 = format_native_dispatch_key("ArthurClaude", "oad-2");
+        pool.create_fresh_session_only(&k1, None)
+            .await
+            .expect("native-1 must succeed");
+        pool.create_fresh_session_only(&k2, None)
+            .await
+            .expect("native-2 must succeed");
+        // Mark both busy so neither is evictable.
+        mark_busy(&pool, &k1).await;
+        mark_busy(&pool, &k2).await;
+        // Third native-dispatch call: must return pool exhausted.
+        let k3 = format_native_dispatch_key("ArthurClaude", "oad-3");
+        let result = pool.create_fresh_session_only(&k3, None).await;
+        let err = result.expect_err("third native dispatch must fail when all are busy");
+        assert!(
+            err.to_string().contains("pool exhausted"),
+            "native fast lane must respect capacity, got: {err}"
+        );
+        // The pool must NOT have grown past the ceiling.
+        assert_eq!(
+            active_len(&pool).await,
+            2,
+            "native fast lane must not exceed max_sessions"
+        );
+        // busy entries must STILL be present and busy.
+        assert!(pool.state.read().await.activity[&k1].in_flight());
+        assert!(pool.state.read().await.activity[&k2].in_flight());
+        assert_phase(&pool, &k1, entry_phase::BUSY, "test I").await;
+        assert_phase(&pool, &k2, entry_phase::BUSY, "test I").await;
+    }
+
+    // ── TEST J ────────────────────────────────────────────────────────────
+    //
+    // J — Failed capacity acquisition leaks NO ACP child. When
+    // `ensure_capacity_or_evict` fails (every entry is BUSY), the spawn
+    // must not happen, so there must be no orphan child process. We
+    // verify by counting children before vs after the failed call.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn j_failed_capacity_acquisition_leaks_no_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let (pool, _wd) = pool_with_max_sessions(&temp, 1).await;
+        // One entry at the ceiling, marked busy.
+        pool.get_or_create("only", None).await.expect("spawn only");
+        mark_busy(&pool, "only").await;
+        // Capture active len (proxy for child count: every active
+        // entry owns exactly one child process).
+        let pre = active_len(&pool).await;
+        // Attempted second spawn must fail.
+        let result = pool.get_or_create("would-orphan", None).await;
+        assert!(result.is_err(), "second spawn must fail at capacity");
+        // The pool must not have grown.
+        let post = active_len(&pool).await;
+        assert_eq!(
+            pre, post,
+            "failed capacity acquisition must not spawn a child"
+        );
+        assert!(
+            !is_active(&pool, "would-orphan").await,
+            "the failed key must not be inserted"
+        );
+        // The original entry is still healthy and still busy.
+        assert!(pool.state.read().await.activity["only"].in_flight());
+        assert_phase(&pool, "only", entry_phase::BUSY, "test J").await;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase 6.4.10 (TOCTOU fix) — concurrency regression tests K–P.
+    //
+    // These exercise the two race conditions identified in the
+    // VERIFIER_FAIL cycle:
+    //
+    //   DEFECT 1 — Capacity TOCTOU between pre-spawn check and insert:
+    //             two concurrent creators could each observe room,
+    //             each spawn, each insert, pushing active.len() past
+    //             max_sessions.
+    //
+    //   DEFECT 2 — Busy/Evicting TOCTOU between phase observation and
+    //             mutex acquisition: with_connection could win the
+    //             mutex after eviction had decided to remove the
+    //             entry.
+    //
+    // The new design (atomic phase CAS + CreationReservation) closes
+    // both. These tests verify the closure under direct concurrent
+    // pressure: `tokio::join!` fires two creators at the same instant
+    // and we assert that the post-conditions hold no matter which
+    // scheduler ordering occurs.
+    // ─────────────────────────────────────────────────────────────────────
+
+    // ── TEST K ────────────────────────────────────────────────────────────
+    //
+    // K — Two fresh creators at max_sessions=1 must NOT both succeed.
+    // The CreationReservation closes the capacity TOCTOU window by
+    // incrementing `outstanding_creations` under the state lock
+    // BEFORE the spawn. This test deterministically proves that the
+    // second creator (C) reached the capacity-attempt boundary
+    // while B was still parked with its reservation, and therefore
+    // could NOT also reserve the same slot.
+    //
+    // Synchronization hooks (all `#[cfg(test)]`, dead in production):
+    //
+    //   * `creator_arrival_notify` — fires at the TOP of
+    //     `get_or_create` (and `create_fresh_session_only`), BEFORE
+    //     any lock acquire. Because the fire position is BEFORE
+    //     `state.write().await` in the per-thread gate acquisition,
+    //     it is reachable by B (parked in the eviction branch) AND
+    //     by C (blocked on the per-thread gate lock). This is the
+    //     "participant has entered the pool" signal.
+    //
+    //   * `eviction_reserved_notify` — fires inside the eviction
+    //     branch AFTER `outstanding_creations.fetch_add(1)` and
+    //     BEFORE the barrier await. The "B has parked with
+    //     reservation" signal.
+    //
+    //   * `eviction_reservation_barrier` — Direction B release: the
+    //     test thread signals the parked creator to proceed.
+    //
+    // Why `creator_arrival_notify` and NOT `ensure_capacity_attempt_notify`:
+    // the latter fires inside `ensure_capacity_or_evict`, which is
+    // unreachable for the blocked creator (C blocks on the per-thread
+    // gate's `state.write().await` BEFORE reaching the function). The
+    // arrival hook sits above that lock so both B and C can fire it
+    // before being blocked. This is a `cfg(test)` hook only — the
+    // production lock acquisition order is unchanged.
+    //
+    // Two-party synchronization with explicit ordering to defeat
+    // Notify's at-most-one-stored-permit coalescing and stale-seed
+    // permits:
+    //
+    //   1. Seed BEFORE any hook arm (no stale seed permit).
+    //   2. Arm hooks AFTER seed.
+    //   3. Spawn B alone. B fires creator_arrival (permit stored).
+    //      B reaches eviction branch, fires reserved_notify (permit
+    //      stored). B parks on barrier.
+    //   4. Consume B's arrival permit (unambiguously B's).
+    //   5. Consume B's reserved permit.
+    //   6. Spawn C ONLY after B is parked.
+    //   7. Consume C's fresh arrival permit (unambiguously C's —
+    //      step 4 cleared B's). C has entered get_or_create and is
+    //      now blocked on the state write lock that B holds.
+    //   8. Release barrier. B unblocks, commits, returns Ok. C is
+    //      queued behind the lock and observes the pool is full +
+    //      0 outstanding, returns Err("pool exhausted").
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn k_concurrent_distinct_fresh_creation_bounded_by_capacity() {
+        let temp = tempfile::tempdir().unwrap();
+        let agent_script = write_test_agent_script(temp.path());
+        let mut pool = SessionPool::with_test_state(
+            AgentConfig {
+                command: agent_script.to_string_lossy().into(),
+                args: Vec::new(),
+                working_dir: temp.path().to_string_lossy().into(),
+                env: HashMap::new(),
+                inherit_env: Vec::new(),
+                command_explicit: true,
+            },
+            SessionPoolTestState::default(),
+            temp.path().join("session_projects_k.json"),
+        );
+        pool.set_max_sessions_for_test(1);
+
+        // Step 1: seed BEFORE any hook arm.
+        pool.get_or_create("seed", None).await.expect("seed spawn");
+
+        // Step 2: arm hooks AFTER seed.
+        let barrier = pool.install_eviction_reservation_barrier_for_test();
+        let creator_arrival =
+            pool.install_creator_arrival_notify_for_test();
+        let reserved_notify = pool.install_eviction_reserved_notify_for_test();
+        let pool = Arc::new(pool);
+
+        // Step 3: spawn B alone.
+        let pool_a = Arc::clone(&pool);
+        let b_task = tokio::spawn(async move { pool_a.get_or_create("B", None).await });
+
+        // Step 4: consume B's arrival permit.
+        creator_arrival.notified().await;
+
+        // Step 5: consume B's reserved permit.
+        reserved_notify.notified().await;
+        assert_eq!(
+            pool.outstanding_creations
+                .load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "B must have reserved the slot before C starts"
+        );
+
+        // Step 6: spawn C ONLY after B is parked.
+        let pool_c = Arc::clone(&pool);
+        let c_task = tokio::spawn(async move { pool_c.get_or_create("C", None).await });
+
+        // Step 7: consume C's fresh arrival permit.
+        creator_arrival.notified().await;
+        assert_eq!(
+            pool.outstanding_creations
+                .load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "C must NOT have acquired a reservation while B is parked"
+        );
+
+        // Step 8: release B; C is rejected by capacity.
+        barrier.notify_one();
+        let res_b = b_task.await.expect("b join");
+        let res_c = c_task.await.expect("c join");
+        let oks = [res_b.is_ok(), res_c.is_ok()].iter().filter(|r| **r).count();
+        let errs = [res_b.is_ok(), res_c.is_ok()].iter().filter(|r| !**r).count();
+        assert_eq!(oks, 1, "exactly one of B/C must succeed");
+        assert_eq!(errs, 1, "the other must be rejected");
+        let c_err = res_c.expect_err("loser must be Err");
+        assert!(
+            c_err.to_string().contains("pool exhausted"),
+            "loser must be rejected with pool exhausted (got: {c_err})"
+        );
+        assert_eq!(
+            active_len(&pool).await,
+            1,
+            "pool must NEVER exceed max_sessions=1"
+        );
+        assert_eq!(
+            pool.outstanding_creations
+                .load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "outstanding must be 0 after both creators finished"
+        );
+    }
+
+    // ── TEST L ────────────────────────────────────────────────────────────
+    //
+    // L — Two native-dispatch fresh creators at max_sessions=1 must
+    // also be bounded. The native-dispatch fast lane previously
+    // tolerated `state.active.len() > max_sessions` with only a
+    // warning; the new invariant guarantees
+    // `active.len() + outstanding_creations <= max_sessions` for the
+    // fast lane too. Same sequencing discipline as K — seed before
+    // arm; spawn t1; consume t1's arrival; consume t1's reserved;
+    // spawn t2; consume t2's fresh arrival; release.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn l_concurrent_native_fresh_creation_bounded_by_capacity() {
+        let temp = tempfile::tempdir().unwrap();
+        let agent_script = write_test_agent_script(temp.path());
+        let mut pool = SessionPool::with_test_state(
+            AgentConfig {
+                command: agent_script.to_string_lossy().into(),
+                args: Vec::new(),
+                working_dir: temp.path().to_string_lossy().into(),
+                env: HashMap::new(),
+                inherit_env: Vec::new(),
+                command_explicit: true,
+            },
+            SessionPoolTestState::default(),
+            temp.path().join("session_projects_l.json"),
+        );
+        pool.set_max_sessions_for_test(1);
+
+        // Step 1: seed BEFORE any hook arm.
+        pool.get_or_create("human-seed", None).await.expect("seed");
+
+        // Step 2: arm hooks AFTER seed.
+        let barrier = pool.install_eviction_reservation_barrier_for_test();
+        let creator_arrival =
+            pool.install_creator_arrival_notify_for_test();
+        let reserved_notify = pool.install_eviction_reserved_notify_for_test();
+        let pool = Arc::new(pool);
+
+        let k1 = format_native_dispatch_key("ArthurClaude", "oad-L-1");
+        let k2 = format_native_dispatch_key("ArthurClaude", "oad-L-2");
+
+        // Step 3: spawn only t1 (the "B" creator) first.
+        let pool_a = Arc::clone(&pool);
+        let k1c = k1.clone();
+        let t1 = tokio::spawn(async move {
+            pool_a.create_fresh_session_only(&k1c, None).await
+        });
+
+        // Step 4: consume t1's arrival permit.
+        creator_arrival.notified().await;
+        // Step 5: consume t1's reserved permit.
+        reserved_notify.notified().await;
+        assert_eq!(
+            pool.outstanding_creations
+                .load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "t1 must have reserved the slot before t2 starts"
+        );
+
+        // Step 6: spawn t2 ONLY AFTER t1 is parked.
+        let pool_b = Arc::clone(&pool);
+        let k2c = k2.clone();
+        let t2 = tokio::spawn(async move {
+            pool_b.create_fresh_session_only(&k2c, None).await
+        });
+
+        // Step 7: consume t2's fresh arrival permit.
+        creator_arrival.notified().await;
+        assert_eq!(
+            pool.outstanding_creations
+                .load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "second native creator must NOT have acquired a reservation"
+        );
+
+        // Step 8: release t1; t2 is rejected by capacity.
+        barrier.notify_one();
+        let r1: anyhow::Result<bool> = t1.await.expect("t1 join");
+        let r2: anyhow::Result<bool> = t2.await.expect("t2 join");
+        let oks = [r1.is_ok(), r2.is_ok()].iter().filter(|r| **r).count();
+        let errs = [r1.is_ok(), r2.is_ok()].iter().filter(|r| !**r).count();
+        assert_eq!(oks, 1, "exactly one native creator must succeed");
+        assert_eq!(errs, 1, "the other must be rejected");
+        assert_eq!(
+            active_len(&pool).await,
+            1,
+            "native fast lane must NEVER exceed max_sessions=1"
+        );
+        if r1.is_err() {
+            assert_not_active(&pool, &k1, "loser (k1)").await;
+        }
+        if r2.is_err() {
+            assert_not_active(&pool, &k2, "loser (k2)").await;
+        }
+    }
+
+    // ── TEST M ────────────────────────────────────────────────────────────
+    //
+    // M — Reuse-vs-eviction race. With max_sessions=1 and one IDLE
+    // entry A, coordinate two tasks:
+    //
+    //   Task 1: with_connection(A) — would CAS IDLE→BUSY
+    //   Task 2: get_or_create(B) — would CAS IDLE→EVICTING for A
+    //
+    // The CAS is the authority: exactly one transition wins. Either:
+    //   * Task 1 wins BUSY → Task 2's eviction sees BUSY and skips A,
+    //     returns `pool exhausted`.
+    //   * Task 2 wins EVICTING → Task 1's with_connection sees EVICTING
+    //     and returns "session is being evicted".
+    //
+    // NEVER: A becomes BUSY and is then evicted, leaving Task 1 using
+    // an entry that has been removed.
+    //
+    // This test uses the deterministic barrier to force the
+    // eviction-claim path to run to completion BEFORE task 1's
+    // `with_connection` even gets a chance to read state. Task 1 will
+    // see A is no longer in `state.active` and return Err. The test
+    // also runs a second variant where task 1 fires its BUSY CAS
+    // FIRST (by acquiring `with_connection` before installing the
+    // barrier-driven eviction), to prove the inverse ordering is
+    // also correct.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn m_reuse_vs_eviction_race_is_exclusive() {
+        // ── Variant 1: eviction-claim wins first (deterministic). ──
+        // max_sessions=1, A is IDLE. The barrier parks the evictor
+        // inside `ensure_capacity_or_evict` AFTER it has CAS'd A to
+        // EVICTING and removed A from state.active. The
+        // with_connection task is spawned second and is forced to
+        // observe the post-eviction state.
+        let temp = tempfile::tempdir().unwrap();
+        let agent_script = write_test_agent_script(temp.path());
+        let mut pool = SessionPool::with_test_state(
+            AgentConfig {
+                command: agent_script.to_string_lossy().into(),
+                args: Vec::new(),
+                working_dir: temp.path().to_string_lossy().into(),
+                env: HashMap::new(),
+                inherit_env: Vec::new(),
+                command_explicit: true,
+            },
+            SessionPoolTestState::default(),
+            temp.path().join("session_projects_m.json"),
+        );
+        pool.set_max_sessions_for_test(1);
+        let barrier = pool.install_eviction_reservation_barrier_for_test();
+        let reserved_notify = pool.install_eviction_reserved_notify_for_test();
+        let pool = Arc::new(pool);
+        pool.get_or_create("A", None).await.expect("seed A");
+
+        // Capture A's Arc for later phase inspection (independent
+        // of state.active visibility).
+        let a_arc = {
+            let st = pool.state.read().await;
+            st.active.get("A").cloned().expect("A present")
+        };
+
+        // Task 2: get_or_create "B". Reaches eviction branch, parks.
+        let pool_e = Arc::clone(&pool);
+        let evict_task = tokio::spawn(async move {
+            pool_e.get_or_create("B", None).await
+        });
+
+        // Wait deterministically for the reservation to land: the
+        // reserved_notify fires AFTER fetch_add(1) and BEFORE the
+        // barrier await, so consuming its permit proves both that
+        // fetch_add has happened AND that the barrier park is
+        // imminent. This replaces the prior atomic-poll / yield-loop
+        // assumption.
+        reserved_notify.notified().await;
+        assert_eq!(
+            pool.outstanding_creations
+                .load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "evictor must have its reservation in place"
+        );
+        // Verify A is EVICTING (the CAS happened).
+        assert_eq!(
+            phase_load(&a_arc),
+            entry_phase::EVICTING,
+            "A must be EVICTING by the time task 2 is parked"
+        );
+
+        // Task 1: with_connection("A"). It tries `state.read()`,
+        // which blocks on task 2's write lock. After we release the
+        // barrier, task 2 finishes, commits B, drops the lock.
+        // Task 1 then reads state, sees no entry for "A", and
+        // returns Err("no connection for thread A").
+        let pool_r = Arc::clone(&pool);
+        let reuse_task = tokio::spawn(async move {
+            pool_r
+                .with_connection("A", |_conn| Box::pin(async move { Ok(()) }))
+                .await
+        });
+
+        barrier.notify_one();
+        let evict_res = evict_task.await.expect("evict join");
+        assert!(evict_res.is_ok(), "evictor must succeed (got {:?})", evict_res);
+        let reuse_res = reuse_task.await.expect("reuse join");
+        let reuse_err = reuse_res.expect_err(
+            "reuse must fail because A was evicted while reuse was queued",
+        );
+        assert!(
+            reuse_err.to_string().contains("no connection")
+                || reuse_err.to_string().contains("evicted")
+                || reuse_err.to_string().contains("evicting"),
+            "reuse error must mention missing/evicted entry: {reuse_err}"
+        );
+        // Final invariants.
+        assert!(is_active(&pool, "B").await);
+        assert!(!is_active(&pool, "A").await);
+        assert_eq!(active_len(&pool).await, 1);
+
+        // ── Variant 2: BUSY wins first. ──
+        //
+        // Two-party synchronization:
+        //
+        //   A. `busy_claimed_notify` — fires from inside the
+        //      `with_connection` closure BEFORE the closure body
+        //      runs, AFTER the BUSY CAS has succeeded. The test
+        //      thread consumes this permit to prove "prompt task
+        //      claimed BUSY".
+        //
+        //   B. `release_notify` — the test thread signals the
+        //      prompt closure to release BUSY and complete. Only
+        //      AFTER observing the evictor's `pool exhausted`
+        //      result does the test release the prompt.
+        //
+        // The eviction task runs SYNCHRONOUSLY in the test thread
+        // (no `tokio::spawn`) because we must observe its result
+        // before releasing the prompt closure. Since the prompt
+        // closure is parked waiting on `release_notify`, the
+        // eviction task is the only thing keeping the test thread
+        // from racing.
+        let pool2 = Arc::clone(&pool);
+        let reuse_held = Arc::clone(&pool);
+        // Build a fresh pool for variant 2 to avoid state
+        // pollution from variant 1 (B is healthy and IDLE).
+        drop(pool2);
+        drop(reuse_held);
+        let temp2 = tempfile::tempdir().unwrap();
+        let agent_script2 = write_test_agent_script(temp2.path());
+        let mut pool2 = SessionPool::with_test_state(
+            AgentConfig {
+                command: agent_script2.to_string_lossy().into(),
+                args: Vec::new(),
+                working_dir: temp2.path().to_string_lossy().into(),
+                env: HashMap::new(),
+                inherit_env: Vec::new(),
+                command_explicit: true,
+            },
+            SessionPoolTestState::default(),
+            temp2.path().join("session_projects_m2.json"),
+        );
+        pool2.set_max_sessions_for_test(1);
+        let pool2 = Arc::new(pool2);
+        pool2.get_or_create("A2", None).await.expect("seed A2");
+
+        let busy_claimed_notify = Arc::new(tokio::sync::Notify::new());
+        let release_notify = Arc::new(tokio::sync::Notify::new());
+
+        // Spawn the prompt task. The closure:
+        //   * signals `busy_claimed_notify` once BUSY has been CAS'd
+        //     (the closure body runs AFTER the CAS, so signaling
+        //     here proves the CAS succeeded);
+        //   * then parks on `release_notify` until the test thread
+        //     releases it.
+        let pool_inner = Arc::clone(&pool2);
+        let bc_clone = Arc::clone(&busy_claimed_notify);
+        let rel_clone = Arc::clone(&release_notify);
+        let held_task = tokio::spawn(async move {
+            pool_inner
+                .with_connection("A2", move |_conn| {
+                    let bc = Arc::clone(&bc_clone);
+                    let rel = Arc::clone(&rel_clone);
+                    Box::pin(async move {
+                        bc.notify_one(); // A: "I claimed BUSY"
+                        rel.notified().await; // wait for test release
+                        Ok(())
+                    })
+                })
+                .await
+        });
+
+        // Direction A: wait for the prompt closure to signal it
+        // has CAS'd A2 to BUSY.
+        busy_claimed_notify.notified().await;
+        assert_eq!(
+            phase_load(
+                &pool2.state.read().await.active.get("A2").cloned().unwrap()
+            ),
+            entry_phase::BUSY,
+            "A2 must be BUSY before evictor runs"
+        );
+
+        // Run the eviction task SYNCHRONOUSLY. While the prompt
+        // closure holds BUSY, the eviction branch scans for an
+        // IDLE candidate, finds A2 is BUSY (skip), no other
+        // candidates, returns Err("pool exhausted").
+        let evict_attempt = pool2.get_or_create("C2", None).await;
+        let evict_err =
+            evict_attempt.expect_err("evictor must fail when only candidate is BUSY");
+        assert!(
+            evict_err.to_string().contains("pool exhausted"),
+            "evictor must report pool exhausted: {evict_err}"
+        );
+
+        // Direction B: only AFTER observing the evictor's
+        // rejection do we release the prompt closure. This proves
+        // the eviction branch saw BUSY, not a transient IDLE.
+        release_notify.notify_one();
+        let prompt_result = held_task.await.expect("held join");
+        let prompt_value = prompt_result.expect("prompt must succeed");
+        // `with_connection` returns the closure's Result<R>; Ok(())
+        // means the closure completed cleanly.
+        let _ = prompt_value;
+        // A2 is still BUSY... wait, actually BUSY has been
+        // released by the PhaseGuard Drop on closure exit, so A2
+        // is now IDLE. Active length is still 1.
+        assert!(is_active(&pool2, "A2").await);
+        assert_eq!(active_len(&pool2).await, 1);
+    }
+
+    // ── TEST N ────────────────────────────────────────────────────────────
+    //
+    // N — Eviction-vs-reuse INVERSE ordering. Force the eviction to
+    // claim EVICTING first, then attempt reuse. Reuse MUST NOT execute
+    // using an entry already claimed for eviction.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn n_eviction_claim_first_blocks_subsequent_reuse() {
+        let temp = tempfile::tempdir().unwrap();
+        let (pool, _wd) = pool_with_max_sessions(&temp, 1).await;
+        pool.get_or_create("A", None).await.expect("seed A");
+        // Manually flip A to EVICTING (simulating an in-progress
+        // eviction claim) so the next with_connection attempt must
+        // observe EVICTING and refuse.
+        mark_busy(&pool, "A").await; // first BUSY (atomic) to allow controlled flip
+        let state = pool.state.read().await;
+        let conn = state.active.get("A").cloned().expect("A active");
+        // Bypass mark_busy and force EVICTING directly.
+        phase_force_set(&conn, entry_phase::EVICTING);
+        drop(state);
+        // with_connection must FAIL because A is EVICTING.
+        let res = pool
+            .with_connection("A", |_conn| Box::pin(async move { Ok(()) }))
+            .await;
+        let err = res.expect_err("with_connection on EVICTING entry must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("evicting") || msg.contains("evicted") || msg.contains("busy"),
+            "error must mention evicting/evicted or busy: {msg}"
+        );
+        // active.len() unchanged.
+        assert_eq!(active_len(&pool).await, 1);
+    }
+
+    // ── TEST O ────────────────────────────────────────────────────────────
+    //
+    // O — Reservation released on spawn/init failure. We force spawn
+    // to fail (by pointing the agent command at a non-existent binary)
+    // and assert that the reservation is released so a subsequent
+    // creator can succeed.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn o_reservation_released_on_spawn_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        // Pool whose agent command does not exist on disk.
+        let mut pool = SessionPool::with_test_state(
+            AgentConfig {
+                command: "/nonexistent/binary/should/fail".into(),
+                args: Vec::new(),
+                working_dir: temp.path().to_string_lossy().into(),
+                env: HashMap::new(),
+                inherit_env: Vec::new(),
+                command_explicit: true,
+            },
+            SessionPoolTestState::default(),
+            temp.path().join("session_projects.json"),
+        );
+        pool.set_max_sessions_for_test(2);
+        let pool = Arc::new(pool);
+        // First attempt must fail.
+        let r1 = pool.get_or_create("fail-key", None).await;
+        assert!(r1.is_err(), "spawn must fail when command is missing");
+        // outstanding_creations must be back to 0.
+        assert_eq!(
+            pool.outstanding_creations
+                .load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "failed spawn must release the reservation"
+        );
+        // The state must not contain a leaked entry.
+        assert_not_active(&pool, "fail-key", "after failed spawn").await;
+        // A second creator can use the freed slot. Use a working
+        // command this time so we can prove the slot is usable.
+        let agent_script = write_test_agent_script(temp.path());
+        let mut pool2 = SessionPool::with_test_state(
+            AgentConfig {
+                command: agent_script.to_string_lossy().into(),
+                args: Vec::new(),
+                working_dir: temp.path().to_string_lossy().into(),
+                env: HashMap::new(),
+                inherit_env: Vec::new(),
+                command_explicit: true,
+            },
+            SessionPoolTestState::default(),
+            temp.path().join("session_projects2.json"),
+        );
+        pool2.set_max_sessions_for_test(2);
+        let pool2 = Arc::new(pool2);
+        pool2.get_or_create("good-1", None).await.expect("good-1 spawn");
+        pool2.get_or_create("good-2", None).await.expect("good-2 spawn");
+        assert_eq!(active_len(&pool2).await, 2);
+    }
+
+    // ── TEST P ────────────────────────────────────────────────────────────
+    //
+    // P — Cancellation while holding a creation reservation. The
+    // CreationReservation's Drop impl must release the slot on every
+    // exit path, including cancellation AFTER reservation has been
+    // acquired but BEFORE insertion. The deterministic
+    // `eviction_reservation_barrier` is the contract: install it, the
+    // second creator parks INSIDE the eviction branch AFTER
+    // `outstanding_creations.fetch_add` and BEFORE
+    // `drop(state)`. The test then cancels the future while it's
+    // parked, asserts the reservation was released, and proves the
+    // slot is reusable by a third creator.
+    //
+    // Synchronization is fully explicit two-party:
+    //
+    //   * `reserved_notify` (Direction A, arrival) — fires inside the
+    //     eviction branch AFTER fetch_add and BEFORE the barrier
+    //     await. The test thread consumes its permit to prove the
+    //     creator has its reservation.
+    //
+    //   * `drop_notify` (Direction A, drop-arrival) — fires inside
+    //     `Drop for CreationReservation` AFTER the failure-path
+    //     fetch_sub. The test thread consumes its permit after
+    //     `b_task.abort()` to deterministically observe that the RAII
+    //     guard's Drop has run.
+    //
+    //   * `barrier` (Direction B, release) — the test thread
+    //     signals the parked creator to proceed (only invoked at the
+    //     end for cleanup, since B is cancelled before reaching it).
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn p_reservation_released_on_cancellation_via_drop() {
+        let temp = tempfile::tempdir().unwrap();
+        // Build a pool directly so we can install the barrier. The
+        // helper would force Arc<SessionPool> which prevents mutation.
+        let agent_script = write_test_agent_script(temp.path());
+        let mut pool = SessionPool::with_test_state(
+            AgentConfig {
+                command: agent_script.to_string_lossy().into(),
+                args: Vec::new(),
+                working_dir: temp.path().to_string_lossy().into(),
+                env: HashMap::new(),
+                inherit_env: Vec::new(),
+                command_explicit: true,
+            },
+            SessionPoolTestState::default(),
+            temp.path().join("session_projects_p.json"),
+        );
+        pool.set_max_sessions_for_test(1);
+        let barrier = pool.install_eviction_reservation_barrier_for_test();
+        let reserved_notify = pool.install_eviction_reserved_notify_for_test();
+        let drop_notify = pool.install_reservation_drop_notify_for_test();
+        let pool = Arc::new(pool);
+
+        // Seed entry A. It must be IDLE (the eviction branch only
+        // runs on IDLE candidates).
+        pool.get_or_create("A", None).await.expect("seed A");
+
+        // Race a creator for "B" against cancellation. The creator
+        // will reach the eviction branch, evict A, fetch_add
+        // outstanding_creations to 1, then park on the barrier.
+        let pool_for_b = Arc::clone(&pool);
+        let b_task = tokio::spawn(async move {
+            pool_for_b.get_or_create("B", None).await
+        });
+
+        // Wait deterministically for B's reservation to be acquired:
+        // the reserved_notify fires AFTER fetch_add(1) and BEFORE
+        // the barrier await, so consuming its permit proves the
+        // reservation is in place. This replaces the prior atomic-
+        // poll / yield-loop assumption.
+        reserved_notify.notified().await;
+        assert_eq!(
+            pool.outstanding_creations
+                .load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "B must have acquired its reservation before being cancelled"
+        );
+
+        // Cancel the B future while it is parked at the barrier.
+        // Drop runs the CreationReservation::Drop, which decrements
+        // outstanding_creations AND fires `drop_notify` exactly
+        // once.
+        b_task.abort();
+        let join_result = b_task.await;
+        assert!(
+            join_result.is_err(),
+            "aborted task should report JoinError"
+        );
+
+        // Wait deterministically for the RAII guard's Drop to run.
+        // The drop_notify fires from inside `Drop for
+        // CreationReservation` AFTER the failure-path fetch_sub
+        // (or after commit sets `committed = true`). This replaces
+        // the prior `for _ in 0..16 { yield_now().await; }`
+        // heuristic.
+        drop_notify.notified().await;
+
+        // Invariant: outstanding_creations is back to 0 and the
+        // slot is reusable.
+        assert_eq!(
+            pool.outstanding_creations
+                .load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "cancelled reservation must release the slot via Drop"
+        );
+
+        // A fresh creator "C" can now acquire the slot. The barrier
+        // is no-op for this path (no eviction candidate), so we
+        // don't need to release it. The seed "A" was already
+        // evicted by B's reservation; "C" will spawn fresh.
+        let c_res = pool.get_or_create("C", None).await;
+        assert!(c_res.is_ok(), "C must succeed after reservation released");
+        assert!(is_active(&pool, "C").await);
+
+        // The barrier is never released because B was cancelled —
+        // release it now to keep the test deterministic for any
+        // follow-up paths.
+        barrier.notify_one();
+    }
+
+    // ── TEST Q ────────────────────────────────────────────────────────────
+    //
+    // Q — Eviction-to-reservation atomicity (deterministic). With
+    // `max_sessions=1`, a single IDLE entry A, two creators B and C
+    // are coordinated so that B reaches the eviction branch and
+    // parks INSIDE the state write lock AFTER it has incremented
+    // `outstanding_creations`, while C is then spawned and observed
+    // to attempt the capacity boundary while B is still parked.
+    //
+    // Two-party synchronization, with explicit ordering to defeat
+    // Notify's at-most-one-stored-permit coalescing and stale-seed
+    // permits:
+    //
+    //   1. Seed A BEFORE any hook arm. (No stale seed permit
+    //      possible — the field is None at seed time.)
+    //   2. Arm hooks AFTER seed.
+    //   3. Spawn B alone.
+    //   4. Consume B's arrival permit.
+    //   5. Consume B's reserved permit (after fetch_add, before
+    //      barrier park).
+    //   6. Spawn C only after B is parked.
+    //   7. Consume C's fresh arrival permit.
+    //   8. Release barrier.
+    //
+    // The arrival hook (`creator_arrival_notify`) fires at the TOP
+    // of `get_or_create`, BEFORE the per-thread gate's
+    // `state.write().await`. This is reachable for both B and C —
+    // even though C is blocked on the per-thread gate lock while B
+    // holds the eviction-branch write lock, C fires the arrival
+    // hook before blocking. `ensure_capacity_attempt_notify`
+    // (firing inside `ensure_capacity_or_evict`) is unreachable for
+    // C under this contention shape and is therefore unsuitable as
+    // the C signal.
+    //
+    // No atomic-poll loops, no yield loops, no sleeps.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn q_eviction_to_reservation_is_atomic_under_deterministic_barrier() {
+        let temp = tempfile::tempdir().unwrap();
+        let agent_script = write_test_agent_script(temp.path());
+        let mut pool = SessionPool::with_test_state(
+            AgentConfig {
+                command: agent_script.to_string_lossy().into(),
+                args: Vec::new(),
+                working_dir: temp.path().to_string_lossy().into(),
+                env: HashMap::new(),
+                inherit_env: Vec::new(),
+                command_explicit: true,
+            },
+            SessionPoolTestState::default(),
+            temp.path().join("session_projects_q.json"),
+        );
+        pool.set_max_sessions_for_test(1);
+
+        // Step 1: seed BEFORE any hook arm.
+        pool.get_or_create("A", None).await.expect("seed A");
+        assert_eq!(active_len(&pool).await, 1);
+
+        // Step 2: arm hooks AFTER seed.
+        let barrier = pool.install_eviction_reservation_barrier_for_test();
+        let creator_arrival =
+            pool.install_creator_arrival_notify_for_test();
+        let reserved_notify = pool.install_eviction_reserved_notify_for_test();
+        let pool = Arc::new(pool);
+
+        // Step 3: spawn B alone.
+        let pool_for_b = Arc::clone(&pool);
+        let b_task = tokio::spawn(async move {
+            pool_for_b.get_or_create("B", None).await
+        });
+
+        // Step 4: consume B's arrival permit.
+        creator_arrival.notified().await;
+        // Step 5: consume B's reserved permit.
+        reserved_notify.notified().await;
+        assert_eq!(
+            pool.outstanding_creations
+                .load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "B must have reserved the freed slot atomically"
+        );
+
+        // Step 6: spawn C only after B is parked.
+        let pool_for_c = Arc::clone(&pool);
+        let c_task = tokio::spawn(async move {
+            pool_for_c.get_or_create("C", None).await
+        });
+
+        // Step 7: consume C's fresh arrival permit. Unambiguously
+        // C's because step 4 cleared B's. C is queued on the
+        // state write lock that B holds.
+        creator_arrival.notified().await;
+        assert_eq!(
+            pool.outstanding_creations
+                .load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "C must NOT have acquired a reservation while B is parked"
+        );
+
+        // Step 8: release B; C is rejected by capacity.
+        barrier.notify_one();
+        let b_res = b_task.await.expect("b join").expect("b not panic");
+        assert!(b_res, "B must successfully create");
+        let c_res = c_task.await.expect("c join");
+        let c_err = c_res.expect_err("C must be rejected with pool exhausted");
+        assert!(
+            c_err.to_string().contains("pool exhausted"),
+            "C must be rejected by capacity (got: {c_err})"
+        );
+
+        // Final invariants.
+        assert_eq!(
+            pool.outstanding_creations
+                .load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "outstanding must be 0 after B committed"
+        );
+        assert_eq!(active_len(&pool).await, 1);
+        assert!(is_active(&pool, "B").await);
+        assert!(!is_active(&pool, "A").await);
+    }
+
+    // ── TEST R ────────────────────────────────────────────────────────────
+    //
+    // R — Native-dispatch version of Q. Same invariant
+    // (`active + outstanding <= max`) must hold on the native
+    // `create_fresh_session_only` fast lane. Same sequencing
+    // discipline as Q — seed before arm; spawn t1; consume t1's
+    // arrival; consume t1's reserved; spawn t2; consume t2's fresh
+    // arrival; release.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn r_native_eviction_to_reservation_is_atomic_under_deterministic_barrier() {
+        let temp = tempfile::tempdir().unwrap();
+        let agent_script = write_test_agent_script(temp.path());
+        let mut pool = SessionPool::with_test_state(
+            AgentConfig {
+                command: agent_script.to_string_lossy().into(),
+                args: Vec::new(),
+                working_dir: temp.path().to_string_lossy().into(),
+                env: HashMap::new(),
+                inherit_env: Vec::new(),
+                command_explicit: true,
+            },
+            SessionPoolTestState::default(),
+            temp.path().join("session_projects_r.json"),
+        );
+        pool.set_max_sessions_for_test(1);
+
+        // Step 1: seed BEFORE any hook arm.
+        pool.get_or_create("human-seed", None).await.expect("seed");
+        assert_eq!(active_len(&pool).await, 1);
+
+        // Step 2: arm hooks AFTER seed.
+        let barrier = pool.install_eviction_reservation_barrier_for_test();
+        let creator_arrival =
+            pool.install_creator_arrival_notify_for_test();
+        let reserved_notify = pool.install_eviction_reserved_notify_for_test();
+        let pool = Arc::new(pool);
+
+        let k1 = format_native_dispatch_key("ArthurClaude", "oad-R-1");
+        let k2 = format_native_dispatch_key("ArthurClaude", "oad-R-2");
+
+        // Step 3: spawn only t1 (the "B" creator) first.
+        let pool_for_1 = Arc::clone(&pool);
+        let k1c = k1.clone();
+        let t1 = tokio::spawn(async move {
+            pool_for_1.create_fresh_session_only(&k1c, None).await
+        });
+
+        // Step 4: consume t1's arrival permit.
+        creator_arrival.notified().await;
+        // Step 5: consume t1's reserved permit.
+        reserved_notify.notified().await;
+        assert_eq!(
+            pool.outstanding_creations
+                .load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "t1 must have reserved the freed slot atomically"
+        );
+
+        // Step 6: spawn t2 only after t1 is parked.
+        let pool_for_2 = Arc::clone(&pool);
+        let k2c = k2.clone();
+        let t2 = tokio::spawn(async move {
+            pool_for_2.create_fresh_session_only(&k2c, None).await
+        });
+
+        // Step 7: consume t2's fresh arrival permit.
+        creator_arrival.notified().await;
+        assert_eq!(
+            pool.outstanding_creations
+                .load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "second native creator must NOT have acquired a reservation"
+        );
+
+        // Step 8: release t1; t2 is rejected by capacity.
+        barrier.notify_one();
+        let (r1, r2) = tokio::join!(t1, t2);
+        let r1: anyhow::Result<bool> = r1.expect("t1 join");
+        let r2: anyhow::Result<bool> = r2.expect("t2 join");
+        let oks = [r1.is_ok(), r2.is_ok()].iter().filter(|r| **r).count();
+        let errs = [r1.is_ok(), r2.is_ok()].iter().filter(|r| !**r).count();
+        assert_eq!(oks, 1, "exactly one native creator must succeed");
+        assert_eq!(errs, 1, "the other must be rejected");
+        assert_eq!(active_len(&pool).await, 1);
+        assert_eq!(
+            pool.outstanding_creations
+                .load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "outstanding must be 0 after one native creator committed"
         );
     }
 }

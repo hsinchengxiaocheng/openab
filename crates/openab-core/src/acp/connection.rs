@@ -403,6 +403,21 @@ pub struct AcpConnection {
     pub config_options: Vec<ConfigOption>,
     pub last_active: Instant,
     pub activity: Arc<SessionActivity>,
+    /// Phase 6.4.10 (TOCTOU fix) — authoritative entry lifecycle state.
+    /// Lock-free atomic so [`SessionPool::with_connection`] and the
+    /// eviction path can coordinate via compare-and-swap without taking
+    /// the connection mutex. Phase transitions are exclusive:
+    ///
+    ///   IDLE   ──CAS──▶ BUSY       (with_connection acquires the entry)
+    ///   IDLE   ──CAS──▶ EVICTING   (eviction claims the entry)
+    ///   BUSY   ──store─▶ IDLE      (with_connection releases on every exit)
+    ///   EVICTING ──store─▶ IDLE    (cancelled eviction — the entry is
+    ///                              given back to the pool, not destroyed)
+    ///
+    /// The encoding is fixed: 0 = IDLE, 1 = BUSY, 2 = EVICTING. Any other
+    /// value is treated as IDLE by readers so a corrupted atomic cannot
+    /// permanently lock out an entry.
+    pub phase: std::sync::atomic::AtomicU8,
     pub session_reset: bool,
     _reader_handle: JoinHandle<()>,
     _stderr_handle: Option<JoinHandle<()>>,
@@ -733,6 +748,7 @@ impl AcpConnection {
             config_options: Vec::new(),
             last_active: Instant::now(),
             activity,
+            phase: std::sync::atomic::AtomicU8::new(0), // 0 = IDLE
             session_reset: false,
             _reader_handle: reader_handle,
             write_policy_guard,
@@ -995,6 +1011,90 @@ impl AcpConnection {
         self.activity.touch();
         self.activity.set_in_flight(false);
         self.last_active = Instant::now();
+    }
+
+    // ── Phase 6.4.10 (TOCTOU fix) — entry lifecycle atomic helpers ───────
+    //
+    // These methods drive the per-connection `phase` atomic. They are the
+    // authority for whether an entry may start a prompt or be evicted.
+    // The previous design inferred idleness from `try_lock` on the
+    // connection mutex (a transient observation) which allowed a
+    // with_connection caller to win the mutex after eviction had already
+    // decided to remove the entry. The atomic CAS below makes the two
+    // transitions mutually exclusive.
+
+    /// Current lifecycle phase as a raw `u8` (0 = Idle, 1 = Busy,
+    /// 2 = Evicting). The pool's callers work with [`super::pool::EntryPhase`]
+    /// constants; this method is the lock-free read used by hot paths.
+    #[inline]
+    pub fn current_phase_u8(&self) -> u8 {
+        use std::sync::atomic::Ordering;
+        self.phase.load(Ordering::Acquire)
+    }
+
+    /// Try to transition IDLE → BUSY (acquire the entry for a prompt).
+    /// Returns `true` on success, `false` if the entry is BUSY or
+    /// EVICTING (the caller MUST retry or surface the failure).
+    #[inline]
+    pub fn try_claim_for_prompt(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.phase
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Try to transition IDLE → EVICTING (claim the entry for removal).
+    /// Returns `true` on success, `false` if the entry is BUSY (must not
+    /// evict) or already EVICTING (someone else claimed it first).
+    #[inline]
+    pub fn try_claim_for_eviction(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.phase
+            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Release a previously-claimed phase back to IDLE. Idempotent — a
+    /// no-op if the phase was already reset (e.g. by another Drop path).
+    /// Always safe to call from a Drop impl because it never panics.
+    #[inline]
+    pub fn release_phase_to_idle(&self) {
+        use std::sync::atomic::Ordering;
+        // Only ever set back to IDLE; if the current value is something
+        // else (EVICTING), the eviction path will reset it itself.
+        let _ = self.phase.compare_exchange(
+            1,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// Release an EVICTING phase back to IDLE. Used when an eviction
+    /// was claimed but the caller decided not to remove the entry (e.g.
+    /// another candidate was selected as "best"). Idempotent and
+    /// infallible — safe to call from Drop.
+    #[inline]
+    pub fn release_eviction_to_idle(&self) {
+        use std::sync::atomic::Ordering;
+        let _ = self.phase.compare_exchange(
+            2,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// Force the phase back to IDLE, regardless of its current value.
+    /// Used by [`super::pool`] after the entry has been fully removed
+    /// (so the next connection reused for the same key starts clean).
+    /// Only safe to call when no other holder is expected; the pool
+    /// pairs it with removal from `state.active`.
+    #[cfg(test)]
+    #[allow(dead_code)] // reserved for future per-key tests
+    pub(crate) fn reset_phase_for_test(&self) {
+        use std::sync::atomic::Ordering;
+        self.phase.store(0, Ordering::Release);
     }
 
     /// Drop the pending entry for `request_id` and best-effort send
