@@ -1706,6 +1706,9 @@ impl CtlHandler for RuntimeHandler {
             recipient: None,
             native_workflow: Some(metadata.clone()),
             discord_text_attachment_bodies: Vec::new(),
+            // Phase 6.4.9 — native scheduler work has no Discord inbound
+            // attachment authority surface; preserve the non-bot default.
+            sender_is_bot: false,
         };
         let ack = match admission
             .admit_work(WorkAdmissionRequest {
