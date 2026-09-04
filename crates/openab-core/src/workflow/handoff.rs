@@ -71,10 +71,19 @@ pub fn render_activation_body(ctx: &WorkflowContext, transition_id: &str) -> Str
 /// forbidden from authoring them.
 ///
 /// Allowed `result` values are derived from the recipient's
-/// `assigned_role`:
+/// `assigned_role`. The agent-facing rules mirror the AAP
+/// authoritative table (`AGENTS.md` Canonical Role Completion
+/// Contract):
 /// - `PRIMARY` → `COMPLETE`
 /// - `VERIFIER` → `PASS | FAIL`
-/// - `FINAL_REVIEWER` → `PASS | FAIL`
+/// - `FINAL_REVIEWER` → `PASS`
+///
+/// `FINAL_REVIEWER + FAIL` is intentionally NOT advertised to
+/// the agent on the prose-validator path because the current
+/// workflow state machine has no legal FINAL_REVIEWER+FAIL
+/// transition. The validator's internal vocabulary may still
+/// accept that combination for legacy callers; the contract
+/// projection never invites an agent to author one.
 ///
 /// The block is appended to the `<workflow_activation>` body and
 /// sent verbatim to the downstream agent. Plain-text
@@ -90,11 +99,16 @@ pub fn render_activation_body(ctx: &WorkflowContext, transition_id: &str) -> Str
 pub fn render_role_completion_contract(ctx: &WorkflowContext) -> String {
     let allowed_results = match ctx.assigned_role {
         WorkflowRole::Primary => "COMPLETE",
-        WorkflowRole::Verifier | WorkflowRole::FinalReviewer => "PASS | FAIL",
+        WorkflowRole::Verifier => "PASS | FAIL",
+        // Phase 6.4.x — FINAL_REVIEWER advertises PASS only.
+        // The agent-facing rule table does not include
+        // FINAL_REVIEWER+FAIL.
+        WorkflowRole::FinalReviewer => "PASS",
     };
     let result_hint = match ctx.assigned_role {
         WorkflowRole::Primary => "<COMPLETE>",
-        WorkflowRole::Verifier | WorkflowRole::FinalReviewer => "<PASS or FAIL>",
+        WorkflowRole::Verifier => "<PASS or FAIL>",
+        WorkflowRole::FinalReviewer => "<PASS>",
     };
     let mut out = String::new();
     out.push_str("<role_completion_contract>\n");
@@ -364,26 +378,36 @@ mod tests {
     }
 
     /// B. FINAL_REVIEWER downstream activation contains the canonical
-    ///    contract. Allowed results are PASS | FAIL.
+    ///    contract. Per the AAP agent-facing rules table, the only
+    ///    allowed result for FINAL_REVIEWER is PASS — FAIL is
+    ///    rejected at the structured-block boundary because the
+    ///    terminal line is owned by FINAL_REVIEWER and never
+    ///    combined with FAIL.
     #[test]
     fn contract_is_present_in_final_reviewer_activation() {
         let ctx = sample_context_for(WorkflowRole::FinalReviewer);
         let body = render_activation_body(&ctx, "tx-2");
         assert!(body.contains("<role_completion_contract>"), "{body}");
         assert!(body.contains("role: FINAL_REVIEWER\n"), "{body}");
-        assert!(body.contains("allowed_results: PASS | FAIL\n"), "{body}");
+        assert!(body.contains("allowed_results: PASS\n"), "{body}");
+        assert!(!body.contains("allowed_results: PASS | FAIL\n"), "{body}");
         assert!(body.contains("</role_completion_contract>"), "{body}");
     }
 
-    /// C. Both PASS and FAIL are legal result tokens for the
-    ///    VERIFIER / FINAL_REVIEWER contract.
+    /// C. PASS / FAIL legal for VERIFIER; only PASS legal for
+    ///    FINAL_REVIEWER. The agent-facing contract is the single
+    ///    source of truth for what the structured `<role_completion>`
+    ///    block parser will admit — these assertions must stay in
+    ///    lock-step with `role_completion_block::check_aap_native_claim_against_metadata`.
     #[test]
-    fn verifier_and_final_reviewer_contract_admits_pass_and_fail() {
-        for role in [WorkflowRole::Verifier, WorkflowRole::FinalReviewer] {
-            let ctx = sample_context_for(role);
-            let body = render_role_completion_contract(&ctx);
-            assert!(body.contains("allowed_results: PASS | FAIL"));
-        }
+    fn verifier_admits_pass_and_fail_final_reviewer_admits_only_pass() {
+        let verifier_ctx = sample_context_for(WorkflowRole::Verifier);
+        let verifier_body = render_role_completion_contract(&verifier_ctx);
+        assert!(verifier_body.contains("allowed_results: PASS | FAIL"));
+        let final_reviewer_ctx = sample_context_for(WorkflowRole::FinalReviewer);
+        let final_reviewer_body = render_role_completion_contract(&final_reviewer_ctx);
+        assert!(final_reviewer_body.contains("allowed_results: PASS"));
+        assert!(!final_reviewer_body.contains("PASS | FAIL"));
     }
 
     /// PRIMARY (defect-loop reactivation) contract admits only

@@ -1762,10 +1762,31 @@ async fn invoke_workflow_hook_after_dispatch(
 
         // Native turns never enter the prose/Discord workflow authority.
         if hook.stop_reason.as_deref() == Some("end_turn") {
-            let Some(outcome) = crate::native_completion::resolve_native_completion_outcome(
-                &metadata.role,
+            // Phase 6.4.x — AAP-native completion contract fix.
+            // The native completion boundary MUST recognize the
+            // structured `<role_completion>` block emitted by the
+            // agent (per `AGENTS.md` Canonical Role Completion
+            // Contract) as the canonical outcome for AAP-native
+            // dispatch. Plain-text token resolvers are intentionally
+            // not used on this path so a downstream agent cannot
+            // claim authority by appending `VERIFIER_PASS` /
+            // `OK-01` / `HANDOFF` to prose — only a well-formed
+            // structured block passes the boundary check.
+            //
+            // The legacy `resolve_native_completion_outcome`
+            // plain-token resolver remains in the crate for
+            // non-AAP callers and unit tests; it is NOT called
+            // here.
+            let Some(outcome) = crate::native_completion::resolve_aap_native_completion_outcome(
+                metadata,
                 &hook.raw_assistant_text,
             ) else {
+                // Structured block missing, malformed, ambiguous,
+                // role-mismatched, role-result inconsistent, or
+                // identity-mismatched against the dispatch
+                // metadata. Do NOT fall back to plain-token
+                // resolution here — that path is intentionally
+                // blocked on AAP-native dispatch.
                 tracing::warn!(
                     workflow_run_id   = %metadata.workflow_run_id,
                     dispatch_id       = %metadata.dispatch_id,
@@ -3236,7 +3257,7 @@ mod tests {
         let hook = crate::workflow::service::WorkflowTurnHookInputs {
             terminal: true,
             stop_reason: Some("end_turn".into()),
-            raw_assistant_text: "done".into(),
+            raw_assistant_text: "<role_completion>\nrole: PRIMARY\nresult: COMPLETE\nworkflow_id: run-test-456\nproject_id: project-test\nproject_root: /project-test\n</role_completion>".into(),
             pinned_project_root: None,
             session_key: "discord:1540183233654952036".into(),
             channel: make_channel("thread"),
@@ -3291,8 +3312,8 @@ mod tests {
             lease_generation: 1,
             expected_revision: 1,
             language: Some("en".into()),
-            project_id: None,
-            project_root: None,
+            project_id: Some("legacy-placeholder".into()),
+            project_root: Some("/legacy-placeholder".into()),
             native_execution_session_key: Some(crate::acp::pool::format_native_dispatch_key(
                 "ArthurClaude",
                 "dispatch-transport-1",
@@ -3304,7 +3325,7 @@ mod tests {
         let hook = crate::workflow::service::WorkflowTurnHookInputs {
             terminal: true,
             stop_reason: Some("end_turn".into()),
-            raw_assistant_text: "done".into(),
+            raw_assistant_text: "<role_completion>\nrole: PRIMARY\nresult: COMPLETE\nworkflow_id: run-transport-1\nproject_id: legacy-placeholder\nproject_root: /legacy-placeholder\n</role_completion>".into(),
             pinned_project_root: None,
             session_key: "discord:1540183233654952036".into(),
             channel: make_channel("thread"),
@@ -3340,8 +3361,8 @@ mod tests {
             lease_generation: 1,
             expected_revision: 1,
             language: Some("en".into()),
-            project_id: None,
-            project_root: None,
+            project_id: Some("legacy-placeholder".into()),
+            project_root: Some("/legacy-placeholder".into()),
             native_execution_session_key: Some(crate::acp::pool::format_native_dispatch_key(
                 "ArthurClaude",
                 "dispatch-transport-none",
@@ -3353,7 +3374,7 @@ mod tests {
         let hook = crate::workflow::service::WorkflowTurnHookInputs {
             terminal: true,
             stop_reason: Some("end_turn".into()),
-            raw_assistant_text: "done".into(),
+            raw_assistant_text: "<role_completion>\nrole: PRIMARY\nresult: COMPLETE\nworkflow_id: run-transport-none\nproject_id: legacy-placeholder\nproject_root: /legacy-placeholder\n</role_completion>".into(),
             pinned_project_root: None,
             session_key: "discord:1540183233654952036".into(),
             channel: make_channel("thread"),
@@ -3384,8 +3405,8 @@ mod tests {
             lease_generation: 1,
             expected_revision: 3,
             language: None,
-            project_id: None,
-            project_root: None,
+            project_id: Some("legacy-placeholder".into()),
+            project_root: Some("/legacy-placeholder".into()),
             native_execution_session_key: Some(crate::acp::pool::format_native_dispatch_key(
                 "ArthurGemini",
                 "dispatch-verifier",
@@ -3395,8 +3416,14 @@ mod tests {
             scope_policy: None,
         };
         for (text, expected) in [
-            ("VERIFIER_PASS", Some("PASS")),
-            ("VERIFIER_FAIL", Some("FAIL")),
+            (
+                "<role_completion>\nrole: VERIFIER\nresult: PASS\nworkflow_id: run-verifier\nproject_id: legacy-placeholder\nproject_root: /legacy-placeholder\n</role_completion>",
+                Some("PASS"),
+            ),
+            (
+                "<role_completion>\nrole: VERIFIER\nresult: FAIL\nworkflow_id: run-verifier\nproject_id: legacy-placeholder\nproject_root: /legacy-placeholder\n</role_completion>",
+                Some("FAIL"),
+            ),
             ("done", None),
             ("VERIFIER_PASS\nVERIFIER_FAIL", None),
             ("prose containing VERIFIER_PASS is not a verdict", None),
@@ -3440,7 +3467,7 @@ mod tests {
         mock.set_next_hook(crate::workflow::service::WorkflowTurnHookInputs {
             terminal: true,
             stop_reason: Some("end_turn".into()),
-            raw_assistant_text: "VERIFIER_PASS".into(),
+            raw_assistant_text: "<role_completion>\nrole: VERIFIER\nresult: PASS\nworkflow_id: wfrun-integration\nproject_id: legacy-placeholder\nproject_root: /legacy-placeholder\n</role_completion>".into(),
             pinned_project_root: None,
             session_key: String::new(),
             channel: make_channel("T"),
@@ -3472,8 +3499,8 @@ mod tests {
             lease_generation: 314,
             expected_revision: 271,
             language: Some("zh-TW".into()),
-            project_id: None,
-            project_root: None,
+            project_id: Some("legacy-placeholder".into()),
+            project_root: Some("/legacy-placeholder".into()),
             native_execution_session_key: Some(crate::acp::pool::format_native_dispatch_key(
                 "ArthurGemini",
                 "dispatch-integration",
@@ -3606,8 +3633,8 @@ mod tests {
             lease_generation: 7,
             expected_revision: 3,
             language: Some("zh-TW".into()),
-            project_id: None,
-            project_root: None,
+            project_id: Some("legacy-placeholder".into()),
+            project_root: Some("/legacy-placeholder".into()),
             native_execution_session_key: Some(crate::acp::pool::format_native_dispatch_key(
                 "ArthurGemini",
                 "dispatch-trace",
@@ -3845,7 +3872,7 @@ mod tests {
         let hook = crate::workflow::service::WorkflowTurnHookInputs {
             terminal: true,
             stop_reason: Some("end_turn".into()),
-            raw_assistant_text: "VERIFIER_PASS".into(),
+            raw_assistant_text: "<role_completion>\nrole: VERIFIER\nresult: PASS\nworkflow_id: wfrun-trace\nproject_id: legacy-placeholder\nproject_root: /legacy-placeholder\n</role_completion>".into(),
             pinned_project_root: None,
             session_key: "session-trace".into(),
             channel: make_channel("T"),
@@ -3913,7 +3940,7 @@ mod tests {
         let hook = crate::workflow::service::WorkflowTurnHookInputs {
             terminal: true,
             stop_reason: Some("end_turn".into()),
-            raw_assistant_text: "VERIFIER_PASS".into(),
+            raw_assistant_text: "<role_completion>\nrole: VERIFIER\nresult: PASS\nworkflow_id: wfrun-trace\nproject_id: legacy-placeholder\nproject_root: /legacy-placeholder\n</role_completion>".into(),
             pinned_project_root: None,
             session_key: "session-trace".into(),
             channel: make_channel("T"),

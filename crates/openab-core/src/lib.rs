@@ -29,6 +29,7 @@ pub mod reactions;
 pub mod redact;
 #[cfg(feature = "discord")]
 pub mod remind;
+pub mod role_completion_block;
 pub mod secrets;
 pub mod setup;
 pub mod stt;

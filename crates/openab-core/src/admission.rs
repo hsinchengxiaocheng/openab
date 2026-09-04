@@ -257,10 +257,11 @@ turn. Legacy .agents/workflow_assignment.json and\n\
 AGENTS.md remains the policy and workflow-rules authority. Follow the\n\
 native role and assignment for this turn.\n\
 \
-For a VERIFIER or FINAL_REVIEWER terminal verdict, emit exactly one standalone \
-canonical line: VERIFIER_PASS, VERIFIER_FAIL, FINAL_REVIEWER_PASS, or \
-FINAL_REVIEWER_FAIL, matching your assigned role. ACP end_turn alone is not a \
-workflow verdict.\n\
+For AAP-native terminal role completion, follow the canonical \
+<role_completion_contract> supplied in the current WORKFLOW_DISPATCH assignment. \
+Do not emit legacy standalone verdict tokens such as VERIFIER_PASS, \
+VERIFIER_FAIL, FINAL_REVIEWER_PASS, or FINAL_REVIEWER_FAIL. ACP end_turn alone \
+is not a workflow verdict.\n\
 </native_work_authority>",
         metadata.dispatch_id,
         metadata.workflow_run_id,
