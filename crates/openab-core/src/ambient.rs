@@ -653,6 +653,7 @@ async fn ambient_consumer_loop(
                 reactions,
                 false, // other_bot_present
                 None,  // no streaming recipient
+                crate::acp::connection::AcpPromptIdentity::default(),
             )
             .await
         {

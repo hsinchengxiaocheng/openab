@@ -51,6 +51,29 @@ fn pick_best_option(options: &[Value]) -> Option<String> {
 pub const WRITE_POLICY_READ_ONLY: &str = "READ_ONLY";
 pub const WRITE_POLICY_MODIFY_ALLOWED: &str = "MODIFY_ALLOWED";
 
+/// Transport identity facts attached to one inbound ACP prompt.
+///
+/// OpenAB only transports these values. The downstream ACP adapter and Runtime
+/// remain responsible for conversation resolution and ownership.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AcpPromptIdentity {
+    pub user_id: Option<String>,
+    pub thread_id: Option<String>,
+}
+
+fn session_prompt_params(
+    session_id: &str,
+    prompt: Vec<Value>,
+    identity: &AcpPromptIdentity,
+) -> Value {
+    json!({
+        "sessionId": session_id,
+        "prompt": prompt,
+        "userId": identity.user_id,
+        "threadId": identity.thread_id,
+    })
+}
+
 /// Phase 6.4.1F — canonical tool-name deny-list applied when the
 /// connection's `write_policy` is `READ_ONLY`. Conservative by design:
 /// every known write-capable tool name is included so the gate cannot
@@ -970,6 +993,7 @@ impl AcpConnection {
     pub async fn session_prompt(
         &mut self,
         content_blocks: Vec<ContentBlock>,
+        identity: AcpPromptIdentity,
     ) -> Result<(mpsc::UnboundedReceiver<JsonRpcMessage>, u64)> {
         self.last_active = Instant::now();
         self.activity.touch();
@@ -991,10 +1015,7 @@ impl AcpConnection {
         let req = JsonRpcRequest::new(
             id,
             "session/prompt",
-            Some(json!({
-                "sessionId": session_id,
-                "prompt": prompt_json,
-            })),
+            Some(session_prompt_params(session_id, prompt_json, &identity)),
         );
         let data = serde_json::to_string(&req)?;
 
@@ -1062,12 +1083,9 @@ impl AcpConnection {
         use std::sync::atomic::Ordering;
         // Only ever set back to IDLE; if the current value is something
         // else (EVICTING), the eviction path will reset it itself.
-        let _ = self.phase.compare_exchange(
-            1,
-            0,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        let _ = self
+            .phase
+            .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire);
     }
 
     /// Release an EVICTING phase back to IDLE. Used when an eviction
@@ -1077,12 +1095,9 @@ impl AcpConnection {
     #[inline]
     pub fn release_eviction_to_idle(&self) {
         use std::sync::atomic::Ordering;
-        let _ = self.phase.compare_exchange(
-            2,
-            0,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        let _ = self
+            .phase
+            .compare_exchange(2, 0, Ordering::AcqRel, Ordering::Acquire);
     }
 
     /// Force the phase back to IDLE, regardless of its current value.
@@ -1198,10 +1213,43 @@ impl Drop for AcpConnection {
 mod tests {
     use super::{
         build_agent_env, build_permission_response, build_permission_response_with_policy,
-        pick_best_option, tool_kind_denied_for_read_only, tool_title_denied_for_read_only,
-        WritePolicyGuard, WRITE_POLICY_MODIFY_ALLOWED, WRITE_POLICY_READ_ONLY,
+        pick_best_option, session_prompt_params, tool_kind_denied_for_read_only,
+        tool_title_denied_for_read_only, AcpPromptIdentity, WritePolicyGuard,
+        WRITE_POLICY_MODIFY_ALLOWED, WRITE_POLICY_READ_ONLY,
     };
     use serde_json::json;
+
+    #[test]
+    fn session_prompt_params_preserve_discord_stable_identity() {
+        let params = session_prompt_params(
+            "acp-session-789",
+            vec![json!({"type": "text", "text": "hello"})],
+            &AcpPromptIdentity {
+                user_id: Some("user-123".into()),
+                thread_id: Some("thread-456".into()),
+            },
+        );
+
+        assert_eq!(params["userId"], "user-123");
+        assert_eq!(params["threadId"], "thread-456");
+        assert_ne!(params["userId"], params["sessionId"]);
+        assert_ne!(params["threadId"], params["sessionId"]);
+    }
+
+    #[test]
+    fn session_prompt_params_preserve_non_thread_null() {
+        let params = session_prompt_params(
+            "acp-session-789",
+            vec![json!({"type": "text", "text": "hello"})],
+            &AcpPromptIdentity {
+                user_id: Some("user-123".into()),
+                thread_id: None,
+            },
+        );
+
+        assert_eq!(params["userId"], "user-123");
+        assert!(params["threadId"].is_null());
+    }
 
     #[test]
     fn picks_allow_always_over_other_options() {

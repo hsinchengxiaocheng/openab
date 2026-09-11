@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, warn};
 
+use crate::acp::connection::AcpPromptIdentity;
 use crate::acp::{
     classify_notification, parse_turn_result, AcpEvent, ContentBlock, SessionPool, TurnResult,
 };
@@ -366,6 +367,36 @@ impl ChannelRef {
             .unwrap_or(self.channel_id.as_str());
         format!("{}:{}", self.platform, logical)
     }
+}
+
+/// Extract the Discord transport facts already captured by the ingress
+/// `SenderContext`. This deliberately does not derive a conversation identity.
+pub(crate) fn discord_prompt_identity(
+    sender_json: &str,
+    channel: &ChannelRef,
+) -> AcpPromptIdentity {
+    if channel.platform != "discord" {
+        return AcpPromptIdentity::default();
+    }
+
+    let user_id = serde_json::from_str::<serde_json::Value>(sender_json)
+        .ok()
+        .and_then(|sender| {
+            sender
+                .get("sender_id")
+                .and_then(|id| id.as_str())
+                .map(str::to_owned)
+        })
+        .filter(|id| !id.trim().is_empty());
+    // Discord threads are channels. `parent_id` is populated only for a
+    // real Discord thread, so the dispatch channel's ID is the canonical
+    // thread identifier; a top-level channel remains `None`.
+    let thread_id = channel
+        .parent_id
+        .as_ref()
+        .map(|_| channel.channel_id.clone());
+
+    AcpPromptIdentity { user_id, thread_id }
 }
 
 /// Identifies a message across platforms.
@@ -886,6 +917,8 @@ impl AdapterRouter {
     ) -> Result<()> {
         tracing::debug!(platform = adapter.platform(), "processing message");
 
+        let identity = discord_prompt_identity(&ctx.sender_json, &ctx.thread_channel);
+
         let content_blocks =
             Self::pack_arrival_event(&ctx.sender_json, &ctx.prompt, ctx.extra_blocks);
 
@@ -924,6 +957,7 @@ impl AdapterRouter {
                 &ctx.thread_channel,
                 reactions.clone(),
                 ctx.other_bot_present,
+                identity,
             )
             .await;
 
@@ -962,6 +996,7 @@ impl AdapterRouter {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn stream_prompt(
         &self,
         adapter: &Arc<dyn ChatAdapter>,
@@ -970,6 +1005,7 @@ impl AdapterRouter {
         thread_channel: &ChannelRef,
         reactions: Arc<StatusReactionController>,
         other_bot_present: bool,
+        identity: AcpPromptIdentity,
     ) -> Result<((), Option<crate::workflow::service::WorkflowTurnHookInputs>)> {
         self.stream_prompt_blocks(
             adapter,
@@ -981,6 +1017,7 @@ impl AdapterRouter {
             // handle_message path (e.g. cron) is never Slack assistant-mode native
             // streaming, so no per-turn recipient — degrades to post+edit if it were.
             None,
+            identity,
         )
         .await
     }
@@ -998,6 +1035,7 @@ impl AdapterRouter {
         reactions: Arc<StatusReactionController>,
         other_bot_present: bool,
         recipient: Option<(String, String)>,
+        identity: AcpPromptIdentity,
     ) -> Result<((), Option<crate::workflow::service::WorkflowTurnHookInputs>)> {
         let adapter = adapter.clone();
         let thread_channel = thread_channel.clone();
@@ -1058,11 +1096,12 @@ impl AdapterRouter {
             let agent_identity = agent_identity_for_hook;
             let session_key = session_key_for_hook.clone();
             let channel = channel_for_hook.clone();
+            let identity = identity.clone();
             Box::pin(async move {
                 let reset = conn.session_reset;
                 conn.session_reset = false;
 
-                    let (mut rx, request_id) = conn.session_prompt(content_blocks).await?;
+                    let (mut rx, request_id) = conn.session_prompt(content_blocks, identity).await?;
                     if assistant_status {
                         let _ = adapter.set_status(&thread_channel, "Thinking…").await;
                     } else {

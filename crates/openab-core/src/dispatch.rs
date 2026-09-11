@@ -19,9 +19,10 @@ use tracing::{debug, error, info, info_span, warn};
 
 use crate::workflow::identity::AgentIdentity;
 
+use crate::acp::connection::AcpPromptIdentity;
 use crate::acp::ContentBlock;
 use crate::acp::ProjectContext;
-use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef};
+use crate::adapter::{discord_prompt_identity, AdapterRouter, ChannelRef, ChatAdapter, MessageRef};
 use crate::agent_lease_heartbeat::{HeartbeatHandle, HeartbeatProducer};
 use crate::config::ReactionsConfig;
 use crate::error_display::format_user_error;
@@ -237,6 +238,7 @@ pub trait DispatchTarget: Send + Sync + 'static {
         reactions: Arc<StatusReactionController>,
         other_bot_present: bool,
         recipient: Option<(String, String)>,
+        identity: AcpPromptIdentity,
     ) -> Result<((), Option<crate::workflow::service::WorkflowTurnHookInputs>)>;
 
     /// Phase 4.1: borrow the configured `WorkflowService` so the
@@ -335,6 +337,7 @@ impl DispatchTarget for AdapterRouter {
         reactions: Arc<StatusReactionController>,
         other_bot_present: bool,
         recipient: Option<(String, String)>,
+        identity: AcpPromptIdentity,
     ) -> Result<((), Option<crate::workflow::service::WorkflowTurnHookInputs>)> {
         AdapterRouter::stream_prompt_blocks(
             self,
@@ -345,6 +348,7 @@ impl DispatchTarget for AdapterRouter {
             reactions,
             other_bot_present,
             recipient,
+            identity,
         )
         .await
     }
@@ -1119,6 +1123,11 @@ async fn dispatch_batch(
         origin_event_id: trigger_msg.channel.origin_event_id.clone(),
         ..thread_channel.clone()
     };
+    let prompt_identity = if native_workflow.is_some() {
+        AcpPromptIdentity::default()
+    } else {
+        discord_prompt_identity(&batch.first().unwrap().sender_json, &dispatch_channel)
+    };
 
     // Pack all arrival events into one Vec<ContentBlock> (§3.3).
     // Uses into_iter() to avoid deep-copying extra_blocks (may contain base64 image data).
@@ -1609,6 +1618,7 @@ async fn dispatch_batch(
             reactions.clone(),
             other_bot_present,
             recipient,
+            prompt_identity,
         )
         .await;
 
@@ -2438,6 +2448,7 @@ mod tests {
         text_blocks: Vec<String>,
         other_bot_present: bool,
         dispatch_channel: ChannelRef,
+        identity: AcpPromptIdentity,
         /// The session-pool key that `dispatch_batch` derived and passed into
         /// `ensure_session` for this turn. Phase 6.2.9 FIX ROUND 4 tests assert
         /// this field is `native-dispatch:<agent>:<dispatch_id>` for native
@@ -2588,6 +2599,7 @@ mod tests {
             _reactions: Arc<StatusReactionController>,
             other_bot_present: bool,
             _recipient: Option<(String, String)>,
+            identity: AcpPromptIdentity,
         ) -> Result<((), Option<crate::workflow::service::WorkflowTurnHookInputs>)> {
             // Phase 6.2.9 FIX ROUND 4 — record the session-pool key alongside
             // the dispatch so focused tests can verify it matches the
@@ -2607,6 +2619,7 @@ mod tests {
                 other_bot_present,
                 dispatch_channel: thread_channel.clone(),
                 session_key: session_key.to_string(),
+                identity,
             });
             if let Some(msg) = self.stream_err.lock().unwrap().take() {
                 return Err(anyhow::anyhow!(msg));
@@ -2775,6 +2788,82 @@ mod tests {
         // pack_arrival_event with no extra_blocks → delimiter + prompt = 2 blocks.
         assert_eq!(calls[0].block_count, 2);
         assert!(!calls[0].other_bot_present);
+    }
+
+    #[tokio::test]
+    async fn discord_dispatch_forwards_sender_and_real_thread_identity() {
+        let mock = Arc::new(MockDispatchTarget::new());
+        let target: Arc<dyn DispatchTarget> = mock.clone();
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let channel = ChannelRef {
+            platform: "discord".into(),
+            channel_id: "thread-456".into(),
+            thread_id: None,
+            parent_id: Some("parent-channel-789".into()),
+            origin_event_id: None,
+        };
+        let mut message = make_msg_with_sender("hello", 10, ordinary_human_sender_json(123));
+        message.trigger_msg.channel = channel.clone();
+
+        dispatch_batch(
+            "discord:thread-456",
+            &channel,
+            &target,
+            None,
+            &adapter,
+            vec![message],
+            false,
+        )
+        .await;
+
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].identity.user_id.as_deref(), Some("123"));
+        assert_eq!(calls[0].identity.thread_id.as_deref(), Some("thread-456"));
+        assert_ne!(
+            calls[0].identity.user_id.as_deref(),
+            Some("1538346676610408568")
+        );
+        assert_ne!(
+            calls[0].identity.user_id.as_deref(),
+            Some("acp-session-789")
+        );
+        assert_ne!(
+            calls[0].identity.thread_id.as_deref(),
+            Some("acp-session-789")
+        );
+    }
+
+    #[tokio::test]
+    async fn discord_dispatch_forwards_null_thread_for_top_level_message() {
+        let mock = Arc::new(MockDispatchTarget::new());
+        let target: Arc<dyn DispatchTarget> = mock.clone();
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let channel = ChannelRef {
+            platform: "discord".into(),
+            channel_id: "channel-789".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: None,
+        };
+        let mut message = make_msg_with_sender("hello", 10, ordinary_human_sender_json(123));
+        message.trigger_msg.channel = channel.clone();
+
+        dispatch_batch(
+            "discord:channel-789",
+            &channel,
+            &target,
+            None,
+            &adapter,
+            vec![message],
+            false,
+        )
+        .await;
+
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].identity.user_id.as_deref(), Some("123"));
+        assert_eq!(calls[0].identity.thread_id, None);
     }
 
     #[tokio::test]
@@ -4051,6 +4140,7 @@ mod tests {
             _reactions: Arc<StatusReactionController>,
             _other_bot_present: bool,
             _recipient: Option<(String, String)>,
+            _identity: AcpPromptIdentity,
         ) -> Result<((), Option<crate::workflow::service::WorkflowTurnHookInputs>)> {
             Ok(((), None))
         }
