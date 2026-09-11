@@ -84,9 +84,8 @@ fn control_plane_send_diagnostic_enabled(value: Option<&str>) -> bool {
     )
 }
 
-/// Configured Discord destination used by the control-plane diagnostic and as
-/// the default native-work delivery target. It is a Discord snowflake, unlike
-/// AAP's opaque canonical conversation capability.
+/// Configured Discord destination used only by the optional operator
+/// control-plane diagnostic. It is never native-work routing authority.
 #[cfg(feature = "discord")]
 const CONTROL_PLANE_DISCORD_TARGET_CHANNEL_ID: &str = "1539923659345502208";
 
@@ -1371,13 +1370,6 @@ async fn main() -> anyhow::Result<()> {
                 ctl::RuntimeHandler::new(adapters, ctl_registry.clone(), ctl_shard.clone())
                     .with_pool(pool.clone())
                     .with_admission(runtime_admission_handle)
-                    .with_native_delivery_target(adapter::ChannelRef {
-                        platform: "discord".into(),
-                        channel_id: CONTROL_PLANE_DISCORD_TARGET_CHANNEL_ID.into(),
-                        thread_id: None,
-                        parent_id: None,
-                        origin_event_id: None,
-                    })
                     // Phase 6.4.1D — wire the canonical
                     // PlatformTrustConfigs into the ctl RuntimeHandler
                     // so the outbound `surface_allowed_for_outbound`

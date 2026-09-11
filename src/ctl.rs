@@ -139,19 +139,13 @@ pub struct AgentWorkRequest {
     /// any other heuristic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<String>,
-    /// Phase 6.4.1D — authoritative structured delivery destination carried
-    /// in by AAP Runtime from the upstream ``ConversationBinding``. When
-    /// ``Some(_)` the daemon uses this as the
-    /// ``BufferedMessage.trigger_msg.channel`` for THIS turn INSTEAD of
-    /// the daemon-wide ``native_delivery_target`` fallback, so every
-    /// role handoff lands in the actual workflow's originating Discord
-    /// channel rather than a hardcoded control-plane target.
+    /// Authoritative structured delivery destination carried in by AAP Runtime
+    /// from the upstream ``ConversationBinding``. Native work without this
+    /// field is rejected; the daemon has no routing fallback.
     ///
     /// The Runtime sources the value from the trusted structured
     /// admission metadata; it is NEVER parsed from ``conversation_key``
-    /// or any other heuristic. ``None`` (legacy callers) keeps the
-    /// pre-6.4.1D behaviour: the daemon uses its static
-    /// ``native_delivery_target`` for every native-work turn.
+    /// or any other heuristic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_destination: Option<AgentWorkDeliveryDestination>,
     /// Phase 6.4.1F — structured native scope authority. The Runtime
@@ -754,9 +748,6 @@ pub struct RuntimeHandler {
     /// this slice because `agent.work` is not yet a ctl command; composition
     /// injects the same handle used by the Discord gateway.
     admission: Option<Arc<dyn WorkAdmissionPort>>,
-    /// Configured, transport-native destination for native workflow turns.
-    /// This is intentionally independent from the opaque AAP conversation key.
-    native_delivery_target: Option<ChannelRef>,
     /// Phase 6.2.9: held in an `Arc` so the `InFlightGuard` returned to
     /// the reservation holder across an `.await` can own its own strong
     /// reference and release the reservation on Drop (panic /
@@ -804,7 +795,6 @@ impl RuntimeHandler {
             shard,
             pool: None,
             admission: None,
-            native_delivery_target: None,
             ledger: Arc::new(tokio::sync::Mutex::new(AgentWorkLedger {
                 entries: HashMap::new(),
                 order: VecDeque::new(),
@@ -823,14 +813,6 @@ impl RuntimeHandler {
 
     pub fn with_admission(mut self, admission: Arc<dyn WorkAdmissionPort>) -> Self {
         self.admission = Some(admission);
-        self
-    }
-
-    /// Attach the configured transport-native destination for native
-    /// `agent.work` turns. The canonical workflow conversation key must never
-    /// be used as a transport routing field.
-    pub fn with_native_delivery_target(mut self, target: ChannelRef) -> Self {
-        self.native_delivery_target = Some(target);
         self
     }
 
@@ -1541,82 +1523,34 @@ impl CtlHandler for RuntimeHandler {
         let Some(admission) = self.admission.as_ref() else {
             return agent_work_error("ADMISSION_NOT_INSTALLED", "admission service is not ready");
         };
-        // Phase 6.4.1D — prefer the authoritative structured delivery
-        // destination carried in by AAP Runtime from the upstream
-        // ``ConversationBinding`` over the daemon-wide static fallback.
-        // The Runtime sources the field from trusted structured admission
-        // metadata; we still re-verify here so an unauthenticated or
-        // malformed upstream field cannot smuggle a destination past the
-        // trust boundary. When the structured field is absent the legacy
-        // behaviour (single static target) is preserved.
-        //
-        // Both the structured branch and the legacy
-        // ``native_delivery_target`` fallback run through the canonical
-        // ``PlatformTrustConfigs::authorize_outbound_channel`` gate
-        // so the operator-configured ``allowed_channels`` list applies
-        // uniformly (no parallel ``OPENAB_NATIVE_DELIVERY_ALLOWLIST``
-        // env-var policy anymore). The fail-closed helper returns
-        // ``false`` when the platform has no explicit trust config —
-        // outbound native delivery MUST NOT silently default to
-        // allow-all just because the inbound trust registry's default
-        // is L2-open.
-        let channel = match request.delivery_destination.clone() {
-            Some(structured) => {
-                if let Err(reason) = validate_delivery_destination(&structured) {
-                    return agent_work_error("INVALID_DELIVERY_DESTINATION", &reason);
-                }
-                // Phase 6.4.1E — the structured ``delivery_destination``
-                // carries ``parent_id``, so it routes through the
-                // parent-aware outbound helper. A Discord thread whose
-                // own channel_id is not in ``allowed_channels`` can still
-                // be authorized when its parent_id IS allowed.
-                // Parent is sourced from the trusted structured field —
-                // never parsed from ``conversation_key`` or any other
-                // heuristic.
-                if !self.trust_configs.authorize_outbound_channel_with_parent(
-                    &structured.platform,
-                    &structured.channel_id,
-                    structured.parent_id.as_deref(),
-                ) {
-                    return agent_work_error(
-                        "DELIVERY_DESTINATION_NOT_ALLOWED",
-                        &format!(
-                            "delivery_destination {}:{} (parent={:?}) is not in the platform trust allowlist",
-                            structured.platform, structured.channel_id, structured.parent_id
-                        ),
-                    );
-                }
-                crate::adapter::ChannelRef::from(structured)
-            }
-            None => match self.native_delivery_target.clone() {
-                Some(target) => {
-                    // Legacy fallback has no parent_id by construction
-                    // (the static ``ChannelRef`` carries ``parent_id:
-                    // None`` — see ``with_native_delivery_target`` and
-                    // the test fixtures). Keep the original channel-only
-                    // check so the legacy contract is bit-exact.
-                    if !self
-                        .trust_configs
-                        .authorize_outbound_channel(&target.platform, &target.channel_id)
-                    {
-                        return agent_work_error(
-                            "DELIVERY_DESTINATION_NOT_ALLOWED",
-                            &format!(
-                                "native_delivery_target {}:{} is not in the platform trust allowlist",
-                                target.platform, target.channel_id
-                            ),
-                        );
-                    }
-                    target
-                }
-                None => {
-                    return agent_work_error(
-                        "NATIVE_DELIVERY_TARGET_NOT_CONFIGURED",
-                        "native delivery target is not configured",
-                    );
-                }
-            },
+        // The persisted structured destination is the sole routing authority.
+        // Never infer it from conversation identity and never substitute a
+        // daemon-wide Discord target for legacy NULL bindings.
+        let Some(structured) = request.delivery_destination.clone() else {
+            return agent_work_error(
+                "MISSING_DELIVERY_DESTINATION",
+                "native agent.work requires a structured delivery_destination",
+            );
         };
+        if let Err(reason) = validate_delivery_destination(&structured) {
+            return agent_work_error("INVALID_DELIVERY_DESTINATION", &reason);
+        }
+        // Parent is supplied only by the trusted structured field, never by a
+        // conversation-key heuristic.
+        if !self.trust_configs.authorize_outbound_channel_with_parent(
+            &structured.platform,
+            &structured.channel_id,
+            structured.parent_id.as_deref(),
+        ) {
+            return agent_work_error(
+                "DELIVERY_DESTINATION_NOT_ALLOWED",
+                &format!(
+                    "delivery_destination {}:{} (parent={:?}) is not in the platform trust allowlist",
+                    structured.platform, structured.channel_id, structured.parent_id
+                ),
+            );
+        }
+        let channel = crate::adapter::ChannelRef::from(structured);
         let Some(adapter) = self.adapters.get(&channel.platform).cloned() else {
             return agent_work_error(
                 "NATIVE_DELIVERY_TARGET_UNAVAILABLE",
@@ -1960,7 +1894,13 @@ mod tests {
             assignment: "bounded assignment".into(),
             language: "zh-TW".into(),
             transport: Some("DISCORD".into()),
-            delivery_destination: None,
+            delivery_destination: Some(AgentWorkDeliveryDestination {
+                platform: "discord".into(),
+                channel_id: "1539923659345502208".into(),
+                thread_id: None,
+                parent_id: None,
+                origin_event_id: None,
+            }),
             scope_policy: None,
         }
     }
@@ -2122,14 +2062,7 @@ mod tests {
         // matters. Real heartbeat firing is NOT exercised here —
         // ctl admission tests never start a per-platform
         // `Dispatcher::submit` flow.
-        .with_heartbeat_producer(Some(Arc::new(fake_heartbeat_producer_for_tests())))
-        .with_native_delivery_target(ChannelRef {
-            platform: "discord".into(),
-            channel_id: "1539923659345502208".into(),
-            thread_id: None,
-            parent_id: None,
-            origin_event_id: None,
-        });
+        .with_heartbeat_producer(Some(Arc::new(fake_heartbeat_producer_for_tests())));
         if let Some(tc) = trust_configs {
             handler = handler.with_trust_configs(tc);
         }
@@ -2182,14 +2115,7 @@ mod tests {
             Arc::new(std::sync::OnceLock::new()),
         )
         .with_admission(admission.clone())
-        .with_trust_configs(trust_allowing_all_for("discord"))
-        .with_native_delivery_target(ChannelRef {
-            platform: "discord".into(),
-            channel_id: "1539923659345502208".into(),
-            thread_id: None,
-            parent_id: None,
-            origin_event_id: None,
-        });
+        .with_trust_configs(trust_allowing_all_for("discord"));
         let request = native_work_request();
 
         let response = handler.handle_agent_work(Some(&request)).await;
@@ -2534,45 +2460,27 @@ mod tests {
         );
     }
 
-    /// H — legacy `native_delivery_target` path also goes through the
-    /// trust gate. `delivery_destination=None` + the handler's static
-    /// target is channel "1539923659345502208"; with
-    /// `allowed_channels=["1539923659345502208"]` it passes; with
-    /// `allowed_channels=["999999999999999999"]` it fails closed.
+    /// Missing destination is rejected before trust or admission. A static
+    /// diagnostic Discord channel must never become native routing fallback.
     #[tokio::test]
-    async fn test_legacy_native_delivery_target_also_subject_to_trust_policy() {
-        // ── H1 — legacy target IN allowlist → WORK_ACCEPTED.
-        let admission_pass = Arc::new(RecordingAdmissionPort::new("admission-H-pass"));
-        let handler_pass = native_work_handler_with_trust(
-            admission_pass.clone(),
+    async fn test_missing_delivery_destination_is_rejected_without_static_fallback() {
+        let admission = Arc::new(RecordingAdmissionPort::new("admission-missing-destination"));
+        let handler = native_work_handler_with_trust(
+            admission.clone(),
             Some(trust_allowing_only(&["1539923659345502208"])),
         );
-        let request = native_work_request(); // delivery_destination=None
-        let response = handler_pass.handle_agent_work(Some(&request)).await;
-        assert!(
-            response.ok,
-            "legacy target IN allowlist must succeed, got message={:?}",
-            response.message
-        );
-        assert_eq!(response.message, "WORK_ACCEPTED");
-        assert_eq!(admission_pass.calls(), 1);
-
-        // ── H2 — legacy target NOT in allowlist → DELIVERY_DESTINATION_NOT_ALLOWED.
-        let admission_fail = Arc::new(RecordingAdmissionPort::new("admission-H-fail"));
-        let handler_fail = native_work_handler_with_trust(
-            admission_fail.clone(),
-            Some(trust_allowing_only(&["999999999999999999"])),
-        );
-        let response = handler_fail.handle_agent_work(Some(&request)).await;
+        let mut request = native_work_request();
+        request.delivery_destination = None;
+        let response = handler.handle_agent_work(Some(&request)).await;
         assert!(!response.ok);
         assert!(response
             .message
-            .starts_with("DELIVERY_DESTINATION_NOT_ALLOWED:"));
+            .starts_with("MISSING_DELIVERY_DESTINATION:"));
         assert_ne!(response.message, "WORK_ACCEPTED");
         assert_eq!(
-            admission_fail.calls(),
+            admission.calls(),
             0,
-            "admission must not be called when the trust gate denies the legacy fallback"
+            "missing destination must not reach admission"
         );
     }
 
@@ -2714,20 +2622,14 @@ mod tests {
         assert_eq!(admission_d2.calls(), 0);
     }
 
-    /// K — legacy `native_delivery_target` fallback when the platform
-    /// has NO trust config → `DELIVERY_DESTINATION_NOT_ALLOWED`.
-    /// Mirrors test I for the legacy code path.
+    /// K — a structured destination with no platform trust config is rejected.
     #[tokio::test]
-    async fn test_outbound_legacy_fallback_unconfigured_fails_closed() {
+    async fn test_outbound_structured_destination_unconfigured_fails_closed() {
         let admission = Arc::new(RecordingAdmissionPort::new("admission-K"));
         let handler = native_work_handler_with_trust(
             admission.clone(),
             Some(Arc::new(PlatformTrustConfigs::new())),
         );
-        // native_work_request() leaves delivery_destination=None and
-        // configures the handler's static native_delivery_target to
-        // a Discord channel. With an empty trust registry the legacy
-        // fallback must also fail closed.
         let request = native_work_request();
         let response = handler.handle_agent_work(Some(&request)).await;
 
@@ -2736,13 +2638,13 @@ mod tests {
             response
                 .message
                 .starts_with("DELIVERY_DESTINATION_NOT_ALLOWED:"),
-            "expected DELIVERY_DESTINATION_NOT_ALLOWED for legacy fallback + unconfigured Discord, got {:?}",
+            "expected DELIVERY_DESTINATION_NOT_ALLOWED for unconfigured Discord, got {:?}",
             response.message
         );
         assert_eq!(
             admission.calls(),
             0,
-            "admission must not be called when the legacy fallback targets an unconfigured platform"
+            "admission must not be called when the destination platform is unconfigured"
         );
     }
 
@@ -2925,33 +2827,29 @@ mod tests {
         assert_eq!(admission.calls(), 0);
     }
 
-    /// J — legacy ``native_delivery_target`` fallback (no parent_id)
-    /// preserves the Round 2 channel-only check. The static fallback
-    /// channel "1539923659345502208" is in the allowlist → Allow.
-    /// This is the negative control: parent inheritance must not
-    /// change the legacy path.
+    /// J — a structured destination without parent_id uses its own allowed
+    /// channel. This is the negative control: parent inheritance must not
+    /// change direct-channel authorization.
     #[tokio::test]
-    async fn test_outbound_legacy_fallback_channel_only_check_preserved() {
+    async fn test_outbound_direct_channel_allowlist_check_preserved() {
         let admission = Arc::new(RecordingAdmissionPort::new("admission-J"));
-        // allowlist matches the static native_delivery_target fixture
-        // (see ``native_work_handler_with_trust`` line 1839).
         let handler = native_work_handler_with_trust(
             admission.clone(),
             Some(trust_allowing_only(&["1539923659345502208"])),
         );
-        let request = native_work_request(); // delivery_destination=None
+        let request = native_work_request();
 
         let response = handler.handle_agent_work(Some(&request)).await;
 
         assert!(
             response.ok,
-            "J: legacy fallback channel in allowlist must Allow, got message={:?}",
+            "J: direct destination channel in allowlist must Allow, got message={:?}",
             response.message
         );
         assert_eq!(response.message, "WORK_ACCEPTED");
         assert_eq!(admission.calls(), 1);
         let (channel, _metadata) = admission.last_admission();
-        // Legacy fallback ChannelRef has parent_id == None by construction.
+        // The supplied direct ChannelRef has no parent_id.
         assert_eq!(channel.parent_id, None);
     }
 
