@@ -87,7 +87,7 @@ fn control_plane_send_diagnostic_enabled(value: Option<&str>) -> bool {
 /// Configured Discord destination used only by the optional operator
 /// control-plane diagnostic. It is never native-work routing authority.
 #[cfg(feature = "discord")]
-const CONTROL_PLANE_DISCORD_TARGET_CHANNEL_ID: &str = "1539923659345502208";
+const CONTROL_PLANE_DISCORD_TARGET_CHANNEL_ID: &str = "1536735741642547262";
 
 /// Creates the one shared admission handle for the two production ingress
 /// consumers. Keeping the clones together in the composition root makes the
