@@ -5,7 +5,7 @@
 //! decide retry/reconciliation policy.
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, Error as SqlError, ErrorCode, OptionalExtension, Transaction};
+use rusqlite::{Connection, Error as SqlError, ErrorCode, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
@@ -185,6 +185,7 @@ pub enum TerminalDeliveryError {
         expected: u64,
         actual: u64,
     },
+    LeaseTokenConflict,
     DiscordMessageIdWriteOnce,
     UnsafeAuditField(&'static str),
 }
@@ -223,6 +224,7 @@ impl fmt::Display for TerminalDeliveryError {
                 f,
                 "terminal delivery revision conflict: expected {expected}, actual {actual}"
             ),
+            Self::LeaseTokenConflict => f.write_str("terminal delivery lease token conflict"),
             Self::DiscordMessageIdWriteOnce => f.write_str("discord_message_id is write-once"),
             Self::UnsafeAuditField(field) => {
                 write!(f, "unsafe terminal delivery audit field: {field}")
@@ -325,6 +327,52 @@ impl TerminalDeliveryRepository {
         update: TransitionUpdate,
         safe_reason_code: &str,
     ) -> Result<TerminalDeliveryRecordV1, TerminalDeliveryError> {
+        self.transition_inner(
+            key,
+            expected_revision,
+            None,
+            new_state,
+            update,
+            safe_reason_code,
+        )
+    }
+
+    /// Transition a record only when both its revision and active delivery
+    /// lease still belong to the caller.  This is intentionally narrow: only
+    /// delivery workers that already own a `DELIVERING` claim need the extra
+    /// fencing condition; ordinary state transitions retain the established
+    /// revision-only API.
+    pub fn transition_with_lease(
+        &self,
+        key: &str,
+        expected_revision: u64,
+        expected_delivery_lease_token: &str,
+        new_state: TerminalDeliveryState,
+        update: TransitionUpdate,
+        safe_reason_code: &str,
+    ) -> Result<TerminalDeliveryRecordV1, TerminalDeliveryError> {
+        if expected_delivery_lease_token.is_empty() {
+            return Err(TerminalDeliveryError::InvalidInput("delivery_lease_token"));
+        }
+        self.transition_inner(
+            key,
+            expected_revision,
+            Some(expected_delivery_lease_token),
+            new_state,
+            update,
+            safe_reason_code,
+        )
+    }
+
+    fn transition_inner(
+        &self,
+        key: &str,
+        expected_revision: u64,
+        expected_delivery_lease_token: Option<&str>,
+        new_state: TerminalDeliveryState,
+        update: TransitionUpdate,
+        safe_reason_code: &str,
+    ) -> Result<TerminalDeliveryRecordV1, TerminalDeliveryError> {
         validate_safe_field(safe_reason_code, "safe_reason_code")?;
         validate_transition_update(&update)?;
         let now = Utc::now();
@@ -342,6 +390,11 @@ impl TerminalDeliveryRepository {
                 expected: expected_revision,
                 actual: current.state_revision,
             });
+        }
+        if let Some(expected_token) = expected_delivery_lease_token {
+            if current.delivery_lease_token.as_deref() != Some(expected_token) {
+                return Err(TerminalDeliveryError::LeaseTokenConflict);
+            }
         }
         if !current.state.may_transition_to(new_state) {
             return Err(TerminalDeliveryError::IllegalTransition {
@@ -405,6 +458,35 @@ impl TerminalDeliveryRepository {
             .ok_or_else(|| TerminalDeliveryError::Storage("transitioned row unavailable".into()))?;
         tx.commit().map_err(sql_error)?;
         Ok(updated)
+    }
+
+    /// Return a bounded, deterministic snapshot of records eligible for
+    /// automatic reconciliation.  This is deliberately read-only: callers
+    /// must still claim or transition each returned record through CAS.
+    pub fn list_reconciliation_candidates(
+        &self,
+        now: DateTime<Utc>,
+        stale_before: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<TerminalDeliveryRecordV1>, TerminalDeliveryError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit)
+            .map_err(|_| TerminalDeliveryError::InvalidInput("reconciliation limit"))?;
+        let conn = self.connect()?;
+        let mut statement = conn.prepare(
+            "SELECT record_version, terminal_delivery_key, openab_inbound_turn_id, platform, channel_id, thread_id, acp_request_id, acp_session_id, runtime_run_id, workflow_run_id, conversation_id, response_sequence, terminal_payload, terminal_payload_digest, state, attempt_count, next_attempt_at, last_failure_classification, last_safe_error, discord_message_id, operator_hold_reason, created_at, updated_at, delivered_at, state_revision, delivery_lease_token, delivery_started_at FROM terminal_deliveries WHERE state IN ('PENDING_RESULT', 'READY_TO_DELIVER', 'AMBIGUOUS') OR (state = 'RETRY_SCHEDULED' AND next_attempt_at IS NOT NULL AND next_attempt_at <= ?1) OR (state = 'DELIVERING' AND delivery_started_at IS NOT NULL AND delivery_started_at <= ?2) ORDER BY CASE WHEN state = 'RETRY_SCHEDULED' THEN next_attempt_at WHEN state = 'DELIVERING' THEN delivery_started_at ELSE created_at END ASC, created_at ASC, terminal_delivery_key ASC LIMIT ?3",
+        ).map_err(sql_error)?;
+        let records = statement
+            .query_map(
+                params![timestamp(now), timestamp(stale_before), limit],
+                record_from_row,
+            )
+            .map_err(sql_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql_error)?;
+        Ok(records)
     }
 
     pub fn events(&self, key: &str) -> Result<Vec<TerminalDeliveryEvent>, TerminalDeliveryError> {
@@ -668,6 +750,15 @@ fn validate_record(record: &TerminalDeliveryRecordV1) -> Result<(), TerminalDeli
         validate_safe_field(value, "persisted safe field")?;
     }
     Ok(())
+}
+
+/// Validate a record supplied to a restart/reconciliation path before it is
+/// allowed to advance.  The validation covers immutable identity and payload
+/// digest; it never changes the record or reaches Runtime.
+pub fn validate_record_integrity(
+    record: &TerminalDeliveryRecordV1,
+) -> Result<(), TerminalDeliveryError> {
+    validate_record(record)
 }
 fn validate_transition_update(update: &TransitionUpdate) -> Result<(), TerminalDeliveryError> {
     for value in [
@@ -1030,9 +1121,10 @@ mod tests {
         assert_eq!(events[0].previous_state, None);
         assert_eq!(events[0].new_state, TerminalDeliveryState::PendingResult);
         let conn = Connection::open(repo.database_path()).unwrap();
-        assert!(conn
-            .execute("DELETE FROM terminal_delivery_events", [])
-            .is_err());
+        assert!(
+            conn.execute("DELETE FROM terminal_delivery_events", [])
+                .is_err()
+        );
     }
     #[test]
     fn restart_digest_schema_and_corruption_fail_closed() {
@@ -1114,9 +1206,11 @@ mod tests {
             }));
         }
         let records: Vec<_> = joins.into_iter().map(|join| join.join().unwrap()).collect();
-        assert!(records
-            .iter()
-            .all(|record| record.terminal_delivery_key == records[0].terminal_delivery_key));
+        assert!(
+            records
+                .iter()
+                .all(|record| record.terminal_delivery_key == records[0].terminal_delivery_key)
+        );
         let record = records[0].clone();
         let mut joins = Vec::new();
         for _ in 0..8 {
@@ -1134,9 +1228,331 @@ mod tests {
         }
         let results: Vec<_> = joins.into_iter().map(|join| join.join().unwrap()).collect();
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
-        assert!(results
-            .iter()
-            .filter(|result| result.is_err())
-            .all(|result| matches!(result, Err(TerminalDeliveryError::RevisionConflict { .. }))));
+        assert!(
+            results
+                .iter()
+                .filter(|result| result.is_err())
+                .all(|result| matches!(
+                    result,
+                    Err(TerminalDeliveryError::RevisionConflict { .. })
+                ))
+        );
+    }
+
+    #[test]
+    fn reconciliation_candidates_are_bounded_ordered_and_state_filtered() {
+        let (_temp, repo) = repo();
+        let now = Utc::now();
+        let make = |suffix: &str| {
+            let mut value = input();
+            value.openab_inbound_turn_id = format!("discord-{suffix}");
+            value.runtime_run_id = format!("run-{suffix}");
+            repo.create_or_reuse(value).unwrap()
+        };
+        let _pending = make("pending");
+        let pending = make("ready");
+        let _ready = repo
+            .transition(
+                &pending.terminal_delivery_key,
+                0,
+                TerminalDeliveryState::ReadyToDeliver,
+                TransitionUpdate::default(),
+                "TEST_READY",
+            )
+            .unwrap();
+        let due = make("due");
+        let due = repo
+            .transition(
+                &due.terminal_delivery_key,
+                0,
+                TerminalDeliveryState::ReadyToDeliver,
+                TransitionUpdate::default(),
+                "TEST_READY",
+            )
+            .unwrap();
+        let due = repo
+            .transition(
+                &due.terminal_delivery_key,
+                due.state_revision,
+                TerminalDeliveryState::Delivering,
+                TransitionUpdate::default(),
+                "TEST_CLAIM",
+            )
+            .unwrap();
+        let due_scheduled = repo
+            .transition(
+                &due.terminal_delivery_key,
+                due.state_revision,
+                TerminalDeliveryState::RetryScheduled,
+                TransitionUpdate {
+                    next_attempt_at: Some(Some(now - chrono::Duration::seconds(1))),
+                    ..Default::default()
+                },
+                "TEST_DUE",
+            )
+            .unwrap();
+        let future = make("future");
+        let future = repo
+            .transition(
+                &future.terminal_delivery_key,
+                0,
+                TerminalDeliveryState::ReadyToDeliver,
+                TransitionUpdate::default(),
+                "TEST_READY",
+            )
+            .unwrap();
+        let future = repo
+            .transition(
+                &future.terminal_delivery_key,
+                future.state_revision,
+                TerminalDeliveryState::Delivering,
+                TransitionUpdate::default(),
+                "TEST_CLAIM",
+            )
+            .unwrap();
+        let _future = repo
+            .transition(
+                &future.terminal_delivery_key,
+                future.state_revision,
+                TerminalDeliveryState::RetryScheduled,
+                TransitionUpdate {
+                    next_attempt_at: Some(Some(now + chrono::Duration::seconds(60))),
+                    ..Default::default()
+                },
+                "TEST_FUTURE",
+            )
+            .unwrap();
+        let stale = make("stale");
+        let stale = repo
+            .transition(
+                &stale.terminal_delivery_key,
+                0,
+                TerminalDeliveryState::ReadyToDeliver,
+                TransitionUpdate::default(),
+                "TEST_READY",
+            )
+            .unwrap();
+        let _stale = repo
+            .transition(
+                &stale.terminal_delivery_key,
+                stale.state_revision,
+                TerminalDeliveryState::Delivering,
+                TransitionUpdate {
+                    delivery_started_at: Some(Some(now - chrono::Duration::seconds(60))),
+                    ..Default::default()
+                },
+                "TEST_STALE",
+            )
+            .unwrap();
+        let fresh = make("fresh");
+        let fresh = repo
+            .transition(
+                &fresh.terminal_delivery_key,
+                0,
+                TerminalDeliveryState::ReadyToDeliver,
+                TransitionUpdate::default(),
+                "TEST_READY",
+            )
+            .unwrap();
+        let _fresh = repo
+            .transition(
+                &fresh.terminal_delivery_key,
+                fresh.state_revision,
+                TerminalDeliveryState::Delivering,
+                TransitionUpdate {
+                    delivery_started_at: Some(Some(now)),
+                    ..Default::default()
+                },
+                "TEST_FRESH",
+            )
+            .unwrap();
+        let ambiguous = make("ambiguous");
+        let ambiguous = repo
+            .transition(
+                &ambiguous.terminal_delivery_key,
+                0,
+                TerminalDeliveryState::ReadyToDeliver,
+                TransitionUpdate::default(),
+                "TEST_READY",
+            )
+            .unwrap();
+        let ambiguous = repo
+            .transition(
+                &ambiguous.terminal_delivery_key,
+                ambiguous.state_revision,
+                TerminalDeliveryState::Delivering,
+                TransitionUpdate::default(),
+                "TEST_CLAIM",
+            )
+            .unwrap();
+        let _ambiguous = repo
+            .transition(
+                &ambiguous.terminal_delivery_key,
+                ambiguous.state_revision,
+                TerminalDeliveryState::Ambiguous,
+                TransitionUpdate::default(),
+                "TEST_AMBIGUOUS",
+            )
+            .unwrap();
+        let hold = make("hold");
+        let _hold = repo
+            .transition(
+                &hold.terminal_delivery_key,
+                0,
+                TerminalDeliveryState::OperatorHold,
+                TransitionUpdate::default(),
+                "TEST_HOLD",
+            )
+            .unwrap();
+        let delivered = make("delivered");
+        let delivered = repo
+            .transition(
+                &delivered.terminal_delivery_key,
+                0,
+                TerminalDeliveryState::ReadyToDeliver,
+                TransitionUpdate::default(),
+                "TEST_READY",
+            )
+            .unwrap();
+        let delivered = repo
+            .transition(
+                &delivered.terminal_delivery_key,
+                delivered.state_revision,
+                TerminalDeliveryState::Delivering,
+                TransitionUpdate::default(),
+                "TEST_CLAIM",
+            )
+            .unwrap();
+        let _delivered = repo
+            .transition(
+                &delivered.terminal_delivery_key,
+                delivered.state_revision,
+                TerminalDeliveryState::Delivered,
+                TransitionUpdate::default(),
+                "TEST_DELIVERED",
+            )
+            .unwrap();
+        let rejected = make("rejected");
+        let rejected = repo
+            .transition(
+                &rejected.terminal_delivery_key,
+                0,
+                TerminalDeliveryState::ReadyToDeliver,
+                TransitionUpdate::default(),
+                "TEST_READY",
+            )
+            .unwrap();
+        let rejected = repo
+            .transition(
+                &rejected.terminal_delivery_key,
+                rejected.state_revision,
+                TerminalDeliveryState::Delivering,
+                TransitionUpdate::default(),
+                "TEST_CLAIM",
+            )
+            .unwrap();
+        let _rejected = repo
+            .transition(
+                &rejected.terminal_delivery_key,
+                rejected.state_revision,
+                TerminalDeliveryState::PermanentRejected,
+                TransitionUpdate::default(),
+                "TEST_REJECTED",
+            )
+            .unwrap();
+
+        let candidates = repo
+            .list_reconciliation_candidates(now, now - chrono::Duration::seconds(30), 16)
+            .unwrap();
+        let states: Vec<_> = candidates.iter().map(|record| record.state).collect();
+        assert_eq!(states.len(), 5);
+        assert_eq!(
+            &states[..2],
+            [
+                TerminalDeliveryState::Delivering,
+                TerminalDeliveryState::RetryScheduled,
+            ]
+        );
+        assert!(states.contains(&TerminalDeliveryState::PendingResult));
+        assert!(states.contains(&TerminalDeliveryState::ReadyToDeliver));
+        assert!(states.contains(&TerminalDeliveryState::RetryScheduled));
+        assert!(states.contains(&TerminalDeliveryState::Delivering));
+        assert!(states.contains(&TerminalDeliveryState::Ambiguous));
+        assert_eq!(
+            repo.list_reconciliation_candidates(now, now - chrono::Duration::seconds(30), 2)
+                .unwrap()
+                .len(),
+            2
+        );
+        let repeated = repo
+            .list_reconciliation_candidates(now, now - chrono::Duration::seconds(30), 16)
+            .unwrap();
+        assert_eq!(candidates, repeated);
+        assert_eq!(
+            repo.get(&due_scheduled.terminal_delivery_key)
+                .unwrap()
+                .unwrap(),
+            due_scheduled
+        );
+    }
+
+    #[test]
+    fn lease_fenced_transition_rejects_wrong_revision_or_token() {
+        let (_temp, repo) = repo();
+        let pending = repo.create_or_reuse(input()).unwrap();
+        let ready = repo
+            .transition(
+                &pending.terminal_delivery_key,
+                0,
+                TerminalDeliveryState::ReadyToDeliver,
+                TransitionUpdate::default(),
+                "TEST_READY",
+            )
+            .unwrap();
+        let claimed = repo
+            .transition(
+                &ready.terminal_delivery_key,
+                ready.state_revision,
+                TerminalDeliveryState::Delivering,
+                TransitionUpdate {
+                    delivery_lease_token: Some(Some("lease-a".into())),
+                    ..Default::default()
+                },
+                "TEST_CLAIM",
+            )
+            .unwrap();
+        assert!(matches!(
+            repo.transition_with_lease(
+                &claimed.terminal_delivery_key,
+                claimed.state_revision - 1,
+                "lease-a",
+                TerminalDeliveryState::Ambiguous,
+                TransitionUpdate::default(),
+                "TEST_STALE"
+            ),
+            Err(TerminalDeliveryError::RevisionConflict { .. })
+        ));
+        assert!(matches!(
+            repo.transition_with_lease(
+                &claimed.terminal_delivery_key,
+                claimed.state_revision,
+                "lease-b",
+                TerminalDeliveryState::Ambiguous,
+                TransitionUpdate::default(),
+                "TEST_WRONG_LEASE"
+            ),
+            Err(TerminalDeliveryError::LeaseTokenConflict)
+        ));
+        let transitioned = repo
+            .transition_with_lease(
+                &claimed.terminal_delivery_key,
+                claimed.state_revision,
+                "lease-a",
+                TerminalDeliveryState::Ambiguous,
+                TransitionUpdate::default(),
+                "TEST_CORRECT_LEASE",
+            )
+            .unwrap();
+        assert_eq!(transitioned.state, TerminalDeliveryState::Ambiguous);
     }
 }

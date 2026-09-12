@@ -6,14 +6,14 @@
 
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::future::Future;
 use std::sync::Arc;
 
 use crate::adapter::{ChannelRef, ChatAdapter};
 use crate::terminal_delivery::{
     NewTerminalDeliveryRecord, TerminalDeliveryError, TerminalDeliveryRecordV1,
-    TerminalDeliveryRepository, TerminalDeliveryState, TransitionUpdate,
+    TerminalDeliveryRepository, TerminalDeliveryState, TransitionUpdate, validate_record_integrity,
 };
 
 pub const SAFE_FAILED_MESSAGE: &str =
@@ -340,6 +340,39 @@ impl TerminalDeliveryWorker {
             .await
             .map_err(|_| LookupError::Unavailable)
     }
+
+    /// Advance an already-materialized durable pending record after restart.
+    /// `PENDING_RESULT` in this outbox already owns its immutable payload, so
+    /// this operation deliberately performs no Runtime lookup or rendering.
+    pub fn recover_pending_result(
+        &self,
+        record: TerminalDeliveryRecordV1,
+    ) -> Result<TerminalDeliveryRecordV1, TerminalDeliveryError> {
+        validate_record_integrity(&record)?;
+        if record.state != TerminalDeliveryState::PendingResult {
+            return Ok(record);
+        }
+        self.repo.transition(
+            &record.terminal_delivery_key,
+            record.state_revision,
+            TerminalDeliveryState::ReadyToDeliver,
+            TransitionUpdate::default(),
+            "RECOVERY_PENDING_RESULT_READY",
+        )
+    }
+
+    /// Resume an already durable ready/due-retry record through the same
+    /// claim/send path as the live worker.  This is the only recovery send
+    /// entry point; it neither consults Runtime nor re-renders the payload.
+    pub async fn recover_ready_or_retry(
+        &self,
+        record: TerminalDeliveryRecordV1,
+        channel: ChannelRef,
+        sender: &dyn DiscordTerminalDeliverySender,
+    ) -> Result<TerminalDeliveryRecordV1, TerminalDeliveryError> {
+        self.deliver_ready(record, channel, sender).await
+    }
+
     async fn deliver_ready(
         &self,
         record: TerminalDeliveryRecordV1,
@@ -423,10 +456,15 @@ impl TerminalDeliveryWorker {
             .unwrap_or(SAFE_FAILED_MESSAGE);
         let attempt = claimed.attempt_count;
         let outcome = sender.send_terminal(&channel, content).await;
+        let lease_token = claimed
+            .delivery_lease_token
+            .as_deref()
+            .ok_or(TerminalDeliveryError::InvalidInput("delivery_lease_token"))?;
         match outcome {
-            DiscordSendResult::DefiniteSuccess(message_id) => self.repo.transition(
+            DiscordSendResult::DefiniteSuccess(message_id) => self.repo.transition_with_lease(
                 &claimed.terminal_delivery_key,
                 claimed.state_revision,
+                lease_token,
                 TerminalDeliveryState::Delivered,
                 TransitionUpdate {
                     discord_message_id: Some(message_id),
@@ -435,20 +473,24 @@ impl TerminalDeliveryWorker {
                 },
                 "DISCORD_DELIVERED",
             ),
-            DiscordSendResult::DefinitePermanentFailure { classification } => self.repo.transition(
+            DiscordSendResult::DefinitePermanentFailure { classification } => {
+                self.repo.transition_with_lease(
+                    &claimed.terminal_delivery_key,
+                    claimed.state_revision,
+                    lease_token,
+                    TerminalDeliveryState::PermanentRejected,
+                    TransitionUpdate {
+                        last_failure_classification: Some(Some(classification.into())),
+                        delivery_lease_token: Some(None),
+                        ..Default::default()
+                    },
+                    "DISCORD_PERMANENT_REJECTED",
+                )
+            }
+            DiscordSendResult::Ambiguous { classification } => self.repo.transition_with_lease(
                 &claimed.terminal_delivery_key,
                 claimed.state_revision,
-                TerminalDeliveryState::PermanentRejected,
-                TransitionUpdate {
-                    last_failure_classification: Some(Some(classification.into())),
-                    delivery_lease_token: Some(None),
-                    ..Default::default()
-                },
-                "DISCORD_PERMANENT_REJECTED",
-            ),
-            DiscordSendResult::Ambiguous { classification } => self.repo.transition(
-                &claimed.terminal_delivery_key,
-                claimed.state_revision,
+                lease_token,
                 TerminalDeliveryState::Ambiguous,
                 TransitionUpdate {
                     last_failure_classification: Some(Some(classification.into())),
@@ -460,9 +502,10 @@ impl TerminalDeliveryWorker {
             DiscordSendResult::DefiniteTransientFailure { classification }
                 if attempt >= MAX_EXTERNAL_ATTEMPTS =>
             {
-                let retry_scheduled = self.repo.transition(
+                let retry_scheduled = self.repo.transition_with_lease(
                     &claimed.terminal_delivery_key,
                     claimed.state_revision,
+                    lease_token,
                     TerminalDeliveryState::RetryScheduled,
                     TransitionUpdate {
                         last_failure_classification: Some(Some(classification.into())),
@@ -486,9 +529,10 @@ impl TerminalDeliveryWorker {
             }
             DiscordSendResult::DefiniteTransientFailure { classification } => {
                 let seconds = retry_delay_secs(attempt);
-                self.repo.transition(
+                self.repo.transition_with_lease(
                     &claimed.terminal_delivery_key,
                     claimed.state_revision,
+                    lease_token,
                     TerminalDeliveryState::RetryScheduled,
                     TransitionUpdate {
                         next_attempt_at: Some(Some(Utc::now() + Duration::seconds(seconds as i64))),
@@ -784,12 +828,90 @@ mod tests {
             .unwrap();
         let digest = retry.terminal_payload_digest.clone();
         let delivered = worker
-            .deliver_ready(retry, channel(), &sender)
+            .recover_ready_or_retry(retry, channel(), &sender)
             .await
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(delivered.terminal_payload_digest, digest);
         assert_eq!(*sender.contents.lock().unwrap(), vec!["stored", "stored"]);
+    }
+
+    #[tokio::test]
+    async fn pending_recovery_uses_persisted_payload_without_runtime_lookup() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Arc::new(TerminalDeliveryRepository::open(tmp.path()).unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker = TerminalDeliveryWorker::new(
+            repo.clone(),
+            Arc::new(RecordingLookup {
+                value: json!({"terminal_status":"completed", "terminal_result":{"final_answer":"must-not-read"}}),
+                calls: calls.clone(),
+            }),
+        );
+        let pending = repo
+            .create_or_reuse(crate::terminal_delivery::NewTerminalDeliveryRecord {
+                openab_inbound_turn_id: "discord:pending".into(),
+                platform: "discord".into(),
+                channel_id: "1".into(),
+                thread_id: None,
+                acp_request_id: "q".into(),
+                acp_session_id: "s".into(),
+                runtime_run_id: "runtime-pending".into(),
+                workflow_run_id: Some("workflow-pending".into()),
+                conversation_id: "conversation-pending".into(),
+                response_sequence: 0,
+                terminal_payload: json!({"content":"persisted"}),
+            })
+            .unwrap();
+        let ready = worker.recover_pending_result(pending.clone()).unwrap();
+        assert_eq!(ready.state, TerminalDeliveryState::ReadyToDeliver);
+        assert_eq!(ready.terminal_payload, pending.terminal_payload);
+        assert_eq!(
+            ready.terminal_payload_digest,
+            pending.terminal_payload_digest
+        );
+        assert_eq!(ready.runtime_run_id, pending.runtime_run_id);
+        assert_eq!(ready.attempt_count, pending.attempt_count);
+        assert_eq!(ready.state_revision, pending.state_revision + 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_recovery_rejects_corrupt_payload_without_transition() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Arc::new(TerminalDeliveryRepository::open(tmp.path()).unwrap());
+        let worker = TerminalDeliveryWorker::new(
+            repo.clone(),
+            Arc::new(Lookup(json!({"terminal_status":"completed"}))),
+        );
+        let pending = repo
+            .create_or_reuse(crate::terminal_delivery::NewTerminalDeliveryRecord {
+                openab_inbound_turn_id: "discord:corrupt".into(),
+                platform: "discord".into(),
+                channel_id: "1".into(),
+                thread_id: None,
+                acp_request_id: "q".into(),
+                acp_session_id: "s".into(),
+                runtime_run_id: "runtime-corrupt".into(),
+                workflow_run_id: None,
+                conversation_id: "conversation-corrupt".into(),
+                response_sequence: 0,
+                terminal_payload: json!({"content":"persisted"}),
+            })
+            .unwrap();
+        let mut corrupt = pending.clone();
+        corrupt.terminal_payload_digest = "not-the-persisted-digest".into();
+        assert!(matches!(
+            worker.recover_pending_result(corrupt),
+            Err(TerminalDeliveryError::MalformedRecord(_))
+        ));
+        assert_eq!(
+            repo.get(&pending.terminal_delivery_key)
+                .unwrap()
+                .unwrap()
+                .state,
+            TerminalDeliveryState::PendingResult
+        );
     }
 
     #[tokio::test]
