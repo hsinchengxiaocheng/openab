@@ -6,20 +6,23 @@
 
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::future::Future;
 use std::sync::Arc;
 
 use crate::adapter::{ChannelRef, ChatAdapter};
 use crate::terminal_delivery::{
-    NewTerminalDeliveryRecord, TerminalDeliveryError, TerminalDeliveryRecordV1,
-    TerminalDeliveryRepository, TerminalDeliveryState, TransitionUpdate, validate_record_integrity,
+    validate_record_integrity, NewTerminalDeliveryRecord, TerminalDeliveryError,
+    TerminalDeliveryRecordV1, TerminalDeliveryRepository, TerminalDeliveryState, TransitionUpdate,
 };
 
 pub const SAFE_FAILED_MESSAGE: &str =
     "⚠️ The requested work failed. Please contact the operator if you need assistance.";
 pub const SAFE_CANCELLED_MESSAGE: &str = "⚠️ The requested work was cancelled.";
 pub const MAX_EXTERNAL_ATTEMPTS: u64 = 5;
+/// A delivery claim older than this is no longer treated as live.  Its
+/// outbound outcome is unknown, so recovery may only declare it ambiguous.
+pub const STALE_DELIVERING_AFTER_SECS: i64 = 300;
 const RETRY_DELAYS_SECS: [u64; MAX_EXTERNAL_ATTEMPTS as usize] = [1, 5, 30, 120, 600];
 /// Bounds one Serenity-managed terminal send, including any internal 429
 /// sleep/retry. An expiry is ambiguous because a write may already be accepted.
@@ -38,6 +41,10 @@ where
 
 fn retry_delay_secs(attempt: u64) -> u64 {
     RETRY_DELAYS_SECS[(attempt as usize).saturating_sub(1).min(4)]
+}
+
+pub fn stale_delivering_before(now: chrono::DateTime<Utc>) -> chrono::DateTime<Utc> {
+    now - Duration::seconds(STALE_DELIVERING_AFTER_SECS)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -373,6 +380,66 @@ impl TerminalDeliveryWorker {
         self.deliver_ready(record, channel, sender).await
     }
 
+    /// Convert a stale in-flight claim into an explicit ambiguous outcome.
+    /// This recovery path never sends and never reads Runtime: a stale send
+    /// may already have reached Discord, so it must not be retried here.
+    pub fn recover_stale_delivering(
+        &self,
+        record: TerminalDeliveryRecordV1,
+        stale_before: chrono::DateTime<Utc>,
+    ) -> Result<TerminalDeliveryRecordV1, TerminalDeliveryError> {
+        validate_record_integrity(&record)?;
+        if record.state != TerminalDeliveryState::Delivering {
+            return Ok(record);
+        }
+        let missing_started_at = record.delivery_started_at.is_none();
+        if !missing_started_at
+            && record
+                .delivery_started_at
+                .is_some_and(|started_at| started_at > stale_before)
+        {
+            return Ok(record);
+        }
+        let lease_token = record
+            .delivery_lease_token
+            .as_deref()
+            .ok_or(TerminalDeliveryError::MissingDeliveryLeaseToken)?;
+        let reason = if missing_started_at {
+            "DELIVERING_MISSING_START_TIME_AMBIGUOUS"
+        } else {
+            "STALE_DELIVERING_DECLARED_AMBIGUOUS"
+        };
+        match self.repo.transition_with_lease(
+            &record.terminal_delivery_key,
+            record.state_revision,
+            lease_token,
+            TerminalDeliveryState::Ambiguous,
+            TransitionUpdate {
+                next_attempt_at: Some(None),
+                delivery_lease_token: Some(None),
+                ..Default::default()
+            },
+            reason,
+        ) {
+            Ok(recovered) => Ok(recovered),
+            Err(
+                error @ (TerminalDeliveryError::RevisionConflict { .. }
+                | TerminalDeliveryError::LeaseTokenConflict),
+            ) => {
+                let authoritative = self
+                    .repo
+                    .get(&record.terminal_delivery_key)?
+                    .ok_or_else(|| TerminalDeliveryError::Storage("lost delivery record".into()))?;
+                if authoritative.state != TerminalDeliveryState::Delivering {
+                    Ok(authoritative)
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     async fn deliver_ready(
         &self,
         record: TerminalDeliveryRecordV1,
@@ -571,6 +638,8 @@ impl TerminalDeliveryPort for TerminalDeliveryWorker {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Barrier;
+    use std::thread;
     use tempfile::TempDir;
 
     #[tokio::test(start_paused = true)]
@@ -706,6 +775,51 @@ mod tests {
             parent_id: None,
             origin_event_id: Some("42".into()),
         }
+    }
+
+    fn delivering_record(
+        repo: &TerminalDeliveryRepository,
+        suffix: &str,
+        started_at: Option<chrono::DateTime<Utc>>,
+        lease_token: Option<&str>,
+    ) -> TerminalDeliveryRecordV1 {
+        let pending = repo
+            .create_or_reuse(crate::terminal_delivery::NewTerminalDeliveryRecord {
+                openab_inbound_turn_id: format!("discord:{suffix}"),
+                platform: "discord".into(),
+                channel_id: "1".into(),
+                thread_id: None,
+                acp_request_id: "q".into(),
+                acp_session_id: "s".into(),
+                runtime_run_id: format!("runtime:{suffix}"),
+                workflow_run_id: None,
+                conversation_id: "c".into(),
+                response_sequence: 0,
+                terminal_payload: json!({"content":"persisted"}),
+            })
+            .unwrap();
+        let ready = repo
+            .transition(
+                &pending.terminal_delivery_key,
+                pending.state_revision,
+                TerminalDeliveryState::ReadyToDeliver,
+                TransitionUpdate::default(),
+                "TEST_READY",
+            )
+            .unwrap();
+        repo.transition(
+            &ready.terminal_delivery_key,
+            ready.state_revision,
+            TerminalDeliveryState::Delivering,
+            TransitionUpdate {
+                delivery_lease_token: Some(lease_token.map(str::to_owned)),
+                delivery_started_at: Some(started_at),
+                next_attempt_at: Some(Some(Utc::now() + Duration::seconds(60))),
+                ..Default::default()
+            },
+            "TEST_DELIVERING",
+        )
+        .unwrap()
     }
 
     async fn deliver_outcome(outcome: DiscordSendResult) -> TerminalDeliveryRecordV1 {
@@ -1288,6 +1402,243 @@ mod tests {
                 .filter(|event| event.new_state == TerminalDeliveryState::Delivering)
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn stale_delivering_recovery_is_fenced_ambiguous_and_side_effect_free() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Arc::new(TerminalDeliveryRepository::open(tmp.path()).unwrap());
+        let lookup_calls = Arc::new(AtomicUsize::new(0));
+        let worker = TerminalDeliveryWorker::new(
+            repo.clone(),
+            Arc::new(RecordingLookup {
+                value: json!({}),
+                calls: lookup_calls.clone(),
+            }),
+        );
+        let sender_calls = Arc::new(AtomicUsize::new(0));
+        let _sender = CountingOutcome {
+            outcome: DiscordSendResult::DefiniteSuccess("must-not-send".into()),
+            calls: sender_calls.clone(),
+        };
+        let now = Utc::now();
+        let stale = delivering_record(
+            &repo,
+            "stale",
+            Some(now - Duration::seconds(STALE_DELIVERING_AFTER_SECS + 1)),
+            Some("lease-stale"),
+        );
+        let recovered = worker
+            .recover_stale_delivering(stale.clone(), stale_delivering_before(now))
+            .unwrap();
+        assert_eq!(recovered.state, TerminalDeliveryState::Ambiguous);
+        assert_eq!(recovered.terminal_payload, stale.terminal_payload);
+        assert_eq!(
+            recovered.terminal_payload_digest,
+            stale.terminal_payload_digest
+        );
+        assert_eq!(recovered.attempt_count, stale.attempt_count);
+        assert_eq!(recovered.delivery_started_at, stale.delivery_started_at);
+        assert_eq!(recovered.next_attempt_at, None);
+        assert_eq!(recovered.delivery_lease_token, None);
+        assert_eq!(lookup_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(sender_calls.load(Ordering::SeqCst), 0);
+        let events = repo.events(&stale.terminal_delivery_key).unwrap();
+        assert_eq!(
+            events.last().unwrap().previous_state,
+            Some(TerminalDeliveryState::Delivering)
+        );
+        assert_eq!(
+            events.last().unwrap().new_state,
+            TerminalDeliveryState::Ambiguous
+        );
+        assert_eq!(
+            events.last().unwrap().safe_reason_code,
+            "STALE_DELIVERING_DECLARED_AMBIGUOUS"
+        );
+    }
+
+    #[test]
+    fn fresh_delivering_and_non_delivering_records_are_noops() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Arc::new(TerminalDeliveryRepository::open(tmp.path()).unwrap());
+        let worker = TerminalDeliveryWorker::new(repo.clone(), Arc::new(Lookup(json!({}))));
+        let now = Utc::now();
+        let fresh = delivering_record(&repo, "fresh", Some(now), Some("lease-fresh"));
+        assert_eq!(
+            worker
+                .recover_stale_delivering(fresh.clone(), stale_delivering_before(now))
+                .unwrap(),
+            fresh
+        );
+        let ambiguous = repo
+            .transition(
+                &fresh.terminal_delivery_key,
+                fresh.state_revision,
+                TerminalDeliveryState::Ambiguous,
+                TransitionUpdate::default(),
+                "TEST_AMBIGUOUS",
+            )
+            .unwrap();
+        assert_eq!(
+            worker
+                .recover_stale_delivering(ambiguous.clone(), stale_delivering_before(now))
+                .unwrap(),
+            ambiguous
+        );
+        let terminal = delivering_record(
+            &repo,
+            "terminal-noop",
+            Some(now - Duration::seconds(301)),
+            Some("lease-terminal"),
+        );
+        let delivered = repo
+            .transition(
+                &terminal.terminal_delivery_key,
+                terminal.state_revision,
+                TerminalDeliveryState::Delivered,
+                TransitionUpdate::default(),
+                "TEST_DELIVERED",
+            )
+            .unwrap();
+        assert_eq!(
+            worker
+                .recover_stale_delivering(delivered.clone(), stale_delivering_before(now))
+                .unwrap(),
+            delivered
+        );
+        let rejected_source = delivering_record(
+            &repo,
+            "permanent-rejected-noop",
+            Some(now - Duration::seconds(301)),
+            Some("lease-permanent-rejected"),
+        );
+        let rejected = repo
+            .transition(
+                &rejected_source.terminal_delivery_key,
+                rejected_source.state_revision,
+                TerminalDeliveryState::PermanentRejected,
+                TransitionUpdate::default(),
+                "TEST_PERMANENT_REJECTED",
+            )
+            .unwrap();
+        assert_eq!(
+            worker
+                .recover_stale_delivering(rejected.clone(), stale_delivering_before(now))
+                .unwrap(),
+            rejected
+        );
+    }
+
+    #[test]
+    fn stale_recovery_rejects_wrong_fence_and_missing_lease_without_mutation() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Arc::new(TerminalDeliveryRepository::open(tmp.path()).unwrap());
+        let worker = TerminalDeliveryWorker::new(repo.clone(), Arc::new(Lookup(json!({}))));
+        let now = Utc::now();
+        let stale = delivering_record(
+            &repo,
+            "fence",
+            Some(now - Duration::seconds(301)),
+            Some("lease-a"),
+        );
+        let mut wrong_token = stale.clone();
+        wrong_token.delivery_lease_token = Some("lease-b".into());
+        assert!(matches!(
+            worker.recover_stale_delivering(wrong_token, stale_delivering_before(now)),
+            Err(TerminalDeliveryError::LeaseTokenConflict)
+        ));
+        let mut wrong_revision = stale.clone();
+        wrong_revision.state_revision -= 1;
+        assert!(matches!(
+            worker.recover_stale_delivering(wrong_revision, stale_delivering_before(now)),
+            Err(TerminalDeliveryError::RevisionConflict { .. })
+        ));
+        assert_eq!(
+            repo.get(&stale.terminal_delivery_key).unwrap().unwrap(),
+            stale
+        );
+        let missing_lease = delivering_record(
+            &repo,
+            "missing-lease",
+            Some(now - Duration::seconds(301)),
+            None,
+        );
+        assert!(matches!(
+            worker.recover_stale_delivering(missing_lease.clone(), stale_delivering_before(now)),
+            Err(TerminalDeliveryError::MissingDeliveryLeaseToken)
+        ));
+        assert_eq!(
+            repo.get(&missing_lease.terminal_delivery_key)
+                .unwrap()
+                .unwrap(),
+            missing_lease
+        );
+    }
+
+    #[test]
+    fn missing_start_time_is_ambiguous_when_a_lease_exists() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Arc::new(TerminalDeliveryRepository::open(tmp.path()).unwrap());
+        let worker = TerminalDeliveryWorker::new(repo.clone(), Arc::new(Lookup(json!({}))));
+        let record = delivering_record(&repo, "missing-start", None, Some("lease-missing-start"));
+        let recovered = worker
+            .recover_stale_delivering(record.clone(), Utc::now())
+            .unwrap();
+        assert_eq!(recovered.state, TerminalDeliveryState::Ambiguous);
+        assert_eq!(
+            repo.events(&record.terminal_delivery_key)
+                .unwrap()
+                .last()
+                .unwrap()
+                .safe_reason_code,
+            "DELIVERING_MISSING_START_TIME_AMBIGUOUS"
+        );
+    }
+
+    #[test]
+    fn concurrent_stale_recovery_has_one_transition_winner_and_one_safe_observer() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Arc::new(TerminalDeliveryRepository::open(tmp.path()).unwrap());
+        let now = Utc::now();
+        let stale = delivering_record(
+            &repo,
+            "concurrent",
+            Some(now - Duration::seconds(301)),
+            Some("lease-concurrent"),
+        );
+        let worker = Arc::new(TerminalDeliveryWorker::new(
+            repo.clone(),
+            Arc::new(Lookup(json!({}))),
+        ));
+        let barrier = Arc::new(Barrier::new(2));
+        let mut joins = Vec::new();
+        for _ in 0..2 {
+            let worker = worker.clone();
+            let barrier = barrier.clone();
+            let snapshot = stale.clone();
+            joins.push(thread::spawn(move || {
+                barrier.wait();
+                worker.recover_stale_delivering(snapshot, stale_delivering_before(now))
+            }));
+        }
+        let results: Vec<_> = joins.into_iter().map(|join| join.join().unwrap()).collect();
+        assert!(results.iter().all(|result| matches!(result, Ok(record) if record.state == TerminalDeliveryState::Ambiguous)));
+        let events = repo.events(&stale.terminal_delivery_key).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.new_state == TerminalDeliveryState::Ambiguous)
+                .count(),
+            1
+        );
+        assert_eq!(
+            repo.get(&stale.terminal_delivery_key)
+                .unwrap()
+                .unwrap()
+                .state,
+            TerminalDeliveryState::Ambiguous
         );
     }
 }

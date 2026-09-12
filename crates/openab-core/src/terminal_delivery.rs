@@ -186,6 +186,7 @@ pub enum TerminalDeliveryError {
         actual: u64,
     },
     LeaseTokenConflict,
+    MissingDeliveryLeaseToken,
     DiscordMessageIdWriteOnce,
     UnsafeAuditField(&'static str),
 }
@@ -225,6 +226,9 @@ impl fmt::Display for TerminalDeliveryError {
                 "terminal delivery revision conflict: expected {expected}, actual {actual}"
             ),
             Self::LeaseTokenConflict => f.write_str("terminal delivery lease token conflict"),
+            Self::MissingDeliveryLeaseToken => {
+                f.write_str("delivering record is missing its delivery lease token")
+            }
             Self::DiscordMessageIdWriteOnce => f.write_str("discord_message_id is write-once"),
             Self::UnsafeAuditField(field) => {
                 write!(f, "unsafe terminal delivery audit field: {field}")
@@ -476,7 +480,7 @@ impl TerminalDeliveryRepository {
             .map_err(|_| TerminalDeliveryError::InvalidInput("reconciliation limit"))?;
         let conn = self.connect()?;
         let mut statement = conn.prepare(
-            "SELECT record_version, terminal_delivery_key, openab_inbound_turn_id, platform, channel_id, thread_id, acp_request_id, acp_session_id, runtime_run_id, workflow_run_id, conversation_id, response_sequence, terminal_payload, terminal_payload_digest, state, attempt_count, next_attempt_at, last_failure_classification, last_safe_error, discord_message_id, operator_hold_reason, created_at, updated_at, delivered_at, state_revision, delivery_lease_token, delivery_started_at FROM terminal_deliveries WHERE state IN ('PENDING_RESULT', 'READY_TO_DELIVER', 'AMBIGUOUS') OR (state = 'RETRY_SCHEDULED' AND next_attempt_at IS NOT NULL AND next_attempt_at <= ?1) OR (state = 'DELIVERING' AND delivery_started_at IS NOT NULL AND delivery_started_at <= ?2) ORDER BY CASE WHEN state = 'RETRY_SCHEDULED' THEN next_attempt_at WHEN state = 'DELIVERING' THEN delivery_started_at ELSE created_at END ASC, created_at ASC, terminal_delivery_key ASC LIMIT ?3",
+            "SELECT record_version, terminal_delivery_key, openab_inbound_turn_id, platform, channel_id, thread_id, acp_request_id, acp_session_id, runtime_run_id, workflow_run_id, conversation_id, response_sequence, terminal_payload, terminal_payload_digest, state, attempt_count, next_attempt_at, last_failure_classification, last_safe_error, discord_message_id, operator_hold_reason, created_at, updated_at, delivered_at, state_revision, delivery_lease_token, delivery_started_at FROM terminal_deliveries WHERE state IN ('PENDING_RESULT', 'READY_TO_DELIVER', 'AMBIGUOUS') OR (state = 'RETRY_SCHEDULED' AND next_attempt_at IS NOT NULL AND next_attempt_at <= ?1) OR (state = 'DELIVERING' AND (delivery_started_at IS NULL OR delivery_started_at <= ?2)) ORDER BY CASE WHEN state = 'RETRY_SCHEDULED' THEN next_attempt_at WHEN state = 'DELIVERING' THEN delivery_started_at ELSE created_at END ASC, created_at ASC, terminal_delivery_key ASC LIMIT ?3",
         ).map_err(sql_error)?;
         let records = statement
             .query_map(
@@ -1554,5 +1558,39 @@ mod tests {
             )
             .unwrap();
         assert_eq!(transitioned.state, TerminalDeliveryState::Ambiguous);
+    }
+
+    #[test]
+    fn delivering_without_start_time_is_a_reconciliation_candidate() {
+        let (_temp, repo) = repo();
+        let pending = repo.create_or_reuse(input()).unwrap();
+        let ready = repo
+            .transition(
+                &pending.terminal_delivery_key,
+                pending.state_revision,
+                TerminalDeliveryState::ReadyToDeliver,
+                TransitionUpdate::default(),
+                "TEST_READY",
+            )
+            .unwrap();
+        let missing_start = repo
+            .transition(
+                &ready.terminal_delivery_key,
+                ready.state_revision,
+                TerminalDeliveryState::Delivering,
+                TransitionUpdate {
+                    delivery_lease_token: Some(Some("lease".into())),
+                    ..Default::default()
+                },
+                "TEST_DELIVERING",
+            )
+            .unwrap();
+        let candidates = repo
+            .list_reconciliation_candidates(Utc::now(), Utc::now(), 10)
+            .unwrap();
+        assert!(candidates.iter().any(|candidate| {
+            candidate.terminal_delivery_key == missing_start.terminal_delivery_key
+                && candidate.delivery_started_at.is_none()
+        }));
     }
 }
