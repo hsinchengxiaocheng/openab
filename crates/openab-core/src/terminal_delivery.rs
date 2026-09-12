@@ -170,6 +170,7 @@ pub enum TerminalDeliveryError {
         found: i32,
     },
     Corrupt(String),
+    Contention(String),
     MalformedRecord(String),
     InvalidInput(&'static str),
     PayloadConflict {
@@ -188,6 +189,12 @@ pub enum TerminalDeliveryError {
     UnsafeAuditField(&'static str),
 }
 
+impl TerminalDeliveryError {
+    pub fn is_contention(&self) -> bool {
+        matches!(self, Self::Contention(_))
+    }
+}
+
 impl fmt::Display for TerminalDeliveryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -196,6 +203,9 @@ impl fmt::Display for TerminalDeliveryError {
                 write!(f, "unsupported terminal delivery schema version {found}")
             }
             Self::Corrupt(detail) => write!(f, "terminal delivery database corruption: {detail}"),
+            Self::Contention(detail) => {
+                write!(f, "terminal delivery database contention: {detail}")
+            }
             Self::MalformedRecord(detail) => {
                 write!(f, "malformed terminal delivery record: {detail}")
             }
@@ -725,6 +735,11 @@ fn sql_error(error: SqlError) -> TerminalDeliveryError {
             if code.code == ErrorCode::DatabaseCorrupt || code.code == ErrorCode::NotADatabase =>
         {
             TerminalDeliveryError::Corrupt(error.to_string())
+        }
+        SqlError::SqliteFailure(code, _)
+            if code.code == ErrorCode::DatabaseBusy || code.code == ErrorCode::DatabaseLocked =>
+        {
+            TerminalDeliveryError::Contention(error.to_string())
         }
         _ => TerminalDeliveryError::Storage(error.to_string()),
     }

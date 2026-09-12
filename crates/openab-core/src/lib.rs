@@ -34,6 +34,7 @@ pub mod secrets;
 pub mod setup;
 pub mod stt;
 pub mod terminal_delivery;
+pub mod terminal_delivery_worker;
 pub mod timestamp;
 pub mod trust;
 pub mod workflow;

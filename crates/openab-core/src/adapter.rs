@@ -14,6 +14,9 @@ use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
 use crate::markdown::{self, TableMode};
 use crate::reactions::StatusReactionController;
+use crate::terminal_delivery_worker::{
+    capture_terminal_metadata, ChatAdapterTerminalSender, TerminalDeliveryPort,
+};
 use crate::workflow::identity::{current_agent_identity_from_env, AgentIdentity};
 
 // --- Output directive parsing ---
@@ -667,6 +670,9 @@ pub struct AdapterRouter {
     /// [`AdapterRouter::with_autonomous_ingress`].
     autonomous_ingress_client: Option<Arc<dyn crate::autonomous_ingress::AutonomousIngressClient>>,
     autonomous_ingress_config: Option<crate::config::AutonomousIngressConfig>,
+    /// Optional durable final-response authority.  It is deliberately absent
+    /// for legacy ACP-only deployments.
+    terminal_delivery_worker: Option<Arc<dyn TerminalDeliveryPort>>,
 }
 
 impl AdapterRouter {
@@ -705,6 +711,7 @@ impl AdapterRouter {
             ),
             autonomous_ingress_client: None,
             autonomous_ingress_config: None,
+            terminal_delivery_worker: None,
         }
     }
 
@@ -763,6 +770,11 @@ impl AdapterRouter {
     ) -> Self {
         self.autonomous_ingress_client = Some(client);
         self.autonomous_ingress_config = Some(config);
+        self
+    }
+
+    pub fn with_terminal_delivery_worker(mut self, worker: Arc<dyn TerminalDeliveryPort>) -> Self {
+        self.terminal_delivery_worker = Some(worker);
         self
     }
 
@@ -917,17 +929,25 @@ impl AdapterRouter {
     ) -> Result<()> {
         tracing::debug!(platform = adapter.platform(), "processing message");
 
-        let identity = discord_prompt_identity(&ctx.sender_json, &ctx.thread_channel);
+        // Discord's gateway message ID is the stable inbound identity for a
+        // durable terminal response.  Preserve the adapter-provided channel
+        // facts and only add this correlation field at ingress.
+        let mut thread_channel = ctx.thread_channel.clone();
+        if thread_channel.platform == "discord" {
+            thread_channel.origin_event_id = Some(ctx.trigger_msg.message_id.clone());
+        }
+
+        let identity = discord_prompt_identity(&ctx.sender_json, &thread_channel);
 
         let content_blocks =
             Self::pack_arrival_event(&ctx.sender_json, &ctx.prompt, ctx.extra_blocks);
 
-        let thread_key = ctx.thread_channel.session_pool_key();
+        let thread_key = thread_channel.session_pool_key();
 
         if let Err(e) = self.pool.get_or_create(&thread_key, None).await {
             let msg = format_user_error(&e.to_string());
             let _ = adapter
-                .send_message(&ctx.thread_channel, &format!("⚠️ {msg}"))
+                .send_message(&thread_channel, &format!("⚠️ {msg}"))
                 .await;
             error!("pool error: {e}");
             return Err(e);
@@ -954,7 +974,7 @@ impl AdapterRouter {
                 adapter,
                 &thread_key,
                 content_blocks,
-                &ctx.thread_channel,
+                &thread_channel,
                 reactions.clone(),
                 ctx.other_bot_present,
                 identity,
@@ -982,8 +1002,13 @@ impl AdapterRouter {
         }
 
         if let Err(ref e) = result {
+            // The durable boundary logs the safe operator-visible failure.
+            // Do not translate it into an untracked final Discord send.
+            if e.to_string().contains("durable terminal delivery") {
+                return Ok(());
+            }
             let _ = adapter
-                .send_message(&ctx.thread_channel, &format!("⚠️ {e}"))
+                .send_message(&thread_channel, &format!("⚠️ {e}"))
                 .await;
         }
 
@@ -1044,7 +1069,13 @@ impl AdapterRouter {
         // coupling): it streams append-only `agent_message_chunk` deltas built from the
         // post+edit (`edit_message` snapshot) path, i.e. streaming=false. Decide it
         // explicitly by platform rather than by whatever Telegram happens to be set to.
-        let streaming = if thread_channel.platform == "acp" {
+        // Runtime identity arrives only in the authoritative ACP terminal
+        // response, not in an agent_message_chunk.  Buffer Discord chunks
+        // while durable delivery is configured so a terminal response cannot
+        // have been made visible by the legacy path first.
+        let durable_discord_candidate =
+            thread_channel.platform == "discord" && self.terminal_delivery_worker.is_some();
+        let streaming = if durable_discord_candidate || thread_channel.platform == "acp" {
             false
         } else {
             adapter.use_streaming(other_bot_present)
@@ -1056,7 +1087,7 @@ impl AdapterRouter {
         // `tool_display`. `streaming` still drives the placeholder / native-stream
         // paths below; only the final-text selection uses `keep_full_text`.
         let keep_full_text = streaming || self.reactions_config.narration_display;
-        let native = adapter.uses_native_streaming(other_bot_present);
+        let native = !durable_discord_candidate && adapter.uses_native_streaming(other_bot_present);
         let assistant_status = adapter.uses_assistant_status();
         // Platforms that render Markdown tables natively (e.g. Slack Block Kit
         // `markdown` blocks / `markdown_text` stream chunks) skip the
@@ -1088,6 +1119,7 @@ impl AdapterRouter {
         let agent_identity_for_hook: Option<AgentIdentity> = current_agent_identity_from_env().ok();
         let session_key_for_hook: String = thread_key.to_string();
         let channel_for_hook: crate::adapter::ChannelRef = thread_channel.clone();
+        let terminal_delivery_worker = self.terminal_delivery_worker.clone();
 
         let inner = self.pool
             .with_connection(thread_key, |conn| {
@@ -1223,6 +1255,7 @@ impl AdapterRouter {
                     // so late responses cannot leak into the next prompt.
                     let mut response_error: Option<String> = None;
                     let mut turn_result = TurnResult::default();
+                    let mut terminal_result: Option<serde_json::Value> = None;
                     let prompt_start = tokio::time::Instant::now();
                     loop {
                         let notification = tokio::select! {
@@ -1285,6 +1318,7 @@ impl AdapterRouter {
                             }
                             if let Some(ref result) = notification.result {
                                 turn_result = parse_turn_result(result);
+                                terminal_result = Some(result.clone());
                             }
                             break;
                         }
@@ -1432,6 +1466,48 @@ impl AdapterRouter {
                     }
 
                     conn.prompt_done().await;
+
+                    // An ACP terminal result that declares Runtime metadata is
+                    // authoritative final delivery input.  Once configured it
+                    // either hands off to the durable worker or fails closed;
+                    // it never falls back to the untracked legacy send/edit path.
+                    if thread_channel.platform == "discord"
+                        && is_terminal_stop_reason(&turn_result)
+                        && terminal_result
+                            .as_ref()
+                            .and_then(|result| result.get("metadata"))
+                            .is_some()
+                    {
+                        let Some(worker) = terminal_delivery_worker.as_ref() else {
+                            tracing::error!("terminal Runtime result received without durable delivery worker; final Discord reply suppressed");
+                            return Err(anyhow::anyhow!("durable terminal delivery is unavailable"));
+                        };
+                        let Some(inbound_message_id) = thread_channel.origin_event_id.as_deref() else {
+                            tracing::error!("terminal Runtime result lacks inbound Discord message identity; final reply suppressed");
+                            return Err(anyhow::anyhow!("durable terminal delivery lacks inbound identity"));
+                        };
+                        let session_id = conn.current_session_id().unwrap_or("");
+                        let metadata = capture_terminal_metadata(
+                            terminal_result.as_ref().expect("checked above"),
+                            request_id,
+                            session_id,
+                        ).map_err(|error| anyhow::anyhow!("durable terminal delivery metadata rejected: {error:?}"))?;
+                        let sender = ChatAdapterTerminalSender::new(adapter.clone());
+                        worker
+                            .capture_and_deliver(metadata, thread_channel.clone(), inbound_message_id, &sender)
+                            .await
+                            .map_err(|error| anyhow::anyhow!("durable terminal delivery capture failed: {error:?}"))?;
+                        return Ok(((), Some(crate::workflow::service::WorkflowTurnHookInputs {
+                            terminal: true,
+                            stop_reason: turn_result.stop_reason.clone(),
+                            raw_assistant_text: text_buf.clone(),
+                            pinned_project_root: pinned_root.clone(),
+                            session_key: session_key.clone(),
+                            channel: channel.clone(),
+                            agent_identity,
+                            native_workflow: None,
+                        })));
+                    }
                     // Stop the cosmetic edit loop before the finalize write path
                     // issues its authoritative edit. Dropping buf_tx closes the watch
                     // channel so the loop breaks on its next check, but it may be

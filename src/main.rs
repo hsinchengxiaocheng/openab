@@ -29,6 +29,8 @@ use openab_core::native_completion::{
     DurableNativeCompletionPort, HttpNativeCompletionPort, NativeCompletionOutbox,
     SharedNativeCompletionPort,
 };
+use openab_core::terminal_delivery::TerminalDeliveryRepository;
+use openab_core::terminal_delivery_worker::{HttpTerminalResultLookup, TerminalDeliveryWorker};
 #[cfg(feature = "discord")]
 use openab_core::remind;
 use openab_core::secrets;
@@ -967,6 +969,38 @@ async fn main() -> anyhow::Result<()> {
         cfg.workflow.parsed_tech_lead_user_ids(),
         cfg.workflow.parsed_bot_user_ids(),
     );
+    // M23 Phase 9C3: this is an opt-in composition of the existing AAP
+    // control-plane authority.  It changes no production configuration and
+    // deliberately has no Runtime execution capability: only the GET-only
+    // terminal-result lookup is installed.
+    let terminal_delivery_worker = cfg.aap_control_plane.as_ref().and_then(|control_plane| {
+        control_plane.resolve_credential().and_then(|credential| {
+            let home = std::env::var("HOME").ok()?;
+            let agent = std::env::var("ARTHUR_AGENT_NAME").ok()?;
+            let path = std::path::PathBuf::from(home)
+                .join(".openab")
+                .join("agents")
+                .join(agent)
+                .join("terminal_delivery.sqlite");
+            match TerminalDeliveryRepository::open_path(path) {
+                Ok(repository) => Some(Arc::new(TerminalDeliveryWorker::new(
+                    Arc::new(repository),
+                    Arc::new(HttpTerminalResultLookup::new(
+                        control_plane.aap_runtime_url.clone(),
+                        credential,
+                    )),
+                ))),
+                Err(error) => {
+                    error!(error = ?error, "durable terminal delivery is unavailable; Runtime terminal replies will fail closed");
+                    None
+                }
+            }
+        })
+    });
+    let router_builder = match terminal_delivery_worker {
+        Some(worker) => router_builder.with_terminal_delivery_worker(worker),
+        None => router_builder,
+    };
     // Native completion uses the dedicated OpenAB bearer only.  The URL is
     // deployment-owned; no credential is ever logged or embedded in config.
     let native_delivery: SharedNativeCompletionPort = Arc::new(

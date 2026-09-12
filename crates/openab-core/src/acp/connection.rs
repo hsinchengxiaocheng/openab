@@ -1026,6 +1026,12 @@ impl AcpConnection {
         Ok((rx, id))
     }
 
+    /// ACP correlation ID for the currently loaded session.  This is transport
+    /// evidence only and is captured with a durable terminal-delivery record.
+    pub fn current_session_id(&self) -> Option<&str> {
+        self.acp_session_id.as_deref()
+    }
+
     /// Call after prompt streaming is done to clean up subscriber.
     pub async fn prompt_done(&mut self) {
         *self.notify_tx.lock().await = None;

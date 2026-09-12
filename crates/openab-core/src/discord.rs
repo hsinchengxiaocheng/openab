@@ -1641,7 +1641,7 @@ impl EventHandler for Handler {
             "processing"
         );
 
-        let thread_channel = if in_thread || is_dm {
+        let mut thread_channel = if in_thread || is_dm {
             // DMs use the DM channel directly (no threads in DMs).
             ChannelRef {
                 platform: "discord".into(),
@@ -1659,6 +1659,10 @@ impl EventHandler for Handler {
                 }
             }
         };
+        // This is the immutable inbound Discord message identity used by the
+        // durable terminal-delivery key.  Thread creation returns a fresh
+        // ChannelRef, so attach it after either branch.
+        thread_channel.origin_event_id = Some(msg.id.to_string());
 
         // Notify user if any images couldn't be processed.
         if !failed_image_files.is_empty() {
