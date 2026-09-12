@@ -295,6 +295,36 @@ pub struct TerminalDeliveryWorker {
     repo: Arc<TerminalDeliveryRepository>,
     lookup: Arc<dyn TerminalResultLookup>,
 }
+
+/// The externally observable result of one bounded restart-reconciliation
+/// action.  A pending record deliberately reports only `Advanced`: sending is
+/// deferred to a subsequent candidate scan after its durable state advance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReconciliationOutcome {
+    Advanced,
+    Delivered,
+    Noop,
+}
+
+/// Per-record batch result. Errors are retained rather than being swallowed so
+/// callers can log/classify the safe domain error while subsequent records
+/// continue to reconcile.
+#[derive(Debug)]
+pub struct ReconciliationRecordResult {
+    pub terminal_delivery_key: String,
+    pub outcome: Result<ReconciliationOutcome, TerminalDeliveryError>,
+}
+
+#[derive(Debug, Default)]
+pub struct ReconciliationBatchSummary {
+    pub processed: usize,
+    pub advanced: usize,
+    pub delivered: usize,
+    pub no_op: usize,
+    pub failed: usize,
+    pub results: Vec<ReconciliationRecordResult>,
+}
+
 impl TerminalDeliveryWorker {
     pub fn new(
         repo: Arc<TerminalDeliveryRepository>,
@@ -438,6 +468,95 @@ impl TerminalDeliveryWorker {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Reconcile one durable terminal-delivery record after restart without
+    /// consulting Runtime or rematerializing the persisted payload.
+    ///
+    /// `PENDING_RESULT` stops after its durable READY transition. This gives
+    /// each reconciliation invocation one durable action and leaves any send
+    /// to a later candidate scan.
+    pub async fn reconcile_record(
+        &self,
+        record: TerminalDeliveryRecordV1,
+        now: chrono::DateTime<Utc>,
+        stale_before: chrono::DateTime<Utc>,
+        sender: &dyn DiscordTerminalDeliverySender,
+    ) -> Result<ReconciliationOutcome, TerminalDeliveryError> {
+        match record.state {
+            TerminalDeliveryState::PendingResult => {
+                self.recover_pending_result(record)?;
+                Ok(ReconciliationOutcome::Advanced)
+            }
+            TerminalDeliveryState::ReadyToDeliver => {
+                let channel = channel_from_record(&record);
+                let recovered = self.recover_ready_or_retry(record, channel, sender).await?;
+                Ok(if recovered.state == TerminalDeliveryState::Delivered {
+                    ReconciliationOutcome::Delivered
+                } else {
+                    ReconciliationOutcome::Advanced
+                })
+            }
+            TerminalDeliveryState::RetryScheduled => {
+                if record.next_attempt_at.is_none_or(|due_at| due_at > now) {
+                    return Ok(ReconciliationOutcome::Noop);
+                }
+                let channel = channel_from_record(&record);
+                let recovered = self.recover_ready_or_retry(record, channel, sender).await?;
+                Ok(if recovered.state == TerminalDeliveryState::Delivered {
+                    ReconciliationOutcome::Delivered
+                } else {
+                    ReconciliationOutcome::Advanced
+                })
+            }
+            TerminalDeliveryState::Delivering => {
+                let before = record.state;
+                let recovered = self.recover_stale_delivering(record, stale_before)?;
+                Ok(if recovered.state != before {
+                    ReconciliationOutcome::Advanced
+                } else {
+                    ReconciliationOutcome::Noop
+                })
+            }
+            TerminalDeliveryState::Ambiguous
+            | TerminalDeliveryState::OperatorHold
+            | TerminalDeliveryState::Delivered
+            | TerminalDeliveryState::PermanentRejected => Ok(ReconciliationOutcome::Noop),
+        }
+    }
+
+    /// Reconcile at most `limit` repository candidates sequentially. This is
+    /// intentionally a caller-driven, bounded helper: it creates no task,
+    /// timer, or periodic background loop.
+    pub async fn reconcile_candidates(
+        &self,
+        now: chrono::DateTime<Utc>,
+        stale_before: chrono::DateTime<Utc>,
+        limit: usize,
+        sender: &dyn DiscordTerminalDeliverySender,
+    ) -> Result<ReconciliationBatchSummary, TerminalDeliveryError> {
+        let candidates = self
+            .repo
+            .list_reconciliation_candidates(now, stale_before, limit)?;
+        let mut summary = ReconciliationBatchSummary::default();
+        for record in candidates {
+            let key = record.terminal_delivery_key.clone();
+            let outcome = self
+                .reconcile_record(record, now, stale_before, sender)
+                .await;
+            summary.processed += 1;
+            match &outcome {
+                Ok(ReconciliationOutcome::Advanced) => summary.advanced += 1,
+                Ok(ReconciliationOutcome::Delivered) => summary.delivered += 1,
+                Ok(ReconciliationOutcome::Noop) => summary.no_op += 1,
+                Err(_) => summary.failed += 1,
+            }
+            summary.results.push(ReconciliationRecordResult {
+                terminal_delivery_key: key,
+                outcome,
+            });
+        }
+        Ok(summary)
     }
 
     async fn deliver_ready(
@@ -611,6 +730,16 @@ impl TerminalDeliveryWorker {
                 )
             }
         }
+    }
+}
+
+fn channel_from_record(record: &TerminalDeliveryRecordV1) -> ChannelRef {
+    ChannelRef {
+        platform: record.platform.clone(),
+        channel_id: record.channel_id.clone(),
+        thread_id: record.thread_id.clone(),
+        parent_id: None,
+        origin_event_id: None,
     }
 }
 
@@ -1640,5 +1769,323 @@ mod tests {
                 .state,
             TerminalDeliveryState::Ambiguous
         );
+    }
+
+    #[tokio::test]
+    async fn restart_reconciliation_advances_pending_then_delivers_on_the_next_run_without_lookup()
+    {
+        let tmp = TempDir::new().unwrap();
+        let repo = Arc::new(TerminalDeliveryRepository::open(tmp.path()).unwrap());
+        let lookup_calls = Arc::new(AtomicUsize::new(0));
+        let worker = TerminalDeliveryWorker::new(
+            repo.clone(),
+            Arc::new(RecordingLookup {
+                value: json!({}),
+                calls: lookup_calls.clone(),
+            }),
+        );
+        let pending = repo
+            .create_or_reuse(crate::terminal_delivery::NewTerminalDeliveryRecord {
+                openab_inbound_turn_id: "discord:restart-pending".into(),
+                platform: "discord".into(),
+                channel_id: "1".into(),
+                thread_id: None,
+                acp_request_id: "q".into(),
+                acp_session_id: "s".into(),
+                runtime_run_id: "r".into(),
+                workflow_run_id: None,
+                conversation_id: "c".into(),
+                response_sequence: 0,
+                terminal_payload: json!({"content":"persisted"}),
+            })
+            .unwrap();
+        let send_calls = Arc::new(AtomicUsize::new(0));
+        let sender = CountingOutcome {
+            outcome: DiscordSendResult::DefiniteSuccess("delivered-next-run".into()),
+            calls: send_calls.clone(),
+        };
+        let now = Utc::now();
+        assert_eq!(
+            worker
+                .reconcile_record(pending.clone(), now, stale_delivering_before(now), &sender)
+                .await
+                .unwrap(),
+            ReconciliationOutcome::Advanced
+        );
+        assert_eq!(send_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(lookup_calls.load(Ordering::SeqCst), 0);
+        let ready = repo.get(&pending.terminal_delivery_key).unwrap().unwrap();
+        assert_eq!(ready.state, TerminalDeliveryState::ReadyToDeliver);
+        assert_eq!(ready.attempt_count, pending.attempt_count);
+        assert_eq!(
+            worker
+                .reconcile_record(ready, now, stale_delivering_before(now), &sender)
+                .await
+                .unwrap(),
+            ReconciliationOutcome::Delivered
+        );
+        assert_eq!(send_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(lookup_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn restart_reconciliation_enforces_due_retry_and_preserves_attempt_budget() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Arc::new(TerminalDeliveryRepository::open(tmp.path()).unwrap());
+        let lookup_calls = Arc::new(AtomicUsize::new(0));
+        let worker = TerminalDeliveryWorker::new(
+            repo.clone(),
+            Arc::new(RecordingLookup {
+                value: json!({}),
+                calls: lookup_calls.clone(),
+            }),
+        );
+        let pending = repo
+            .create_or_reuse(crate::terminal_delivery::NewTerminalDeliveryRecord {
+                openab_inbound_turn_id: "discord:due-retry".into(),
+                platform: "discord".into(),
+                channel_id: "1".into(),
+                thread_id: None,
+                acp_request_id: "q".into(),
+                acp_session_id: "s".into(),
+                runtime_run_id: "r".into(),
+                workflow_run_id: None,
+                conversation_id: "c".into(),
+                response_sequence: 0,
+                terminal_payload: json!({"content":"persisted"}),
+            })
+            .unwrap();
+        let ready = repo
+            .transition(
+                &pending.terminal_delivery_key,
+                pending.state_revision,
+                TerminalDeliveryState::ReadyToDeliver,
+                TransitionUpdate::default(),
+                "TEST_READY",
+            )
+            .unwrap();
+        let delivering = repo
+            .transition(
+                &ready.terminal_delivery_key,
+                ready.state_revision,
+                TerminalDeliveryState::Delivering,
+                TransitionUpdate {
+                    attempt_count: Some(1),
+                    delivery_lease_token: Some(Some("retry-lease".into())),
+                    delivery_started_at: Some(Some(Utc::now())),
+                    ..Default::default()
+                },
+                "TEST_DELIVERING",
+            )
+            .unwrap();
+        let now = Utc::now();
+        let due_retry = repo
+            .transition_with_lease(
+                &delivering.terminal_delivery_key,
+                delivering.state_revision,
+                "retry-lease",
+                TerminalDeliveryState::RetryScheduled,
+                TransitionUpdate {
+                    next_attempt_at: Some(Some(now)),
+                    delivery_lease_token: Some(None),
+                    ..Default::default()
+                },
+                "TEST_RETRY_DUE",
+            )
+            .unwrap();
+        let send_calls = Arc::new(AtomicUsize::new(0));
+        let sender = CountingOutcome {
+            outcome: DiscordSendResult::DefiniteSuccess("due-retry-delivered".into()),
+            calls: send_calls.clone(),
+        };
+        assert_eq!(
+            worker
+                .reconcile_record(due_retry, now, stale_delivering_before(now), &sender)
+                .await
+                .unwrap(),
+            ReconciliationOutcome::Delivered
+        );
+        let delivered = repo.get(&pending.terminal_delivery_key).unwrap().unwrap();
+        assert_eq!(delivered.attempt_count, 2);
+        assert_eq!(lookup_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(send_calls.load(Ordering::SeqCst), 1);
+
+        let future = repo
+            .create_or_reuse(crate::terminal_delivery::NewTerminalDeliveryRecord {
+                openab_inbound_turn_id: "discord:future-retry".into(),
+                platform: "discord".into(),
+                channel_id: "1".into(),
+                thread_id: None,
+                acp_request_id: "q2".into(),
+                acp_session_id: "s".into(),
+                runtime_run_id: "r2".into(),
+                workflow_run_id: None,
+                conversation_id: "c".into(),
+                response_sequence: 0,
+                terminal_payload: json!({"content":"persisted"}),
+            })
+            .unwrap();
+        let future_ready = repo
+            .transition(
+                &future.terminal_delivery_key,
+                future.state_revision,
+                TerminalDeliveryState::ReadyToDeliver,
+                TransitionUpdate::default(),
+                "TEST_READY",
+            )
+            .unwrap();
+        let future_delivering = repo
+            .transition(
+                &future_ready.terminal_delivery_key,
+                future_ready.state_revision,
+                TerminalDeliveryState::Delivering,
+                TransitionUpdate {
+                    delivery_lease_token: Some(Some("future-lease".into())),
+                    delivery_started_at: Some(Some(now)),
+                    ..Default::default()
+                },
+                "TEST_DELIVERING",
+            )
+            .unwrap();
+        let future_retry = repo
+            .transition_with_lease(
+                &future_delivering.terminal_delivery_key,
+                future_delivering.state_revision,
+                "future-lease",
+                TerminalDeliveryState::RetryScheduled,
+                TransitionUpdate {
+                    next_attempt_at: Some(Some(now + Duration::seconds(60))),
+                    delivery_lease_token: Some(None),
+                    ..Default::default()
+                },
+                "TEST_RETRY_FUTURE",
+            )
+            .unwrap();
+        assert_eq!(
+            worker
+                .reconcile_record(
+                    future_retry.clone(),
+                    now,
+                    stale_delivering_before(now),
+                    &sender
+                )
+                .await
+                .unwrap(),
+            ReconciliationOutcome::Noop
+        );
+        assert_eq!(send_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            repo.get(&future_retry.terminal_delivery_key)
+                .unwrap()
+                .unwrap()
+                .attempt_count,
+            future_retry.attempt_count
+        );
+        assert_eq!(lookup_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn restart_reconciliation_batch_is_bounded_and_isolates_record_errors() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Arc::new(TerminalDeliveryRepository::open(tmp.path()).unwrap());
+        let worker = TerminalDeliveryWorker::new(repo.clone(), Arc::new(Lookup(json!({}))));
+        let now = Utc::now();
+        let failing = delivering_record(
+            &repo,
+            "batch-missing-lease",
+            Some(now - Duration::seconds(STALE_DELIVERING_AFTER_SECS + 1)),
+            None,
+        );
+        let ready_source = repo
+            .create_or_reuse(crate::terminal_delivery::NewTerminalDeliveryRecord {
+                openab_inbound_turn_id: "discord:batch-ready".into(),
+                platform: "discord".into(),
+                channel_id: "1".into(),
+                thread_id: None,
+                acp_request_id: "q".into(),
+                acp_session_id: "s".into(),
+                runtime_run_id: "r".into(),
+                workflow_run_id: None,
+                conversation_id: "c".into(),
+                response_sequence: 0,
+                terminal_payload: json!({"content":"persisted"}),
+            })
+            .unwrap();
+        let ready = repo
+            .transition(
+                &ready_source.terminal_delivery_key,
+                ready_source.state_revision,
+                TerminalDeliveryState::ReadyToDeliver,
+                TransitionUpdate::default(),
+                "TEST_READY",
+            )
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sender = CountingOutcome {
+            outcome: DiscordSendResult::DefiniteSuccess("batch-delivered".into()),
+            calls: calls.clone(),
+        };
+        let summary = worker
+            .reconcile_candidates(now, stale_delivering_before(now), 2, &sender)
+            .await
+            .unwrap();
+        assert_eq!(summary.processed, 2);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.delivered, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(summary.results.iter().any(|result| {
+            result.terminal_delivery_key == failing.terminal_delivery_key
+                && matches!(
+                    &result.outcome,
+                    Err(TerminalDeliveryError::MissingDeliveryLeaseToken)
+                )
+        }));
+        assert!(summary.results.iter().any(|result| {
+            result.terminal_delivery_key == ready.terminal_delivery_key
+                && matches!(&result.outcome, Ok(ReconciliationOutcome::Delivered))
+        }));
+    }
+
+    #[tokio::test]
+    async fn restart_reconciliation_marks_only_stale_delivering_ambiguous_without_send_or_lookup() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Arc::new(TerminalDeliveryRepository::open(tmp.path()).unwrap());
+        let lookup_calls = Arc::new(AtomicUsize::new(0));
+        let worker = TerminalDeliveryWorker::new(
+            repo.clone(),
+            Arc::new(RecordingLookup {
+                value: json!({}),
+                calls: lookup_calls.clone(),
+            }),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sender = CountingOutcome {
+            outcome: DiscordSendResult::DefiniteSuccess("must-not-send".into()),
+            calls: calls.clone(),
+        };
+        let now = Utc::now();
+        let stale = delivering_record(
+            &repo,
+            "entry-stale",
+            Some(now - Duration::seconds(STALE_DELIVERING_AFTER_SECS + 1)),
+            Some("stale-lease"),
+        );
+        let fresh = delivering_record(&repo, "entry-fresh", Some(now), Some("fresh-lease"));
+        assert_eq!(
+            worker
+                .reconcile_record(stale, now, stale_delivering_before(now), &sender)
+                .await
+                .unwrap(),
+            ReconciliationOutcome::Advanced
+        );
+        assert_eq!(
+            worker
+                .reconcile_record(fresh, now, stale_delivering_before(now), &sender)
+                .await
+                .unwrap(),
+            ReconciliationOutcome::Noop
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(lookup_calls.load(Ordering::SeqCst), 0);
     }
 }
