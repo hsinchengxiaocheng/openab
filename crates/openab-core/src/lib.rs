@@ -33,6 +33,7 @@ pub mod role_completion_block;
 pub mod secrets;
 pub mod setup;
 pub mod stt;
+pub mod terminal_delivery;
 pub mod timestamp;
 pub mod trust;
 pub mod workflow;
