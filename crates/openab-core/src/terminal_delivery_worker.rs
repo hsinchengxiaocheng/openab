@@ -192,6 +192,68 @@ pub trait DiscordTerminalDeliverySender: Send + Sync {
     async fn send_terminal(&self, channel: &ChannelRef, content: &str) -> DiscordSendResult;
 }
 
+/// Immutable evidence returned by an exact Discord message GET.  This is
+/// deliberately narrower than `ChatAdapter`: reconciliation can inspect a
+/// known message, but cannot create, edit, delete, or search messages.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscordTerminalMessage {
+    pub message_id: String,
+    pub channel_id: String,
+    pub author_id: String,
+    pub content: String,
+}
+
+/// Safe classifications for the one exact-message Discord read used by
+/// ambiguous-delivery reconciliation.  None of the non-`Found` outcomes is
+/// evidence that a terminal message was not delivered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DiscordTerminalDeliveryReadResult {
+    Found(DiscordTerminalMessage),
+    NotFound,
+    Forbidden,
+    TransientFailure { classification: &'static str },
+    Inconclusive { classification: &'static str },
+}
+
+#[async_trait]
+pub trait DiscordTerminalDeliveryReader: Send + Sync {
+    /// Stable Discord user identity for the bot authorized to produce the
+    /// persisted terminal message. Display names are never identity evidence.
+    fn expected_author_id(&self) -> &str;
+
+    /// Read exactly `message_id` from exactly `channel_id`. Implementations
+    /// must not list channel history or use content/time heuristics.
+    async fn get_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+    ) -> DiscordTerminalDeliveryReadResult;
+}
+
+/// Outcome of an AMBIGUOUS known-message verification attempt.  Only
+/// `Delivered` mutates durable state; every other outcome leaves the record
+/// unchanged and must never trigger a send.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KnownMessageVerificationOutcome {
+    Delivered,
+    Noop,
+    NotFound,
+    Forbidden,
+    TransientFailure,
+    Inconclusive,
+    IdentityMismatch,
+}
+
+/// Canonical terminal content sent by the existing Discord terminal path.
+/// `ChannelId::say` receives this exact string: this path performs no split,
+/// markdown transformation, escaping, or suffixing.
+pub fn terminal_content_for_discord(payload: &Value) -> &str {
+    payload
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or(SAFE_FAILED_MESSAGE)
+}
+
 /// Router-facing narrow port. Production delegates to the durable worker;
 /// tests can record this handoff without duplicating delivery semantics.
 #[async_trait]
@@ -408,6 +470,79 @@ impl TerminalDeliveryWorker {
         sender: &dyn DiscordTerminalDeliverySender,
     ) -> Result<TerminalDeliveryRecordV1, TerminalDeliveryError> {
         self.deliver_ready(record, channel, sender).await
+    }
+
+    /// Reconcile one AMBIGUOUS record only when its durable Discord message ID
+    /// is known. This method is intentionally read-only with respect to
+    /// Discord: it never invokes a sender, Runtime lookup, payload
+    /// materialization, history search, or resend path.
+    pub async fn reconcile_ambiguous_with_known_message(
+        &self,
+        record: TerminalDeliveryRecordV1,
+        reader: &dyn DiscordTerminalDeliveryReader,
+    ) -> Result<KnownMessageVerificationOutcome, TerminalDeliveryError> {
+        validate_record_integrity(&record)?;
+        if record.state != TerminalDeliveryState::Ambiguous || record.platform != "discord" {
+            return Ok(KnownMessageVerificationOutcome::Noop);
+        }
+        let Some(message_id) = record.discord_message_id.as_deref() else {
+            return Ok(KnownMessageVerificationOutcome::Noop);
+        };
+        if message_id.is_empty() || reader.expected_author_id().is_empty() {
+            return Ok(KnownMessageVerificationOutcome::Inconclusive);
+        }
+
+        match reader.get_message(&record.channel_id, message_id).await {
+            DiscordTerminalDeliveryReadResult::NotFound => {
+                Ok(KnownMessageVerificationOutcome::NotFound)
+            }
+            DiscordTerminalDeliveryReadResult::Forbidden => {
+                Ok(KnownMessageVerificationOutcome::Forbidden)
+            }
+            DiscordTerminalDeliveryReadResult::TransientFailure { .. } => {
+                Ok(KnownMessageVerificationOutcome::TransientFailure)
+            }
+            DiscordTerminalDeliveryReadResult::Inconclusive { .. } => {
+                Ok(KnownMessageVerificationOutcome::Inconclusive)
+            }
+            DiscordTerminalDeliveryReadResult::Found(message) => {
+                if message.message_id != message_id
+                    || message.channel_id != record.channel_id
+                    || message.author_id != reader.expected_author_id()
+                    || message.content != terminal_content_for_discord(&record.terminal_payload)
+                {
+                    return Ok(KnownMessageVerificationOutcome::IdentityMismatch);
+                }
+                match self.repo.transition(
+                    &record.terminal_delivery_key,
+                    record.state_revision,
+                    TerminalDeliveryState::Delivered,
+                    TransitionUpdate::default(),
+                    "DELIVERY_VERIFIED_BY_MESSAGE_ID",
+                ) {
+                    Ok(_) => Ok(KnownMessageVerificationOutcome::Delivered),
+                    Err(
+                        error @ (TerminalDeliveryError::RevisionConflict { .. }
+                        | TerminalDeliveryError::ImmutableTerminalState(
+                            TerminalDeliveryState::Delivered,
+                        )),
+                    ) => {
+                        let authoritative = self
+                            .repo
+                            .get(&record.terminal_delivery_key)?
+                            .ok_or_else(|| {
+                                TerminalDeliveryError::Storage("lost delivery record".into())
+                            })?;
+                        if authoritative.state == TerminalDeliveryState::Delivered {
+                            Ok(KnownMessageVerificationOutcome::Delivered)
+                        } else {
+                            Err(error)
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        }
     }
 
     /// Convert a stale in-flight claim into an explicit ambiguous outcome.
@@ -635,11 +770,7 @@ impl TerminalDeliveryWorker {
                 Err(error) => return Err(error),
             }
         };
-        let content = claimed
-            .terminal_payload
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or(SAFE_FAILED_MESSAGE);
+        let content = terminal_content_for_discord(&claimed.terminal_payload);
         let attempt = claimed.attempt_count;
         let outcome = sender.send_terminal(&channel, content).await;
         let lease_token = claimed
@@ -819,6 +950,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn terminal_discord_content_is_the_persisted_content_without_formatting() {
+        assert_eq!(
+            terminal_content_for_discord(&json!({"content":"**exact**\n<@1>"})),
+            "**exact**\n<@1>"
+        );
+        assert_eq!(
+            terminal_content_for_discord(&json!({"not_content":"ignored"})),
+            SAFE_FAILED_MESSAGE
+        );
+    }
+
     struct Lookup(Value);
     #[async_trait]
     impl TerminalResultLookup for Lookup {
@@ -880,6 +1023,29 @@ mod tests {
     #[async_trait]
     impl DiscordTerminalDeliverySender for CountingOutcome {
         async fn send_terminal(&self, _: &ChannelRef, _: &str) -> DiscordSendResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.outcome.clone()
+        }
+    }
+
+    struct RecordingReader {
+        expected_author_id: String,
+        outcome: DiscordTerminalDeliveryReadResult,
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl DiscordTerminalDeliveryReader for RecordingReader {
+        fn expected_author_id(&self) -> &str {
+            &self.expected_author_id
+        }
+
+        async fn get_message(
+            &self,
+            channel_id: &str,
+            message_id: &str,
+        ) -> DiscordTerminalDeliveryReadResult {
+            assert_eq!(channel_id, "1");
+            assert_eq!(message_id, "discord-known");
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.outcome.clone()
         }
@@ -949,6 +1115,296 @@ mod tests {
             "TEST_DELIVERING",
         )
         .unwrap()
+    }
+
+    fn ambiguous_record_with_known_message(
+        repo: &TerminalDeliveryRepository,
+    ) -> TerminalDeliveryRecordV1 {
+        let pending = repo
+            .create_or_reuse(crate::terminal_delivery::NewTerminalDeliveryRecord {
+                openab_inbound_turn_id: "discord:known-message".into(),
+                platform: "discord".into(),
+                channel_id: "1".into(),
+                thread_id: None,
+                acp_request_id: "q".into(),
+                acp_session_id: "s".into(),
+                runtime_run_id: "runtime:known-message".into(),
+                workflow_run_id: None,
+                conversation_id: "c".into(),
+                response_sequence: 0,
+                terminal_payload: json!({"content":"persisted"}),
+            })
+            .unwrap();
+        let ready = repo
+            .transition(
+                &pending.terminal_delivery_key,
+                pending.state_revision,
+                TerminalDeliveryState::ReadyToDeliver,
+                TransitionUpdate::default(),
+                "TEST_READY",
+            )
+            .unwrap();
+        let delivering = repo
+            .transition(
+                &ready.terminal_delivery_key,
+                ready.state_revision,
+                TerminalDeliveryState::Delivering,
+                TransitionUpdate {
+                    discord_message_id: Some("discord-known".into()),
+                    ..Default::default()
+                },
+                "TEST_KNOWN_MESSAGE",
+            )
+            .unwrap();
+        repo.transition(
+            &delivering.terminal_delivery_key,
+            delivering.state_revision,
+            TerminalDeliveryState::Ambiguous,
+            TransitionUpdate::default(),
+            "TEST_AMBIGUOUS",
+        )
+        .unwrap()
+    }
+
+    fn found_terminal_message() -> DiscordTerminalDeliveryReadResult {
+        DiscordTerminalDeliveryReadResult::Found(DiscordTerminalMessage {
+            message_id: "discord-known".into(),
+            channel_id: "1".into(),
+            author_id: "bot-1".into(),
+            content: "persisted".into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn known_message_positive_proof_delivers_without_sender_or_runtime_lookup() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Arc::new(TerminalDeliveryRepository::open(tmp.path()).unwrap());
+        let lookup_calls = Arc::new(AtomicUsize::new(0));
+        let worker = TerminalDeliveryWorker::new(
+            repo.clone(),
+            Arc::new(RecordingLookup {
+                value: json!({}),
+                calls: lookup_calls.clone(),
+            }),
+        );
+        let ambiguous = ambiguous_record_with_known_message(&repo);
+        let reader_calls = Arc::new(AtomicUsize::new(0));
+        let reader = RecordingReader {
+            expected_author_id: "bot-1".into(),
+            outcome: found_terminal_message(),
+            calls: reader_calls.clone(),
+        };
+
+        assert_eq!(
+            worker
+                .reconcile_ambiguous_with_known_message(ambiguous.clone(), &reader)
+                .await
+                .unwrap(),
+            KnownMessageVerificationOutcome::Delivered
+        );
+        let delivered = repo.get(&ambiguous.terminal_delivery_key).unwrap().unwrap();
+        assert_eq!(delivered.state, TerminalDeliveryState::Delivered);
+        assert_eq!(
+            delivered.discord_message_id.as_deref(),
+            Some("discord-known")
+        );
+        assert_eq!(lookup_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(reader_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            repo.events(&ambiguous.terminal_delivery_key)
+                .unwrap()
+                .last()
+                .unwrap()
+                .safe_reason_code,
+            "DELIVERY_VERIFIED_BY_MESSAGE_ID"
+        );
+    }
+
+    #[tokio::test]
+    async fn known_message_nonproof_outcomes_keep_ambiguous_without_sender_or_runtime_lookup() {
+        let scenarios = vec![
+            (
+                DiscordTerminalDeliveryReadResult::NotFound,
+                KnownMessageVerificationOutcome::NotFound,
+            ),
+            (
+                DiscordTerminalDeliveryReadResult::Forbidden,
+                KnownMessageVerificationOutcome::Forbidden,
+            ),
+            (
+                DiscordTerminalDeliveryReadResult::TransientFailure {
+                    classification: "DISCORD_MESSAGE_VERIFICATION_RATE_LIMITED",
+                },
+                KnownMessageVerificationOutcome::TransientFailure,
+            ),
+            (
+                DiscordTerminalDeliveryReadResult::Inconclusive {
+                    classification: "DISCORD_MESSAGE_VERIFICATION_TRANSPORT",
+                },
+                KnownMessageVerificationOutcome::Inconclusive,
+            ),
+        ];
+        for (outcome, expected) in scenarios {
+            let tmp = TempDir::new().unwrap();
+            let repo = Arc::new(TerminalDeliveryRepository::open(tmp.path()).unwrap());
+            let lookup_calls = Arc::new(AtomicUsize::new(0));
+            let worker = TerminalDeliveryWorker::new(
+                repo.clone(),
+                Arc::new(RecordingLookup {
+                    value: json!({}),
+                    calls: lookup_calls.clone(),
+                }),
+            );
+            let ambiguous = ambiguous_record_with_known_message(&repo);
+            let reader = RecordingReader {
+                expected_author_id: "bot-1".into(),
+                outcome,
+                calls: Arc::new(AtomicUsize::new(0)),
+            };
+            assert_eq!(
+                worker
+                    .reconcile_ambiguous_with_known_message(ambiguous.clone(), &reader)
+                    .await
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(
+                repo.get(&ambiguous.terminal_delivery_key)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                TerminalDeliveryState::Ambiguous
+            );
+            assert_eq!(lookup_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn known_message_identity_mismatches_and_missing_id_are_safe_noops() {
+        for mismatch in [
+            DiscordTerminalMessage {
+                message_id: "wrong".into(),
+                channel_id: "1".into(),
+                author_id: "bot-1".into(),
+                content: "persisted".into(),
+            },
+            DiscordTerminalMessage {
+                message_id: "discord-known".into(),
+                channel_id: "wrong".into(),
+                author_id: "bot-1".into(),
+                content: "persisted".into(),
+            },
+            DiscordTerminalMessage {
+                message_id: "discord-known".into(),
+                channel_id: "1".into(),
+                author_id: "wrong".into(),
+                content: "persisted".into(),
+            },
+            DiscordTerminalMessage {
+                message_id: "discord-known".into(),
+                channel_id: "1".into(),
+                author_id: "bot-1".into(),
+                content: "wrong".into(),
+            },
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let repo = Arc::new(TerminalDeliveryRepository::open(tmp.path()).unwrap());
+            let worker = TerminalDeliveryWorker::new(repo.clone(), Arc::new(Lookup(json!({}))));
+            let ambiguous = ambiguous_record_with_known_message(&repo);
+            let reader = RecordingReader {
+                expected_author_id: "bot-1".into(),
+                outcome: DiscordTerminalDeliveryReadResult::Found(mismatch),
+                calls: Arc::new(AtomicUsize::new(0)),
+            };
+            assert_eq!(
+                worker
+                    .reconcile_ambiguous_with_known_message(ambiguous.clone(), &reader)
+                    .await
+                    .unwrap(),
+                KnownMessageVerificationOutcome::IdentityMismatch
+            );
+            assert_eq!(
+                repo.get(&ambiguous.terminal_delivery_key)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                TerminalDeliveryState::Ambiguous
+            );
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let repo = Arc::new(TerminalDeliveryRepository::open(tmp.path()).unwrap());
+        let worker = TerminalDeliveryWorker::new(repo.clone(), Arc::new(Lookup(json!({}))));
+        let mut no_id = ambiguous_record_with_known_message(&repo);
+        no_id.discord_message_id = None;
+        let reader_calls = Arc::new(AtomicUsize::new(0));
+        let reader = RecordingReader {
+            expected_author_id: "bot-1".into(),
+            outcome: found_terminal_message(),
+            calls: reader_calls.clone(),
+        };
+        assert_eq!(
+            worker
+                .reconcile_ambiguous_with_known_message(no_id, &reader)
+                .await
+                .unwrap(),
+            KnownMessageVerificationOutcome::Noop
+        );
+        assert_eq!(reader_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_known_message_verifiers_have_one_transition_winner_and_one_safe_success() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Arc::new(TerminalDeliveryRepository::open(tmp.path()).unwrap());
+        let worker = Arc::new(TerminalDeliveryWorker::new(
+            repo.clone(),
+            Arc::new(Lookup(json!({}))),
+        ));
+        let ambiguous = ambiguous_record_with_known_message(&repo);
+        let key = ambiguous.terminal_delivery_key.clone();
+        let reader_calls = Arc::new(AtomicUsize::new(0));
+        let reader = Arc::new(RecordingReader {
+            expected_author_id: "bot-1".into(),
+            outcome: found_terminal_message(),
+            calls: reader_calls.clone(),
+        });
+        let first = {
+            let worker = worker.clone();
+            let reader = reader.clone();
+            let record = ambiguous.clone();
+            tokio::spawn(async move {
+                worker
+                    .reconcile_ambiguous_with_known_message(record, reader.as_ref())
+                    .await
+            })
+        };
+        let second = {
+            let worker = worker.clone();
+            let reader = reader.clone();
+            tokio::spawn(async move {
+                worker
+                    .reconcile_ambiguous_with_known_message(ambiguous, reader.as_ref())
+                    .await
+            })
+        };
+        assert_eq!(
+            first.await.unwrap().unwrap(),
+            KnownMessageVerificationOutcome::Delivered
+        );
+        assert_eq!(
+            second.await.unwrap().unwrap(),
+            KnownMessageVerificationOutcome::Delivered
+        );
+        assert_eq!(reader_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            repo.events(&key)
+                .unwrap()
+                .iter()
+                .filter(|event| event.safe_reason_code == "DELIVERY_VERIFIED_BY_MESSAGE_ID")
+                .count(),
+            1
+        );
     }
 
     async fn deliver_outcome(outcome: DiscordSendResult) -> TerminalDeliveryRecordV1 {

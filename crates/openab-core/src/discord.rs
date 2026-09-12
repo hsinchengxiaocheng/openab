@@ -9,6 +9,9 @@ use crate::dispatch::DispatchTarget;
 use crate::format;
 use crate::media;
 use crate::remind::{self, ReminderStore};
+use crate::terminal_delivery_worker::{
+    DiscordTerminalDeliveryReadResult, DiscordTerminalDeliveryReader, DiscordTerminalMessage,
+};
 use crate::trust::l3_gate_applies;
 use async_trait::async_trait;
 use serenity::builder::{
@@ -72,6 +75,91 @@ pub struct DiscordAdapter {
     http: Arc<Http>,
     diagnostic_client: Arc<dyn DiagnosticDiscordClient>,
     adapter_instance_id: String,
+}
+
+/// Exact-message reader for durable terminal-delivery reconciliation. It owns
+/// the same Serenity `Arc<Http>` as the concrete Discord adapter and exposes
+/// no write or history-listing operations.
+#[derive(Clone)]
+pub struct SerenityDiscordTerminalDeliveryReader {
+    http: Arc<Http>,
+    expected_author_id: String,
+}
+
+impl SerenityDiscordTerminalDeliveryReader {
+    pub fn from_adapter(adapter: &DiscordAdapter, expected_author_id: UserId) -> Self {
+        Self {
+            http: adapter.http.clone(),
+            expected_author_id: expected_author_id.to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl DiscordTerminalDeliveryReader for SerenityDiscordTerminalDeliveryReader {
+    fn expected_author_id(&self) -> &str {
+        &self.expected_author_id
+    }
+
+    async fn get_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+    ) -> DiscordTerminalDeliveryReadResult {
+        let (Ok(channel_id), Ok(message_id)) =
+            (channel_id.parse::<u64>(), message_id.parse::<u64>())
+        else {
+            return DiscordTerminalDeliveryReadResult::Inconclusive {
+                classification: "DISCORD_INVALID_MESSAGE_IDENTITY",
+            };
+        };
+        match ChannelId::new(channel_id)
+            .message(&self.http, MessageId::new(message_id))
+            .await
+        {
+            Ok(message) => DiscordTerminalDeliveryReadResult::Found(DiscordTerminalMessage {
+                message_id: message.id.to_string(),
+                channel_id: message.channel_id.to_string(),
+                author_id: message.author.id.to_string(),
+                content: message.content,
+            }),
+            Err(error) => classify_terminal_delivery_read_error(&error),
+        }
+    }
+}
+
+fn classify_terminal_delivery_read_error(
+    error: &serenity::Error,
+) -> DiscordTerminalDeliveryReadResult {
+    use serenity::http::HttpError;
+
+    match error {
+        serenity::Error::Http(HttpError::UnsuccessfulRequest(response)) => {
+            match response.status_code.as_u16() {
+                404 => DiscordTerminalDeliveryReadResult::NotFound,
+                403 => DiscordTerminalDeliveryReadResult::Forbidden,
+                429 => DiscordTerminalDeliveryReadResult::TransientFailure {
+                    classification: "DISCORD_MESSAGE_VERIFICATION_RATE_LIMITED",
+                },
+                500..=599 => DiscordTerminalDeliveryReadResult::TransientFailure {
+                    classification: "DISCORD_MESSAGE_VERIFICATION_HTTP_5XX",
+                },
+                _ => DiscordTerminalDeliveryReadResult::Inconclusive {
+                    classification: "DISCORD_MESSAGE_VERIFICATION_HTTP_INCONCLUSIVE",
+                },
+            }
+        }
+        serenity::Error::Http(HttpError::Request(request_error))
+            if request_error.is_connect() || request_error.is_timeout() =>
+        {
+            DiscordTerminalDeliveryReadResult::TransientFailure {
+                classification: "DISCORD_MESSAGE_VERIFICATION_TRANSPORT",
+            }
+        }
+        _ => DiscordTerminalDeliveryReadResult::Inconclusive {
+            classification: "DISCORD_MESSAGE_VERIFICATION_INCONCLUSIVE",
+        },
+    }
 }
 
 /// Safe, bounded details from a Discord REST failure.
