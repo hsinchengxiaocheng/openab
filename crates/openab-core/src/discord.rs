@@ -10,7 +10,8 @@ use crate::format;
 use crate::media;
 use crate::remind::{self, ReminderStore};
 use crate::terminal_delivery_worker::{
-    DiscordTerminalDeliveryReadResult, DiscordTerminalDeliveryReader, DiscordTerminalMessage,
+    ChatAdapterTerminalSender, DiscordTerminalDeliveryReadResult, DiscordTerminalDeliveryReader,
+    DiscordTerminalMessage, TerminalDeliveryReconciliationManager, TerminalDeliveryWorker,
 };
 use crate::trust::l3_gate_applies;
 use async_trait::async_trait;
@@ -87,11 +88,15 @@ pub struct SerenityDiscordTerminalDeliveryReader {
 }
 
 impl SerenityDiscordTerminalDeliveryReader {
-    pub fn from_adapter(adapter: &DiscordAdapter, expected_author_id: UserId) -> Self {
+    pub fn new(http: Arc<Http>, expected_author_id: UserId) -> Self {
         Self {
-            http: adapter.http.clone(),
+            http,
             expected_author_id: expected_author_id.to_string(),
         }
+    }
+
+    pub fn from_adapter(adapter: &DiscordAdapter, expected_author_id: UserId) -> Self {
+        Self::new(adapter.http.clone(), expected_author_id)
     }
 }
 
@@ -760,6 +765,11 @@ pub struct Handler {
     pub reminder_store: ReminderStore,
     /// Track scheduled reminder IDs to prevent duplicate scheduling on reconnect.
     pub scheduled_ids: tokio::sync::Mutex<std::collections::HashSet<String>>,
+    /// Optional Phase 9C4.6 lifecycle input. It is deliberately constructed
+    /// only after Serenity reports the authenticated bot identity in `ready`.
+    pub terminal_delivery_worker: Option<Arc<TerminalDeliveryWorker>>,
+    pub terminal_delivery_shutdown: tokio::sync::watch::Receiver<bool>,
+    pub terminal_delivery_manager: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Handler {
@@ -2251,6 +2261,31 @@ impl EventHandler for Handler {
             }
             if count > 0 {
                 info!(count, "re-scheduled pending reminders");
+            }
+        }
+
+        // Start recovery only after the concrete Discord HTTP dependency and
+        // authenticated bot identity are both available.  Reconnect-ready
+        // events do not create a second loop for this handler instance.
+        if let Some(worker) = self.terminal_delivery_worker.as_ref() {
+            let mut manager_handle = self.terminal_delivery_manager.lock().unwrap();
+            if manager_handle.is_none() {
+                let sender: Arc<
+                    dyn crate::terminal_delivery_worker::DiscordTerminalDeliverySender,
+                > = Arc::new(ChatAdapterTerminalSender::new(Arc::new(
+                    DiscordAdapter::new(ctx.http.clone()),
+                )));
+                let reader: Arc<dyn DiscordTerminalDeliveryReader> = Arc::new(
+                    SerenityDiscordTerminalDeliveryReader::new(ctx.http.clone(), ready.user.id),
+                );
+                let manager = Arc::new(TerminalDeliveryReconciliationManager::new(
+                    worker.repository(),
+                    worker.clone(),
+                    sender,
+                    reader,
+                ));
+                *manager_handle = Some(manager.spawn(self.terminal_delivery_shutdown.clone()));
+                info!("started terminal delivery reconciliation manager");
             }
         }
     }

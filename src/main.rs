@@ -29,14 +29,14 @@ use openab_core::native_completion::{
     DurableNativeCompletionPort, HttpNativeCompletionPort, NativeCompletionOutbox,
     SharedNativeCompletionPort,
 };
-use openab_core::terminal_delivery::TerminalDeliveryRepository;
-use openab_core::terminal_delivery_worker::{HttpTerminalResultLookup, TerminalDeliveryWorker};
 #[cfg(feature = "discord")]
 use openab_core::remind;
 use openab_core::secrets;
 use openab_core::setup;
 #[cfg(feature = "slack")]
 use openab_core::slack;
+use openab_core::terminal_delivery::TerminalDeliveryRepository;
+use openab_core::terminal_delivery_worker::{HttpTerminalResultLookup, TerminalDeliveryWorker};
 use openab_core::workflow::{ChatAdapterWorkflowMessenger, WorkflowService};
 
 use clap::Parser;
@@ -997,8 +997,8 @@ async fn main() -> anyhow::Result<()> {
             }
         })
     });
-    let router_builder = match terminal_delivery_worker {
-        Some(worker) => router_builder.with_terminal_delivery_worker(worker),
+    let router_builder = match terminal_delivery_worker.as_ref() {
+        Some(worker) => router_builder.with_terminal_delivery_worker(worker.clone()),
         None => router_builder,
     };
     // Native completion uses the dedicated OpenAB bearer only.  The URL is
@@ -2187,6 +2187,9 @@ async fn main() -> anyhow::Result<()> {
             ambient: ambient_dispatcher,
             reminder_store: reminder_store.clone(),
             scheduled_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+            terminal_delivery_worker: terminal_delivery_worker.clone(),
+            terminal_delivery_shutdown: shutdown_rx.clone(),
+            terminal_delivery_manager: Mutex::new(None),
         };
 
         let intents = GatewayIntents::GUILD_MESSAGES

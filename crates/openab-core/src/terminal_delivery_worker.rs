@@ -6,14 +6,17 @@
 
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::future::Future;
 use std::sync::Arc;
+use tokio::sync::{watch, Mutex};
+use tokio::task::JoinHandle;
+use tracing::{error, info, warn};
 
 use crate::adapter::{ChannelRef, ChatAdapter};
 use crate::terminal_delivery::{
-    NewTerminalDeliveryRecord, TerminalDeliveryError, TerminalDeliveryRecordV1,
-    TerminalDeliveryRepository, TerminalDeliveryState, TransitionUpdate, validate_record_integrity,
+    validate_record_integrity, NewTerminalDeliveryRecord, TerminalDeliveryError,
+    TerminalDeliveryRecordV1, TerminalDeliveryRepository, TerminalDeliveryState, TransitionUpdate,
 };
 
 pub const SAFE_FAILED_MESSAGE: &str =
@@ -27,6 +30,12 @@ pub const MAX_AMBIGUOUS_RECONCILIATION_ATTEMPTS: usize = 3;
 /// A delivery claim older than this is no longer treated as live.  Its
 /// outbound outcome is unknown, so recovery may only declare it ambiguous.
 pub const STALE_DELIVERING_AFTER_SECS: i64 = 300;
+/// Bounded number of records handled by one startup or periodic scan.
+pub const TERMINAL_RECONCILIATION_BATCH_LIMIT: usize = 50;
+/// Fixed cadence for restart reconciliation.  This is intentionally code-owned
+/// for Phase 9C4.6 rather than a new production configuration surface.
+pub const TERMINAL_RECONCILIATION_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(45);
 const RETRY_DELAYS_SECS: [u64; MAX_EXTERNAL_ATTEMPTS as usize] = [1, 5, 30, 120, 600];
 /// Bounds one Serenity-managed terminal send, including any internal 429
 /// sleep/retry. An expiry is ambiguous because a write may already be accepted.
@@ -402,12 +411,172 @@ pub struct ReconciliationBatchSummary {
     pub results: Vec<ReconciliationRecordResult>,
 }
 
+/// Aggregate result for one lifecycle-manager scan.  The worker remains the
+/// sole owner of delivery/reconciliation state policy; this type only reports
+/// the manager's bounded routing work.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TerminalDeliveryReconciliationSummary {
+    pub candidates: usize,
+    pub advanced: usize,
+    pub delivered: usize,
+    pub held: usize,
+    pub no_op: usize,
+    pub failed: usize,
+}
+
+/// Lifecycle orchestration for durable terminal-delivery recovery.
+///
+/// This deliberately holds both Discord authorities but routes them through
+/// separate worker APIs: only READY/due RETRY records see `sender`, and only
+/// AMBIGUOUS records see `reader`.  Durable repository CAS/lease operations
+/// remain the correctness authority across manager instances.
+pub struct TerminalDeliveryReconciliationManager {
+    repository: Arc<TerminalDeliveryRepository>,
+    worker: Arc<TerminalDeliveryWorker>,
+    sender: Arc<dyn DiscordTerminalDeliverySender>,
+    reader: Arc<dyn DiscordTerminalDeliveryReader>,
+    single_flight: Mutex<()>,
+}
+
+impl TerminalDeliveryReconciliationManager {
+    pub fn new(
+        repository: Arc<TerminalDeliveryRepository>,
+        worker: Arc<TerminalDeliveryWorker>,
+        sender: Arc<dyn DiscordTerminalDeliverySender>,
+        reader: Arc<dyn DiscordTerminalDeliveryReader>,
+    ) -> Self {
+        Self {
+            repository,
+            worker,
+            sender,
+            reader,
+            single_flight: Mutex::new(()),
+        }
+    }
+
+    /// Process one deterministic, bounded repository snapshot.  A failed
+    /// record is retained in the summary and does not prevent later records
+    /// in this same batch from being processed.
+    pub async fn reconcile_once(
+        &self,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<TerminalDeliveryReconciliationSummary, TerminalDeliveryError> {
+        let _single_flight = self.single_flight.lock().await;
+        let stale_before = stale_delivering_before(now);
+        let candidates = self.repository.list_reconciliation_candidates(
+            now,
+            stale_before,
+            TERMINAL_RECONCILIATION_BATCH_LIMIT,
+        )?;
+        let mut summary = TerminalDeliveryReconciliationSummary {
+            candidates: candidates.len(),
+            ..Default::default()
+        };
+
+        for record in candidates {
+            let key = record.terminal_delivery_key.clone();
+            match record.state {
+                TerminalDeliveryState::Ambiguous => {
+                    match self
+                        .worker
+                        .reconcile_ambiguous(record, self.reader.as_ref())
+                        .await
+                    {
+                        Ok(AmbiguousReconciliationOutcome::Delivered) => summary.delivered += 1,
+                        Ok(AmbiguousReconciliationOutcome::Held) => summary.held += 1,
+                        Ok(
+                            AmbiguousReconciliationOutcome::StillAmbiguous
+                            | AmbiguousReconciliationOutcome::Noop,
+                        ) => summary.no_op += 1,
+                        Err(error) => {
+                            summary.failed += 1;
+                            warn!(terminal_delivery_key = %key, error = %error, "terminal delivery ambiguous reconciliation failed");
+                        }
+                    }
+                }
+                _ => match self
+                    .worker
+                    .reconcile_record(record, now, stale_before, self.sender.as_ref())
+                    .await
+                {
+                    Ok(ReconciliationOutcome::Advanced) => summary.advanced += 1,
+                    Ok(ReconciliationOutcome::Delivered) => summary.delivered += 1,
+                    Ok(ReconciliationOutcome::Noop) => summary.no_op += 1,
+                    Err(error) => {
+                        summary.failed += 1;
+                        warn!(terminal_delivery_key = %key, error = %error, "terminal delivery reconciliation failed");
+                    }
+                },
+            }
+        }
+        Ok(summary)
+    }
+
+    /// Run the required startup pass, then one scan per fixed interval until
+    /// the application's existing shutdown watch is signalled.
+    pub fn spawn(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            if *shutdown.borrow() {
+                return;
+            }
+            if let Err(error) = self.reconcile_and_log("startup").await {
+                error!(error = %error, "terminal delivery startup reconciliation scan failed");
+            }
+
+            let mut interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + TERMINAL_RECONCILIATION_INTERVAL,
+                TERMINAL_RECONCILIATION_INTERVAL,
+            );
+            loop {
+                tokio::select! {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            break;
+                        }
+                    }
+                    _ = interval.tick() => {
+                        if *shutdown.borrow() {
+                            break;
+                        }
+                        if let Err(error) = self.reconcile_and_log("periodic").await {
+                            error!(error = %error, "terminal delivery periodic reconciliation scan failed");
+                        }
+                    }
+                }
+            }
+            info!("terminal delivery reconciliation manager stopped");
+        })
+    }
+
+    async fn reconcile_and_log(&self, phase: &'static str) -> Result<(), TerminalDeliveryError> {
+        let summary = self.reconcile_once(Utc::now()).await?;
+        info!(
+            phase,
+            candidates = summary.candidates,
+            advanced = summary.advanced,
+            delivered = summary.delivered,
+            held = summary.held,
+            no_op = summary.no_op,
+            failed = summary.failed,
+            "terminal delivery reconciliation scan completed"
+        );
+        Ok(())
+    }
+}
+
 impl TerminalDeliveryWorker {
     pub fn new(
         repo: Arc<TerminalDeliveryRepository>,
         lookup: Arc<dyn TerminalResultLookup>,
     ) -> Self {
         Self { repo, lookup }
+    }
+
+    /// Shared durable store for composition of the lifecycle manager.  The
+    /// repository still owns candidate ordering and all compare-and-swap
+    /// transitions; callers receive no alternate mutation path.
+    pub fn repository(&self) -> Arc<TerminalDeliveryRepository> {
+        self.repo.clone()
     }
     pub async fn capture_and_deliver(
         &self,
@@ -1017,8 +1186,8 @@ impl TerminalDeliveryPort for TerminalDeliveryWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Barrier;
     use std::thread;
     use tempfile::TempDir;
 
@@ -1293,6 +1462,265 @@ mod tests {
             author_id: "bot-1".into(),
             content: "persisted".into(),
         })
+    }
+
+    fn pending_record(repo: &TerminalDeliveryRepository, suffix: &str) -> TerminalDeliveryRecordV1 {
+        repo.create_or_reuse(crate::terminal_delivery::NewTerminalDeliveryRecord {
+            openab_inbound_turn_id: format!("discord:manager:{suffix}"),
+            platform: "discord".into(),
+            channel_id: "1".into(),
+            thread_id: None,
+            acp_request_id: "q".into(),
+            acp_session_id: "s".into(),
+            runtime_run_id: format!("runtime:manager:{suffix}"),
+            workflow_run_id: None,
+            conversation_id: "c".into(),
+            response_sequence: 0,
+            terminal_payload: json!({"content":"persisted"}),
+        })
+        .unwrap()
+    }
+
+    fn reconciliation_manager(
+        repo: Arc<TerminalDeliveryRepository>,
+        sender: Arc<dyn DiscordTerminalDeliverySender>,
+        reader: Arc<dyn DiscordTerminalDeliveryReader>,
+    ) -> TerminalDeliveryReconciliationManager {
+        let worker = Arc::new(TerminalDeliveryWorker::new(
+            repo.clone(),
+            Arc::new(Lookup(json!({}))),
+        ));
+        TerminalDeliveryReconciliationManager::new(repo, worker, sender, reader)
+    }
+
+    #[tokio::test]
+    async fn reconciliation_manager_routes_mixed_candidates_without_crossing_discord_authorities() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Arc::new(TerminalDeliveryRepository::open(tmp.path()).unwrap());
+        let pending = pending_record(&repo, "pending");
+        let ready_source = pending_record(&repo, "ready");
+        let ready = repo
+            .transition(
+                &ready_source.terminal_delivery_key,
+                ready_source.state_revision,
+                TerminalDeliveryState::ReadyToDeliver,
+                TransitionUpdate::default(),
+                "TEST_READY",
+            )
+            .unwrap();
+        let stale = delivering_record(
+            &repo,
+            "stale",
+            Some(Utc::now() - Duration::seconds(STALE_DELIVERING_AFTER_SECS + 1)),
+            Some("lease"),
+        );
+        let ambiguous = ambiguous_record_with_known_message(&repo);
+        let sender_calls = Arc::new(AtomicUsize::new(0));
+        let reader_calls = Arc::new(AtomicUsize::new(0));
+        let manager = reconciliation_manager(
+            repo.clone(),
+            Arc::new(CountingOutcome {
+                outcome: DiscordSendResult::DefiniteSuccess("sent".into()),
+                calls: sender_calls.clone(),
+            }),
+            Arc::new(RecordingReader {
+                expected_author_id: "bot-1".into(),
+                outcome: found_terminal_message(),
+                calls: reader_calls.clone(),
+            }),
+        );
+
+        let summary = manager.reconcile_once(Utc::now()).await.unwrap();
+        assert_eq!(summary.candidates, 4);
+        assert_eq!(summary.advanced, 2);
+        assert_eq!(summary.delivered, 2);
+        assert_eq!(
+            sender_calls.load(Ordering::SeqCst),
+            1,
+            "only READY was sent"
+        );
+        assert_eq!(
+            reader_calls.load(Ordering::SeqCst),
+            1,
+            "only AMBIGUOUS was read"
+        );
+        assert_eq!(
+            repo.get(&pending.terminal_delivery_key)
+                .unwrap()
+                .unwrap()
+                .state,
+            TerminalDeliveryState::ReadyToDeliver
+        );
+        assert_eq!(
+            repo.get(&ready.terminal_delivery_key)
+                .unwrap()
+                .unwrap()
+                .state,
+            TerminalDeliveryState::Delivered
+        );
+        assert_eq!(
+            repo.get(&stale.terminal_delivery_key)
+                .unwrap()
+                .unwrap()
+                .state,
+            TerminalDeliveryState::Ambiguous
+        );
+        assert_eq!(
+            repo.get(&ambiguous.terminal_delivery_key)
+                .unwrap()
+                .unwrap()
+                .state,
+            TerminalDeliveryState::Delivered
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconciliation_manager_runs_startup_then_periodically_and_stops_on_shutdown() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Arc::new(TerminalDeliveryRepository::open(tmp.path()).unwrap());
+        let pending = pending_record(&repo, "periodic");
+        let sender_calls = Arc::new(AtomicUsize::new(0));
+        let manager = Arc::new(reconciliation_manager(
+            repo.clone(),
+            Arc::new(CountingOutcome {
+                outcome: DiscordSendResult::DefiniteSuccess("sent".into()),
+                calls: sender_calls.clone(),
+            }),
+            Arc::new(RecordingReader {
+                expected_author_id: "bot-1".into(),
+                outcome: found_terminal_message(),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        ));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = manager.spawn(shutdown_rx);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            repo.get(&pending.terminal_delivery_key)
+                .unwrap()
+                .unwrap()
+                .state,
+            TerminalDeliveryState::ReadyToDeliver
+        );
+        assert_eq!(sender_calls.load(Ordering::SeqCst), 0);
+        tokio::time::advance(TERMINAL_RECONCILIATION_INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert_eq!(sender_calls.load(Ordering::SeqCst), 1);
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+        tokio::time::advance(TERMINAL_RECONCILIATION_INTERVAL * 2).await;
+        assert_eq!(sender_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_manager_limits_each_scan_and_later_scans_progress_remaining_records() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Arc::new(TerminalDeliveryRepository::open(tmp.path()).unwrap());
+        for i in 0..=TERMINAL_RECONCILIATION_BATCH_LIMIT {
+            let pending = pending_record(&repo, &format!("batch-{i}"));
+            repo.transition(
+                &pending.terminal_delivery_key,
+                pending.state_revision,
+                TerminalDeliveryState::ReadyToDeliver,
+                TransitionUpdate::default(),
+                "TEST_READY",
+            )
+            .unwrap();
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let manager = reconciliation_manager(
+            repo.clone(),
+            Arc::new(CountingOutcome {
+                outcome: DiscordSendResult::DefiniteSuccess("sent".into()),
+                calls: calls.clone(),
+            }),
+            Arc::new(RecordingReader {
+                expected_author_id: "bot-1".into(),
+                outcome: found_terminal_message(),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let first = manager.reconcile_once(Utc::now()).await.unwrap();
+        assert_eq!(first.candidates, TERMINAL_RECONCILIATION_BATCH_LIMIT);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            TERMINAL_RECONCILIATION_BATCH_LIMIT
+        );
+        let second = manager.reconcile_once(Utc::now()).await.unwrap();
+        assert_eq!(second.candidates, 1);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            TERMINAL_RECONCILIATION_BATCH_LIMIT + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_manager_isolates_record_failure_and_concurrent_managers_claim_one_send()
+    {
+        let tmp = TempDir::new().unwrap();
+        let repo = Arc::new(TerminalDeliveryRepository::open(tmp.path()).unwrap());
+        delivering_record(&repo, "missing-lease", None, None);
+        let ready = pending_record(&repo, "concurrent-ready");
+        let ready = repo
+            .transition(
+                &ready.terminal_delivery_key,
+                ready.state_revision,
+                TerminalDeliveryState::ReadyToDeliver,
+                TransitionUpdate::default(),
+                "TEST_READY",
+            )
+            .unwrap();
+        let ambiguous = ambiguous_record_with_known_message(&repo);
+        let sends = Arc::new(AtomicUsize::new(0));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let make_manager = || {
+            reconciliation_manager(
+                repo.clone(),
+                Arc::new(CountingOutcome {
+                    outcome: DiscordSendResult::DefiniteSuccess("sent".into()),
+                    calls: sends.clone(),
+                }),
+                Arc::new(RecordingReader {
+                    expected_author_id: "bot-1".into(),
+                    outcome: found_terminal_message(),
+                    calls: reads.clone(),
+                }),
+            )
+        };
+        let one = Arc::new(make_manager());
+        let two = Arc::new(make_manager());
+        let (a, b) = tokio::join!(
+            one.reconcile_once(Utc::now()),
+            two.reconcile_once(Utc::now())
+        );
+        assert_eq!(
+            a.unwrap().failed + b.unwrap().failed,
+            2,
+            "unfenced record is reported by both scans"
+        );
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            1,
+            "CAS permits one READY sender"
+        );
+        assert!(
+            reads.load(Ordering::SeqCst) <= 2,
+            "durable read budget remains bounded"
+        );
+        assert_eq!(
+            repo.get(&ready.terminal_delivery_key)
+                .unwrap()
+                .unwrap()
+                .state,
+            TerminalDeliveryState::Delivered
+        );
+        assert_eq!(
+            repo.get(&ambiguous.terminal_delivery_key)
+                .unwrap()
+                .unwrap()
+                .state,
+            TerminalDeliveryState::Delivered
+        );
     }
 
     #[tokio::test]
