@@ -6,20 +6,24 @@
 
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::future::Future;
 use std::sync::Arc;
 
 use crate::adapter::{ChannelRef, ChatAdapter};
 use crate::terminal_delivery::{
-    validate_record_integrity, NewTerminalDeliveryRecord, TerminalDeliveryError,
-    TerminalDeliveryRecordV1, TerminalDeliveryRepository, TerminalDeliveryState, TransitionUpdate,
+    NewTerminalDeliveryRecord, TerminalDeliveryError, TerminalDeliveryRecordV1,
+    TerminalDeliveryRepository, TerminalDeliveryState, TransitionUpdate, validate_record_integrity,
 };
 
 pub const SAFE_FAILED_MESSAGE: &str =
     "⚠️ The requested work failed. Please contact the operator if you need assistance.";
 pub const SAFE_CANCELLED_MESSAGE: &str = "⚠️ The requested work was cancelled.";
 pub const MAX_EXTERNAL_ATTEMPTS: u64 = 5;
+/// Maximum durable exact-message reads permitted while resolving an ambiguous
+/// Discord terminal delivery. These are read-only verification attempts, not
+/// delivery-send retries.
+pub const MAX_AMBIGUOUS_RECONCILIATION_ATTEMPTS: usize = 3;
 /// A delivery claim older than this is no longer treated as live.  Its
 /// outbound outcome is unknown, so recovery may only declare it ambiguous.
 pub const STALE_DELIVERING_AFTER_SECS: i64 = 300;
@@ -242,6 +246,17 @@ pub enum KnownMessageVerificationOutcome {
     TransientFailure,
     Inconclusive,
     IdentityMismatch,
+}
+
+/// Structured result of the bounded AMBIGUOUS reconciliation policy.  Errors
+/// remain `TerminalDeliveryError`s so a later manager never needs to parse
+/// strings to distinguish a completed policy decision from a failed action.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AmbiguousReconciliationOutcome {
+    Delivered,
+    StillAmbiguous,
+    Held,
+    Noop,
 }
 
 /// Canonical terminal content sent by the existing Discord terminal path.
@@ -542,6 +557,111 @@ impl TerminalDeliveryWorker {
                     Err(error) => Err(error),
                 }
             }
+        }
+    }
+
+    /// Apply the bounded, read-only reconciliation policy for one AMBIGUOUS
+    /// record. It never sends, performs Runtime lookup, searches history, or
+    /// changes the delivery-send attempt budget.
+    pub async fn reconcile_ambiguous(
+        &self,
+        record: TerminalDeliveryRecordV1,
+        reader: &dyn DiscordTerminalDeliveryReader,
+    ) -> Result<AmbiguousReconciliationOutcome, TerminalDeliveryError> {
+        validate_record_integrity(&record)?;
+        if record.state != TerminalDeliveryState::Ambiguous {
+            return Ok(AmbiguousReconciliationOutcome::Noop);
+        }
+        if record
+            .discord_message_id
+            .as_deref()
+            .is_none_or(str::is_empty)
+        {
+            return self.hold_ambiguous(record, "AMBIGUOUS_UNRESOLVED");
+        }
+        if record.platform != "discord" || reader.expected_author_id().is_empty() {
+            return self.hold_ambiguous(record, "AMBIGUOUS_UNRESOLVED");
+        }
+
+        if !self.repo.claim_ambiguous_reconciliation_read(
+            &record.terminal_delivery_key,
+            record.state_revision,
+            MAX_AMBIGUOUS_RECONCILIATION_ATTEMPTS,
+        )? {
+            return self.hold_if_reconciliation_exhausted(record);
+        }
+
+        match self
+            .reconcile_ambiguous_with_known_message(record.clone(), reader)
+            .await?
+        {
+            KnownMessageVerificationOutcome::Delivered => {
+                Ok(AmbiguousReconciliationOutcome::Delivered)
+            }
+            KnownMessageVerificationOutcome::Forbidden => {
+                self.hold_ambiguous(record, "MESSAGE_VERIFICATION_FORBIDDEN")
+            }
+            KnownMessageVerificationOutcome::IdentityMismatch => {
+                self.hold_ambiguous(record, "MESSAGE_IDENTITY_MISMATCH")
+            }
+            KnownMessageVerificationOutcome::NotFound
+            | KnownMessageVerificationOutcome::TransientFailure
+            | KnownMessageVerificationOutcome::Inconclusive
+            | KnownMessageVerificationOutcome::Noop => {
+                self.hold_if_reconciliation_exhausted(record)
+            }
+        }
+    }
+
+    fn hold_if_reconciliation_exhausted(
+        &self,
+        record: TerminalDeliveryRecordV1,
+    ) -> Result<AmbiguousReconciliationOutcome, TerminalDeliveryError> {
+        let authoritative = self
+            .repo
+            .get(&record.terminal_delivery_key)?
+            .ok_or_else(|| TerminalDeliveryError::Storage("lost delivery record".into()))?;
+        if authoritative.state != TerminalDeliveryState::Ambiguous {
+            return Ok(AmbiguousReconciliationOutcome::Noop);
+        }
+        if self
+            .repo
+            .ambiguous_reconciliation_read_attempts(&authoritative.terminal_delivery_key)?
+            < MAX_AMBIGUOUS_RECONCILIATION_ATTEMPTS
+        {
+            return Ok(AmbiguousReconciliationOutcome::StillAmbiguous);
+        }
+        self.hold_ambiguous(authoritative, "RECONCILIATION_EXHAUSTED")
+    }
+
+    fn hold_ambiguous(
+        &self,
+        record: TerminalDeliveryRecordV1,
+        reason: &str,
+    ) -> Result<AmbiguousReconciliationOutcome, TerminalDeliveryError> {
+        match self.repo.transition(
+            &record.terminal_delivery_key,
+            record.state_revision,
+            TerminalDeliveryState::OperatorHold,
+            TransitionUpdate {
+                operator_hold_reason: Some(Some(reason.to_owned())),
+                ..Default::default()
+            },
+            reason,
+        ) {
+            Ok(_) => Ok(AmbiguousReconciliationOutcome::Held),
+            Err(TerminalDeliveryError::RevisionConflict { .. }) => {
+                let authoritative = self
+                    .repo
+                    .get(&record.terminal_delivery_key)?
+                    .ok_or_else(|| TerminalDeliveryError::Storage("lost delivery record".into()))?;
+                if authoritative.state == TerminalDeliveryState::OperatorHold {
+                    Ok(AmbiguousReconciliationOutcome::Held)
+                } else {
+                    Ok(AmbiguousReconciliationOutcome::Noop)
+                }
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -897,8 +1017,8 @@ impl TerminalDeliveryPort for TerminalDeliveryWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
     use tempfile::TempDir;
 
@@ -1404,6 +1524,266 @@ mod tests {
                 .filter(|event| event.safe_reason_code == "DELIVERY_VERIFIED_BY_MESSAGE_ID")
                 .count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_ambiguous_reconciliation_persists_attempts_and_holds_on_exhaustion() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Arc::new(TerminalDeliveryRepository::open(tmp.path()).unwrap());
+        let lookup_calls = Arc::new(AtomicUsize::new(0));
+        let worker = TerminalDeliveryWorker::new(
+            repo.clone(),
+            Arc::new(RecordingLookup {
+                value: json!({}),
+                calls: lookup_calls.clone(),
+            }),
+        );
+        let original = ambiguous_record_with_known_message(&repo);
+        let key = original.terminal_delivery_key.clone();
+        let payload = original.terminal_payload.clone();
+        let digest = original.terminal_payload_digest.clone();
+        let delivery_attempts = original.attempt_count;
+        let reader_calls = Arc::new(AtomicUsize::new(0));
+
+        for expected_attempt in 1..MAX_AMBIGUOUS_RECONCILIATION_ATTEMPTS {
+            let current = repo.get(&key).unwrap().unwrap();
+            assert_eq!(
+                worker
+                    .reconcile_ambiguous(
+                        current,
+                        &RecordingReader {
+                            expected_author_id: "bot-1".into(),
+                            outcome: DiscordTerminalDeliveryReadResult::TransientFailure {
+                                classification: "DISCORD_MESSAGE_VERIFICATION_TRANSPORT",
+                            },
+                            calls: reader_calls.clone(),
+                        },
+                    )
+                    .await
+                    .unwrap(),
+                AmbiguousReconciliationOutcome::StillAmbiguous
+            );
+            assert_eq!(
+                repo.ambiguous_reconciliation_read_attempts(&key).unwrap(),
+                expected_attempt
+            );
+        }
+
+        // Reopen the durable repository to prove the next worker observes the
+        // prior budget rather than resetting a process-local counter.
+        let reopened = Arc::new(TerminalDeliveryRepository::open(tmp.path()).unwrap());
+        let next_worker =
+            TerminalDeliveryWorker::new(reopened.clone(), Arc::new(Lookup(json!({}))));
+        let current = reopened.get(&key).unwrap().unwrap();
+        assert_eq!(
+            next_worker
+                .reconcile_ambiguous(
+                    current,
+                    &RecordingReader {
+                        expected_author_id: "bot-1".into(),
+                        outcome: DiscordTerminalDeliveryReadResult::TransientFailure {
+                            classification: "DISCORD_MESSAGE_VERIFICATION_TRANSPORT",
+                        },
+                        calls: reader_calls.clone(),
+                    },
+                )
+                .await
+                .unwrap(),
+            AmbiguousReconciliationOutcome::Held
+        );
+        let held = reopened.get(&key).unwrap().unwrap();
+        assert_eq!(held.state, TerminalDeliveryState::OperatorHold);
+        assert_eq!(
+            held.operator_hold_reason.as_deref(),
+            Some("RECONCILIATION_EXHAUSTED")
+        );
+        assert_eq!(
+            reopened
+                .ambiguous_reconciliation_read_attempts(&key)
+                .unwrap(),
+            MAX_AMBIGUOUS_RECONCILIATION_ATTEMPTS
+        );
+        assert_eq!(
+            reader_calls.load(Ordering::SeqCst),
+            MAX_AMBIGUOUS_RECONCILIATION_ATTEMPTS
+        );
+        assert_eq!(lookup_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(held.terminal_payload, payload);
+        assert_eq!(held.terminal_payload_digest, digest);
+        assert_eq!(held.discord_message_id.as_deref(), Some("discord-known"));
+        assert_eq!(held.attempt_count, delivery_attempts);
+    }
+
+    #[tokio::test]
+    async fn bounded_ambiguous_reconciliation_accepts_positive_proof_before_exhaustion() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Arc::new(TerminalDeliveryRepository::open(tmp.path()).unwrap());
+        let worker = TerminalDeliveryWorker::new(repo.clone(), Arc::new(Lookup(json!({}))));
+        let original = ambiguous_record_with_known_message(&repo);
+        let key = original.terminal_delivery_key.clone();
+        for outcome in [
+            DiscordTerminalDeliveryReadResult::TransientFailure {
+                classification: "DISCORD_MESSAGE_VERIFICATION_TRANSPORT",
+            },
+            DiscordTerminalDeliveryReadResult::NotFound,
+        ] {
+            let current = repo.get(&key).unwrap().unwrap();
+            assert_eq!(
+                worker
+                    .reconcile_ambiguous(
+                        current,
+                        &RecordingReader {
+                            expected_author_id: "bot-1".into(),
+                            outcome,
+                            calls: Arc::new(AtomicUsize::new(0)),
+                        },
+                    )
+                    .await
+                    .unwrap(),
+                AmbiguousReconciliationOutcome::StillAmbiguous
+            );
+        }
+        let current = repo.get(&key).unwrap().unwrap();
+        assert_eq!(
+            worker
+                .reconcile_ambiguous(
+                    current,
+                    &RecordingReader {
+                        expected_author_id: "bot-1".into(),
+                        outcome: found_terminal_message(),
+                        calls: Arc::new(AtomicUsize::new(0)),
+                    },
+                )
+                .await
+                .unwrap(),
+            AmbiguousReconciliationOutcome::Delivered
+        );
+        assert_eq!(
+            repo.get(&key).unwrap().unwrap().state,
+            TerminalDeliveryState::Delivered
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_reconciliation_holds_immediately_for_missing_id_forbidden_and_mismatch() {
+        let scenarios = [
+            (
+                DiscordTerminalDeliveryReadResult::Forbidden,
+                "MESSAGE_VERIFICATION_FORBIDDEN",
+            ),
+            (
+                DiscordTerminalDeliveryReadResult::Found(DiscordTerminalMessage {
+                    message_id: "discord-known".into(),
+                    channel_id: "1".into(),
+                    author_id: "wrong".into(),
+                    content: "persisted".into(),
+                }),
+                "MESSAGE_IDENTITY_MISMATCH",
+            ),
+        ];
+        for (outcome, reason) in scenarios {
+            let tmp = TempDir::new().unwrap();
+            let repo = Arc::new(TerminalDeliveryRepository::open(tmp.path()).unwrap());
+            let worker = TerminalDeliveryWorker::new(repo.clone(), Arc::new(Lookup(json!({}))));
+            let record = ambiguous_record_with_known_message(&repo);
+            assert_eq!(
+                worker
+                    .reconcile_ambiguous(
+                        record.clone(),
+                        &RecordingReader {
+                            expected_author_id: "bot-1".into(),
+                            outcome,
+                            calls: Arc::new(AtomicUsize::new(0)),
+                        },
+                    )
+                    .await
+                    .unwrap(),
+                AmbiguousReconciliationOutcome::Held
+            );
+            let held = repo.get(&record.terminal_delivery_key).unwrap().unwrap();
+            assert_eq!(held.operator_hold_reason.as_deref(), Some(reason));
+            assert_eq!(held.attempt_count, record.attempt_count);
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let repo = Arc::new(TerminalDeliveryRepository::open(tmp.path()).unwrap());
+        let worker = TerminalDeliveryWorker::new(repo.clone(), Arc::new(Lookup(json!({}))));
+        let delivering = delivering_record(&repo, "no-message-id", Some(Utc::now()), Some("lease"));
+        let ambiguous = repo
+            .transition(
+                &delivering.terminal_delivery_key,
+                delivering.state_revision,
+                TerminalDeliveryState::Ambiguous,
+                TransitionUpdate::default(),
+                "TEST_AMBIGUOUS",
+            )
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert_eq!(
+            worker
+                .reconcile_ambiguous(
+                    ambiguous.clone(),
+                    &RecordingReader {
+                        expected_author_id: "bot-1".into(),
+                        outcome: found_terminal_message(),
+                        calls: calls.clone(),
+                    },
+                )
+                .await
+                .unwrap(),
+            AmbiguousReconciliationOutcome::Held
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let held = repo.get(&ambiguous.terminal_delivery_key).unwrap().unwrap();
+        assert_eq!(
+            held.operator_hold_reason.as_deref(),
+            Some("AMBIGUOUS_UNRESOLVED")
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_bounded_reconcilers_cannot_hold_a_record_verified_delivered() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Arc::new(TerminalDeliveryRepository::open(tmp.path()).unwrap());
+        let worker = Arc::new(TerminalDeliveryWorker::new(
+            repo.clone(),
+            Arc::new(Lookup(json!({}))),
+        ));
+        let ambiguous = ambiguous_record_with_known_message(&repo);
+        let key = ambiguous.terminal_delivery_key.clone();
+        let reader = Arc::new(RecordingReader {
+            expected_author_id: "bot-1".into(),
+            outcome: found_terminal_message(),
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let first = {
+            let worker = worker.clone();
+            let reader = reader.clone();
+            let record = ambiguous.clone();
+            tokio::spawn(async move { worker.reconcile_ambiguous(record, reader.as_ref()).await })
+        };
+        let second = {
+            let worker = worker.clone();
+            let reader = reader.clone();
+            tokio::spawn(
+                async move { worker.reconcile_ambiguous(ambiguous, reader.as_ref()).await },
+            )
+        };
+        for result in [
+            first.await.unwrap().unwrap(),
+            second.await.unwrap().unwrap(),
+        ] {
+            assert!(matches!(
+                result,
+                AmbiguousReconciliationOutcome::Delivered | AmbiguousReconciliationOutcome::Noop
+            ));
+        }
+        let delivered = repo.get(&key).unwrap().unwrap();
+        assert_eq!(delivered.state, TerminalDeliveryState::Delivered);
+        assert_ne!(
+            delivered.operator_hold_reason.as_deref(),
+            Some("RECONCILIATION_EXHAUSTED")
         );
     }
 

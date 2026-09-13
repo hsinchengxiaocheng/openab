@@ -16,6 +16,10 @@ use std::path::{Path, PathBuf};
 pub const TERMINAL_DELIVERY_SCHEMA_VERSION: i32 = 1;
 pub const TERMINAL_DELIVERY_RECORD_VERSION: i32 = 1;
 pub const TERMINAL_DELIVERY_PAYLOAD_CONFLICT: &str = "TERMINAL_DELIVERY_PAYLOAD_CONFLICT";
+/// Append-only audit reason for an authorized exact Discord message read.
+/// These events deliberately retain the same state revision: they are not
+/// delivery state transitions and must never affect the send attempt budget.
+pub const AMBIGUOUS_RECONCILIATION_READ_ATTEMPT: &str = "AMBIGUOUS_RECONCILIATION_READ_ATTEMPT";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TerminalDeliveryState {
@@ -502,6 +506,76 @@ impl TerminalDeliveryRepository {
             .collect::<Result<Vec<_>, _>>()
             .map_err(sql_error)?;
         Ok(events)
+    }
+
+    /// Durably authorize one exact-message reconciliation read.  The
+    /// append-only audit event is the restart-safe attempt authority: the
+    /// transaction counts prior read authorizations before recording this one,
+    /// so concurrent workers cannot exceed `max_attempts`.  It intentionally
+    /// does not change state or state_revision because a read is not a state
+    /// transition.
+    pub fn claim_ambiguous_reconciliation_read(
+        &self,
+        key: &str,
+        expected_revision: u64,
+        max_attempts: usize,
+    ) -> Result<bool, TerminalDeliveryError> {
+        let max_attempts = i64::try_from(max_attempts)
+            .map_err(|_| TerminalDeliveryError::InvalidInput("reconciliation attempts"))?;
+        let now = Utc::now();
+        let mut conn = self.connect()?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let current = select_record(&tx, key)?
+            .ok_or(TerminalDeliveryError::InvalidInput("terminal_delivery_key"))?;
+        if current.state != TerminalDeliveryState::Ambiguous
+            || current.state_revision != expected_revision
+        {
+            tx.commit().map_err(sql_error)?;
+            return Ok(false);
+        }
+        let attempts: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM terminal_delivery_events WHERE terminal_delivery_key=?1 AND safe_reason_code=?2",
+                params![key, AMBIGUOUS_RECONCILIATION_READ_ATTEMPT],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        if attempts >= max_attempts {
+            tx.commit().map_err(sql_error)?;
+            return Ok(false);
+        }
+        insert_event(
+            &tx,
+            key,
+            Some(TerminalDeliveryState::Ambiguous),
+            TerminalDeliveryState::Ambiguous,
+            current.state_revision,
+            AMBIGUOUS_RECONCILIATION_READ_ATTEMPT,
+            now,
+        )?;
+        tx.commit().map_err(sql_error)?;
+        Ok(true)
+    }
+
+    /// Return the durable number of authorized exact-message reconciliation
+    /// reads.  This is intentionally separate from `attempt_count`, which is
+    /// reserved for external delivery sends.
+    pub fn ambiguous_reconciliation_read_attempts(
+        &self,
+        key: &str,
+    ) -> Result<usize, TerminalDeliveryError> {
+        let conn = self.connect()?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM terminal_delivery_events WHERE terminal_delivery_key=?1 AND safe_reason_code=?2",
+                params![key, AMBIGUOUS_RECONCILIATION_READ_ATTEMPT],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        usize::try_from(count)
+            .map_err(|_| TerminalDeliveryError::InvalidInput("reconciliation attempts"))
     }
 
     fn connect(&self) -> Result<Connection, TerminalDeliveryError> {
