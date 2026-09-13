@@ -59,6 +59,10 @@ pub const WRITE_POLICY_MODIFY_ALLOWED: &str = "MODIFY_ALLOWED";
 pub struct AcpPromptIdentity {
     pub user_id: Option<String>,
     pub thread_id: Option<String>,
+    /// The inbound OpenAB/Discord turn identity.  This is deliberately
+    /// prompt-scoped: it must never become durable ACP session state, and it
+    /// is not a terminal delivery message id.
+    pub openab_message_id: Option<String>,
 }
 
 fn session_prompt_params(
@@ -71,6 +75,10 @@ fn session_prompt_params(
         "prompt": prompt,
         "userId": identity.user_id,
         "threadId": identity.thread_id,
+        // ACP permits extension fields in request params.  Keep the canonical
+        // snake_case audit-correlation name rather than introducing a Discord
+        // specific alias. `None` serializes as null for backwards compatibility.
+        "openab_message_id": identity.openab_message_id,
     })
 }
 
@@ -1233,6 +1241,7 @@ mod tests {
             &AcpPromptIdentity {
                 user_id: Some("user-123".into()),
                 thread_id: Some("thread-456".into()),
+                openab_message_id: Some("inbound-discord-mid".into()),
             },
         );
 
@@ -1240,6 +1249,9 @@ mod tests {
         assert_eq!(params["threadId"], "thread-456");
         assert_ne!(params["userId"], params["sessionId"]);
         assert_ne!(params["threadId"], params["sessionId"]);
+        assert_eq!(params["openab_message_id"], "inbound-discord-mid");
+        // This is the inbound trigger identity, never a terminal-delivery id.
+        assert_ne!(params["openab_message_id"], "terminal-delivery-mid");
     }
 
     #[test]
@@ -1250,11 +1262,37 @@ mod tests {
             &AcpPromptIdentity {
                 user_id: Some("user-123".into()),
                 thread_id: None,
+                openab_message_id: None,
             },
         );
 
         assert_eq!(params["userId"], "user-123");
         assert!(params["threadId"].is_null());
+        assert!(params["openab_message_id"].is_null());
+    }
+
+    #[test]
+    fn session_prompt_params_do_not_reuse_prior_message_id_in_same_session() {
+        let first = session_prompt_params(
+            "acp-session-789",
+            vec![],
+            &AcpPromptIdentity {
+                openab_message_id: Some("inbound-1".into()),
+                ..AcpPromptIdentity::default()
+            },
+        );
+        let second = session_prompt_params(
+            "acp-session-789",
+            vec![],
+            &AcpPromptIdentity {
+                openab_message_id: Some("inbound-2".into()),
+                ..AcpPromptIdentity::default()
+            },
+        );
+
+        assert_eq!(first["openab_message_id"], "inbound-1");
+        assert_eq!(second["openab_message_id"], "inbound-2");
+        assert_ne!(first["openab_message_id"], second["openab_message_id"]);
     }
 
     #[test]

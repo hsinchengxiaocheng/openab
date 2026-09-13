@@ -377,9 +377,13 @@ impl ChannelRef {
 pub(crate) fn discord_prompt_identity(
     sender_json: &str,
     channel: &ChannelRef,
+    openab_message_id: Option<String>,
 ) -> AcpPromptIdentity {
     if channel.platform != "discord" {
-        return AcpPromptIdentity::default();
+        return AcpPromptIdentity {
+            openab_message_id,
+            ..AcpPromptIdentity::default()
+        };
     }
 
     let user_id = serde_json::from_str::<serde_json::Value>(sender_json)
@@ -399,7 +403,11 @@ pub(crate) fn discord_prompt_identity(
         .as_ref()
         .map(|_| channel.channel_id.clone());
 
-    AcpPromptIdentity { user_id, thread_id }
+    AcpPromptIdentity {
+        user_id,
+        thread_id,
+        openab_message_id,
+    }
 }
 
 /// Identifies a message across platforms.
@@ -937,7 +945,11 @@ impl AdapterRouter {
             thread_channel.origin_event_id = Some(ctx.trigger_msg.message_id.clone());
         }
 
-        let identity = discord_prompt_identity(&ctx.sender_json, &thread_channel);
+        let identity = discord_prompt_identity(
+            &ctx.sender_json,
+            &thread_channel,
+            Some(ctx.trigger_msg.message_id.clone()),
+        );
 
         let content_blocks =
             Self::pack_arrival_event(&ctx.sender_json, &ctx.prompt, ctx.extra_blocks);

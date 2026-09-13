@@ -1126,7 +1126,15 @@ async fn dispatch_batch(
     let prompt_identity = if native_workflow.is_some() {
         AcpPromptIdentity::default()
     } else {
-        discord_prompt_identity(&batch.first().unwrap().sender_json, &dispatch_channel)
+        discord_prompt_identity(
+            &batch.first().unwrap().sender_json,
+            &dispatch_channel,
+            // A batched ACP prompt is one logical turn.  Its reply anchor is
+            // the newest inbound message, so use that same inbound identity
+            // for audit correlation rather than retaining an earlier prompt's
+            // id in the shared ACP session.
+            Some(trigger_msg.message_id.clone()),
+        )
     };
 
     // Pack all arrival events into one Vec<ContentBlock> (§3.3).
