@@ -79,3 +79,8 @@ acp-mcp = ["dep:rmcp", "dep:tokio-util"]
 # subset of state). Enabled only via the binary's `dev-dependencies`; never
 # part of `default`. Production release builds do not see this surface.
 test-utils = []
+
+[[bin]]
+name = "openab-acp-wire-fixture"
+path = "src/acp_wire_fixture_producer.rs"
+required-features = ["test-utils"]

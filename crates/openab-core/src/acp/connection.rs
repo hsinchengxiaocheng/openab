@@ -82,6 +82,121 @@ fn session_prompt_params(
     })
 }
 
+/// Serialize an outgoing JSON-RPC request before ACP stdio line framing.
+fn serialize_json_rpc_request(request: &JsonRpcRequest) -> Result<String> {
+    Ok(serde_json::to_string(request)?)
+}
+
+fn frame_json_rpc_line(payload: impl AsRef<[u8]>) -> Vec<u8> {
+    let mut line = payload.as_ref().to_vec();
+    line.push(b'\n');
+    line
+}
+
+/// Serialize and frame an outgoing JSON-RPC request exactly as ACP stdio
+/// receives it.
+fn serialize_json_rpc_line(request: &JsonRpcRequest) -> Result<Vec<u8>> {
+    Ok(frame_json_rpc_line(serialize_json_rpc_request(request)?))
+}
+
+/// Test-only canonical ACP wire-fixture support.
+///
+/// This is deliberately compiled only for unit tests and consumers that
+/// explicitly opt into `test-utils`; normal OpenAB builds do not expose it.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_support {
+    use super::{serialize_json_rpc_line, session_prompt_params, AcpPromptIdentity};
+    use crate::acp::protocol::JsonRpcRequest;
+    use anyhow::Result;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use serde::Serialize;
+    use serde_json::{json, Value};
+
+    /// Version of the cross-repository acceptance fixture format, not ACP.
+    pub const FIXTURE_VERSION: u64 = 1;
+    /// Stable identifier for the production serializer and line framing used.
+    pub const SERIALIZER_IDENTIFIER: &str = "acp.session_prompt.v1";
+    const SESSION_ID: &str = "acp-fixture-session-001";
+
+    #[derive(Serialize)]
+    struct MetadataRecord {
+        fixture_version: u64,
+        producer: &'static str,
+        encoding: &'static str,
+        serializer: &'static str,
+    }
+
+    #[derive(Serialize)]
+    struct FrameRecord {
+        logical_scenario: &'static str,
+        sequence_number: u64,
+        frame_base64: String,
+    }
+
+    fn prompt_frame(
+        request_id: u64,
+        text: &'static str,
+        openab_message_id: Option<&'static str>,
+    ) -> Result<Vec<u8>> {
+        // These are the transport facts a production MessageRef/SenderContext
+        // path supplies to AcpPromptIdentity. The fixture deliberately stays
+        // at this ACP boundary and does not reimplement adapter parsing.
+        let identity = AcpPromptIdentity {
+            user_id: Some("fixture-user-001".to_owned()),
+            thread_id: Some("fixture-thread-001".to_owned()),
+            openab_message_id: openab_message_id.map(str::to_owned),
+        };
+        let prompt: Vec<Value> = vec![json!({"type": "text", "text": text})];
+        let request = JsonRpcRequest::new(
+            request_id,
+            "session/prompt",
+            Some(session_prompt_params(SESSION_ID, prompt, &identity)),
+        );
+        serialize_json_rpc_line(&request)
+    }
+
+    /// Produce deterministic UTF-8 JSONL containing the canonical ACP
+    /// client-to-agent session/prompt wire frames for cross-repo acceptance.
+    pub fn canonical_acp_wire_fixture() -> Result<Vec<u8>> {
+        let frames = [
+            ("prompt_a", 101, "Phase 10 fixture prompt A", Some("MSG-A")),
+            ("prompt_b", 102, "Phase 10 fixture prompt B", Some("MSG-B")),
+            (
+                "prompt_c_no_message_id",
+                103,
+                "Phase 10 fixture prompt C",
+                None,
+            ),
+            (
+                "prompt_error",
+                104,
+                "Phase 10 fixture error marker: ACP_FIXTURE_ERROR",
+                Some("MSG-ERROR"),
+            ),
+        ];
+        let mut fixture = Vec::new();
+        let metadata = MetadataRecord {
+            fixture_version: FIXTURE_VERSION,
+            producer: "openab",
+            encoding: "base64",
+            serializer: SERIALIZER_IDENTIFIER,
+        };
+        serde_json::to_writer(&mut fixture, &metadata)?;
+        fixture.push(b'\n');
+
+        for (index, (scenario, request_id, text, message_id)) in frames.into_iter().enumerate() {
+            let record = FrameRecord {
+                logical_scenario: scenario,
+                sequence_number: (index + 1) as u64,
+                frame_base64: STANDARD.encode(prompt_frame(request_id, text, message_id)?),
+            };
+            serde_json::to_writer(&mut fixture, &record)?;
+            fixture.push(b'\n');
+        }
+        Ok(fixture)
+    }
+}
+
 /// Phase 6.4.1F — canonical tool-name deny-list applied when the
 /// connection's `write_policy` is `READ_ONLY`. Conservative by design:
 /// every known write-capable tool name is included so the gate cannot
@@ -799,14 +914,13 @@ impl AcpConnection {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    pub(crate) async fn send_raw(&self, data: &str) -> Result<()> {
-        debug!(data = data.trim(), "acp_send");
+    pub(crate) async fn send_raw(&self, data: &[u8]) -> Result<()> {
+        debug!(data = %String::from_utf8_lossy(data).trim(), "acp_send");
         // A hung agent can stop draining stdin; bound the write so callers
         // (and the mutexes they hold) can never block on it indefinitely.
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             let mut w = self.stdin.lock().await;
-            w.write_all(data.as_bytes()).await?;
-            w.write_all(b"\n").await?;
+            w.write_all(data).await?;
             w.flush().await?;
             Ok::<(), anyhow::Error>(())
         })
@@ -818,12 +932,12 @@ impl AcpConnection {
     async fn send_request(&self, method: &str, params: Option<Value>) -> Result<JsonRpcMessage> {
         let id = self.next_id();
         let req = JsonRpcRequest::new(id, method, params);
-        let data = serde_json::to_string(&req)?;
+        let data = serialize_json_rpc_request(&req)?;
 
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
 
-        self.send_raw(&data).await?;
+        self.send_raw(&frame_json_rpc_line(data)).await?;
 
         let timeout_secs = if method == "session/new" { 120 } else { 30 };
         let resp = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx)
@@ -1025,7 +1139,7 @@ impl AcpConnection {
             "session/prompt",
             Some(session_prompt_params(session_id, prompt_json, &identity)),
         );
-        let data = serde_json::to_string(&req)?;
+        let data = serialize_json_rpc_line(&req)?;
 
         let (resp_tx, _resp_rx) = oneshot::channel();
         self.pending.lock().await.insert(id, resp_tx);
@@ -1142,7 +1256,7 @@ impl AcpConnection {
             "params": {"sessionId": session_id},
         });
         if let Ok(data) = serde_json::to_string(&req) {
-            let _ = self.send_raw(&data).await;
+            let _ = self.send_raw(&frame_json_rpc_line(data)).await;
         }
     }
 
@@ -1231,7 +1345,79 @@ mod tests {
         tool_title_denied_for_read_only, AcpPromptIdentity, WritePolicyGuard,
         WRITE_POLICY_MODIFY_ALLOWED, WRITE_POLICY_READ_ONLY,
     };
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde_json::json;
+
+    fn fixture_frames() -> Vec<serde_json::Value> {
+        let fixture = super::test_support::canonical_acp_wire_fixture().unwrap();
+        std::str::from_utf8(&fixture)
+            .unwrap()
+            .lines()
+            .skip(1)
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn decoded_frame(frames: &[serde_json::Value], scenario: &str) -> Vec<u8> {
+        let encoded = frames
+            .iter()
+            .find(|frame| frame["logical_scenario"] == scenario)
+            .unwrap()["frame_base64"]
+            .as_str()
+            .unwrap();
+        STANDARD.decode(encoded).unwrap()
+    }
+
+    fn decoded_request(frames: &[serde_json::Value], scenario: &str) -> serde_json::Value {
+        let frame = decoded_frame(frames, scenario);
+        serde_json::from_slice(frame.strip_suffix(b"\n").unwrap()).unwrap()
+    }
+
+    #[test]
+    fn canonical_acp_wire_fixture_matches_checked_in_golden() {
+        let actual = super::test_support::canonical_acp_wire_fixture().unwrap();
+        let golden = include_bytes!("../../testdata/acp_session_prompt_v1.jsonl");
+        assert_eq!(
+            actual.as_slice(),
+            golden,
+            "ACP wire fixture changed; review the production serializer/framing change and regenerate with `cargo run -p openab-core --no-default-features --features test-utils --bin openab-acp-wire-fixture > crates/openab-core/testdata/acp_session_prompt_v1.jsonl`"
+        );
+    }
+
+    #[test]
+    fn canonical_acp_wire_fixture_preserves_prompt_scoped_identity() {
+        let frames = fixture_frames();
+        let prompt_a = decoded_request(&frames, "prompt_a");
+        let prompt_b = decoded_request(&frames, "prompt_b");
+        let prompt_c = decoded_request(&frames, "prompt_c_no_message_id");
+        let prompt_error = decoded_request(&frames, "prompt_error");
+
+        assert_eq!(prompt_a["method"], "session/prompt");
+        assert_eq!(prompt_a["params"]["openab_message_id"], "MSG-A");
+        assert_eq!(prompt_b["params"]["openab_message_id"], "MSG-B");
+        assert_eq!(prompt_a["params"]["sessionId"], "acp-fixture-session-001");
+        assert_eq!(
+            prompt_b["params"]["sessionId"],
+            prompt_a["params"]["sessionId"]
+        );
+        assert_ne!(prompt_b["params"]["openab_message_id"], "MSG-A");
+        assert!(prompt_c["params"]["openab_message_id"].is_null());
+        assert_eq!(prompt_error["params"]["openab_message_id"], "MSG-ERROR");
+        assert!(prompt_error["params"]["prompt"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("ACP_FIXTURE_ERROR"));
+        assert_eq!(prompt_a["params"]["userId"], "fixture-user-001");
+        assert_eq!(prompt_a["params"]["threadId"], "fixture-thread-001");
+    }
+
+    #[test]
+    fn canonical_acp_wire_fixture_preserves_exact_json_rpc_line_framing() {
+        let frames = fixture_frames();
+        let decoded = decoded_frame(&frames, "prompt_a");
+        let expected = b"{\"jsonrpc\":\"2.0\",\"id\":101,\"method\":\"session/prompt\",\"params\":{\"openab_message_id\":\"MSG-A\",\"prompt\":[{\"text\":\"Phase 10 fixture prompt A\",\"type\":\"text\"}],\"sessionId\":\"acp-fixture-session-001\",\"threadId\":\"fixture-thread-001\",\"userId\":\"fixture-user-001\"}}\n";
+        assert_eq!(decoded.as_slice(), expected);
+    }
 
     #[test]
     fn session_prompt_params_preserve_discord_stable_identity() {
