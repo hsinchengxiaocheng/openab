@@ -1067,18 +1067,25 @@ impl TerminalDeliveryWorker {
             .as_deref()
             .ok_or(TerminalDeliveryError::InvalidInput("delivery_lease_token"))?;
         match outcome {
-            DiscordSendResult::DefiniteSuccess(message_id) => self.repo.transition_with_lease(
-                &claimed.terminal_delivery_key,
-                claimed.state_revision,
-                lease_token,
-                TerminalDeliveryState::Delivered,
-                TransitionUpdate {
-                    discord_message_id: Some(message_id),
-                    delivery_lease_token: Some(None),
-                    ..Default::default()
-                },
-                "DISCORD_DELIVERED",
-            ),
+            DiscordSendResult::DefiniteSuccess(message_id) => {
+                let evidenced = self.repo.persist_accepted_message_id(
+                    &claimed.terminal_delivery_key,
+                    claimed.state_revision,
+                    lease_token,
+                    &message_id,
+                )?;
+                self.repo.transition_with_lease(
+                    &evidenced.terminal_delivery_key,
+                    evidenced.state_revision,
+                    lease_token,
+                    TerminalDeliveryState::Delivered,
+                    TransitionUpdate {
+                        delivery_lease_token: Some(None),
+                        ..Default::default()
+                    },
+                    "DISCORD_DELIVERED",
+                )
+            }
             DiscordSendResult::DefinitePermanentFailure { classification } => {
                 self.repo.transition_with_lease(
                     &claimed.terminal_delivery_key,
@@ -1270,14 +1277,6 @@ mod tests {
             Ok(self.value.clone())
         }
     }
-    struct Success;
-    #[async_trait]
-    impl DiscordTerminalDeliverySender for Success {
-        async fn send_terminal(&self, _: &ChannelRef, _: &str) -> DiscordSendResult {
-            DiscordSendResult::DefiniteSuccess("discord-1".into())
-        }
-    }
-
     struct Outcome(DiscordSendResult);
     #[async_trait]
     impl DiscordTerminalDeliverySender for Outcome {
@@ -2511,7 +2510,7 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|e| e.new_state == TerminalDeliveryState::Delivering)
+                .filter(|e| e.safe_reason_code == "DELIVERY_CLAIMED")
                 .count(),
             1,
             "exactly one claim transition"
@@ -2573,7 +2572,7 @@ mod tests {
             assert_eq!(
                 events
                     .iter()
-                    .filter(|e| e.new_state == TerminalDeliveryState::Delivering)
+                    .filter(|e| e.safe_reason_code == "DELIVERY_CLAIMED")
                     .count(),
                 1,
                 "exactly one claim transition per race"
@@ -2778,24 +2777,108 @@ mod tests {
             parent_id: None,
             origin_event_id: Some("42".into()),
         };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sender = CountingOutcome {
+            outcome: DiscordSendResult::DefiniteSuccess("discord-1".into()),
+            calls: calls.clone(),
+        };
         let delivered = worker
-            .capture_and_deliver(metadata.clone(), channel.clone(), "42", &Success)
+            .capture_and_deliver(metadata.clone(), channel.clone(), "42", &sender)
             .await
             .unwrap();
         assert_eq!(delivered.state, TerminalDeliveryState::Delivered);
+        assert_eq!(delivered.delivery_lease_token, None);
         let replay = worker
-            .capture_and_deliver(metadata, channel, "42", &Success)
+            .capture_and_deliver(metadata, channel, "42", &sender)
             .await
             .unwrap();
         assert_eq!(replay.discord_message_id.as_deref(), Some("discord-1"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let events = repo.events(&replay.terminal_delivery_key).unwrap();
+        let reasons: Vec<_> = events
+            .iter()
+            .map(|event| event.safe_reason_code.as_str())
+            .collect();
         assert_eq!(
-            repo.events(&replay.terminal_delivery_key)
-                .unwrap()
+            reasons,
+            vec![
+                "CREATED",
+                "RESULT_MATERIALIZED",
+                "DELIVERY_CLAIMED",
+                "DISCORD_ACCEPTED_MESSAGE_ID_PERSISTED",
+                "DISCORD_DELIVERED",
+            ]
+        );
+        assert_eq!(
+            events
                 .iter()
                 .filter(|event| event.new_state == TerminalDeliveryState::Delivering)
                 .count(),
-            1
+            2
         );
+    }
+
+    #[tokio::test]
+    async fn post_evidence_crash_reopens_and_verifies_known_message_without_resend_or_lookup() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Arc::new(TerminalDeliveryRepository::open(tmp.path()).unwrap());
+        let stale_at = Utc::now() - Duration::seconds(STALE_DELIVERING_AFTER_SECS + 1);
+        let delivering = delivering_record(&repo, "post-evidence", Some(stale_at), Some("lease"));
+        let evidenced = repo
+            .persist_accepted_message_id(
+                &delivering.terminal_delivery_key,
+                delivering.state_revision,
+                "lease",
+                "discord-known",
+            )
+            .unwrap();
+        let key = evidenced.terminal_delivery_key.clone();
+        let digest = evidenced.terminal_payload_digest.clone();
+        let path = repo.database_path().to_path_buf();
+        drop(repo);
+
+        let reopened = Arc::new(TerminalDeliveryRepository::open_path(path).unwrap());
+        let lookup_calls = Arc::new(AtomicUsize::new(0));
+        let worker = TerminalDeliveryWorker::new(
+            reopened.clone(),
+            Arc::new(RecordingLookup {
+                value: json!({}),
+                calls: lookup_calls.clone(),
+            }),
+        );
+        let stale = reopened.get(&key).unwrap().unwrap();
+        let ambiguous = worker
+            .recover_stale_delivering(stale, stale_delivering_before(Utc::now()))
+            .unwrap();
+        assert_eq!(ambiguous.state, TerminalDeliveryState::Ambiguous);
+        assert_eq!(
+            ambiguous.discord_message_id.as_deref(),
+            Some("discord-known")
+        );
+        let reader_calls = Arc::new(AtomicUsize::new(0));
+        assert_eq!(
+            worker
+                .reconcile_ambiguous(
+                    ambiguous,
+                    &RecordingReader {
+                        expected_author_id: "bot-1".into(),
+                        outcome: found_terminal_message(),
+                        calls: reader_calls.clone(),
+                    },
+                )
+                .await
+                .unwrap(),
+            AmbiguousReconciliationOutcome::Delivered
+        );
+        let delivered = reopened.get(&key).unwrap().unwrap();
+        assert_eq!(delivered.state, TerminalDeliveryState::Delivered);
+        assert_eq!(
+            delivered.discord_message_id.as_deref(),
+            Some("discord-known")
+        );
+        assert_eq!(delivered.terminal_payload_digest, digest);
+        assert_eq!(reader_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(lookup_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

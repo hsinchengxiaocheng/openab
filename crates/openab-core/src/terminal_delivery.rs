@@ -5,7 +5,7 @@
 //! decide retry/reconciliation policy.
 
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, Error as SqlError, ErrorCode, OptionalExtension, Transaction, params};
+use rusqlite::{params, Connection, Error as SqlError, ErrorCode, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
@@ -370,6 +370,90 @@ impl TerminalDeliveryRepository {
             update,
             safe_reason_code,
         )
+    }
+
+    /// Persist the exact Discord message id returned by a successful send
+    /// while retaining the active `DELIVERING` claim.  This is deliberately
+    /// not a state-machine transition: it records accepted-message evidence
+    /// needed to reconcile a crash before the final `DELIVERED` commit.
+    pub fn persist_accepted_message_id(
+        &self,
+        key: &str,
+        expected_revision: u64,
+        expected_delivery_lease_token: &str,
+        discord_message_id: &str,
+    ) -> Result<TerminalDeliveryRecordV1, TerminalDeliveryError> {
+        if expected_delivery_lease_token.is_empty() {
+            return Err(TerminalDeliveryError::InvalidInput("delivery_lease_token"));
+        }
+        if discord_message_id.is_empty() {
+            return Err(TerminalDeliveryError::InvalidInput("discord_message_id"));
+        }
+
+        let now = Utc::now();
+        let mut conn = self.connect()?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let current = select_record(&tx, key)?
+            .ok_or(TerminalDeliveryError::InvalidInput("terminal_delivery_key"))?;
+        if current.state != TerminalDeliveryState::Delivering {
+            return Err(TerminalDeliveryError::IllegalTransition {
+                from: current.state,
+                to: TerminalDeliveryState::Delivering,
+            });
+        }
+        if current.state_revision != expected_revision {
+            return Err(TerminalDeliveryError::RevisionConflict {
+                expected: expected_revision,
+                actual: current.state_revision,
+            });
+        }
+        if current.delivery_lease_token.as_deref() != Some(expected_delivery_lease_token) {
+            return Err(TerminalDeliveryError::LeaseTokenConflict);
+        }
+        match current.discord_message_id.as_deref() {
+            Some(existing) if existing == discord_message_id => {
+                tx.commit().map_err(sql_error)?;
+                return Ok(current);
+            }
+            Some(_) => return Err(TerminalDeliveryError::DiscordMessageIdWriteOnce),
+            None => {}
+        }
+
+        let revision =
+            current
+                .state_revision
+                .checked_add(1)
+                .ok_or(TerminalDeliveryError::InvalidInput(
+                    "state_revision overflow",
+                ))?;
+        let changed = tx
+            .execute(
+                "UPDATE terminal_deliveries SET discord_message_id=?1, updated_at=?2, state_revision=?3 WHERE terminal_delivery_key=?4 AND state_revision=?5 AND state='DELIVERING' AND delivery_lease_token=?6",
+                params![discord_message_id, timestamp(now), revision.to_string(), key, expected_revision.to_string(), expected_delivery_lease_token],
+            )
+            .map_err(sql_error)?;
+        if changed != 1 {
+            return Err(TerminalDeliveryError::RevisionConflict {
+                expected: expected_revision,
+                actual: current.state_revision,
+            });
+        }
+        insert_event(
+            &tx,
+            key,
+            Some(TerminalDeliveryState::Delivering),
+            TerminalDeliveryState::Delivering,
+            revision,
+            "DISCORD_ACCEPTED_MESSAGE_ID_PERSISTED",
+            now,
+        )?;
+        let updated = select_record(&tx, key)?.ok_or_else(|| {
+            TerminalDeliveryError::Storage("accepted-message evidence unavailable".into())
+        })?;
+        tx.commit().map_err(sql_error)?;
+        Ok(updated)
     }
 
     fn transition_inner(
@@ -1102,6 +1186,170 @@ mod tests {
             }
         }
     }
+
+    fn delivering_with_lease(repo: &TerminalDeliveryRepository) -> TerminalDeliveryRecordV1 {
+        let pending = repo.create_or_reuse(input()).unwrap();
+        let ready = step(repo, &pending, TerminalDeliveryState::ReadyToDeliver);
+        repo.transition(
+            &ready.terminal_delivery_key,
+            ready.state_revision,
+            TerminalDeliveryState::Delivering,
+            TransitionUpdate {
+                attempt_count: Some(1),
+                delivery_lease_token: Some(Some("lease-1".into())),
+                delivery_started_at: Some(Some(Utc::now())),
+                ..Default::default()
+            },
+            "DELIVERY_CLAIMED",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn accepted_message_evidence_is_fenced_write_once_and_preserves_claim_fields() {
+        let (_temp, repo) = repo();
+        let delivering = delivering_with_lease(&repo);
+        let payload = delivering.terminal_payload.clone();
+        let digest = delivering.terminal_payload_digest.clone();
+        let attempt_count = delivering.attempt_count;
+        let started_at = delivering.delivery_started_at;
+
+        let evidenced = repo
+            .persist_accepted_message_id(
+                &delivering.terminal_delivery_key,
+                delivering.state_revision,
+                "lease-1",
+                "message-1",
+            )
+            .unwrap();
+        assert_eq!(evidenced.state, TerminalDeliveryState::Delivering);
+        assert_eq!(evidenced.discord_message_id.as_deref(), Some("message-1"));
+        assert_eq!(evidenced.state_revision, delivering.state_revision + 1);
+        assert_eq!(evidenced.delivery_lease_token.as_deref(), Some("lease-1"));
+        assert_eq!(evidenced.delivery_started_at, started_at);
+        assert_eq!(evidenced.attempt_count, attempt_count);
+        assert_eq!(evidenced.terminal_payload, payload);
+        assert_eq!(evidenced.terminal_payload_digest, digest);
+        let event_count = repo.events(&evidenced.terminal_delivery_key).unwrap().len();
+        assert_eq!(
+            repo.persist_accepted_message_id(
+                &evidenced.terminal_delivery_key,
+                evidenced.state_revision,
+                "lease-1",
+                "message-1",
+            )
+            .unwrap(),
+            evidenced
+        );
+        assert_eq!(
+            repo.events(&evidenced.terminal_delivery_key).unwrap().len(),
+            event_count
+        );
+        assert_eq!(
+            repo.events(&evidenced.terminal_delivery_key)
+                .unwrap()
+                .last()
+                .unwrap()
+                .safe_reason_code,
+            "DISCORD_ACCEPTED_MESSAGE_ID_PERSISTED"
+        );
+    }
+
+    #[test]
+    fn accepted_message_evidence_rejects_wrong_claim_and_non_delivering_records() {
+        let (_temp, repo) = repo();
+        let delivering = delivering_with_lease(&repo);
+        for (revision, lease, message_id) in [
+            (delivering.state_revision, "wrong-lease", "message-1"),
+            (
+                delivering.state_revision.saturating_sub(1),
+                "lease-1",
+                "message-1",
+            ),
+            (delivering.state_revision, "lease-1", ""),
+        ] {
+            assert!(repo
+                .persist_accepted_message_id(
+                    &delivering.terminal_delivery_key,
+                    revision,
+                    lease,
+                    message_id,
+                )
+                .is_err());
+        }
+        let evidenced = repo
+            .persist_accepted_message_id(
+                &delivering.terminal_delivery_key,
+                delivering.state_revision,
+                "lease-1",
+                "message-1",
+            )
+            .unwrap();
+        assert!(matches!(
+            repo.persist_accepted_message_id(
+                &evidenced.terminal_delivery_key,
+                evidenced.state_revision,
+                "lease-1",
+                "message-2",
+            ),
+            Err(TerminalDeliveryError::DiscordMessageIdWriteOnce)
+        ));
+        let delivered = repo
+            .transition_with_lease(
+                &evidenced.terminal_delivery_key,
+                evidenced.state_revision,
+                "lease-1",
+                TerminalDeliveryState::Delivered,
+                TransitionUpdate {
+                    delivery_lease_token: Some(None),
+                    ..Default::default()
+                },
+                "TEST_DELIVERED",
+            )
+            .unwrap();
+        assert!(repo
+            .persist_accepted_message_id(
+                &delivered.terminal_delivery_key,
+                delivered.state_revision,
+                "lease-1",
+                "message-1",
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn accepted_message_evidence_has_one_concurrent_claim_winner() {
+        let temp = TempDir::new().unwrap();
+        let repo = Arc::new(TerminalDeliveryRepository::open(temp.path()).unwrap());
+        let delivering = delivering_with_lease(&repo);
+        let mut joins = Vec::new();
+        for message_id in ["message-1", "message-2"] {
+            let repo = Arc::clone(&repo);
+            let key = delivering.terminal_delivery_key.clone();
+            let revision = delivering.state_revision;
+            joins.push(thread::spawn(move || {
+                repo.persist_accepted_message_id(&key, revision, "lease-1", message_id)
+            }));
+        }
+        let results: Vec<_> = joins.into_iter().map(|join| join.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let record = repo
+            .get(&delivering.terminal_delivery_key)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            record.discord_message_id.as_deref(),
+            Some("message-1" | "message-2")
+        ));
+        assert_eq!(
+            repo.events(&record.terminal_delivery_key)
+                .unwrap()
+                .iter()
+                .filter(|event| event.safe_reason_code == "DISCORD_ACCEPTED_MESSAGE_ID_PERSISTED")
+                .count(),
+            1
+        );
+    }
     #[test]
     fn operator_hold_cas_attempts_and_message_id_are_enforced() {
         let (_temp, repo) = repo();
@@ -1199,10 +1447,9 @@ mod tests {
         assert_eq!(events[0].previous_state, None);
         assert_eq!(events[0].new_state, TerminalDeliveryState::PendingResult);
         let conn = Connection::open(repo.database_path()).unwrap();
-        assert!(
-            conn.execute("DELETE FROM terminal_delivery_events", [])
-                .is_err()
-        );
+        assert!(conn
+            .execute("DELETE FROM terminal_delivery_events", [])
+            .is_err());
     }
     #[test]
     fn restart_digest_schema_and_corruption_fail_closed() {
@@ -1284,11 +1531,9 @@ mod tests {
             }));
         }
         let records: Vec<_> = joins.into_iter().map(|join| join.join().unwrap()).collect();
-        assert!(
-            records
-                .iter()
-                .all(|record| record.terminal_delivery_key == records[0].terminal_delivery_key)
-        );
+        assert!(records
+            .iter()
+            .all(|record| record.terminal_delivery_key == records[0].terminal_delivery_key));
         let record = records[0].clone();
         let mut joins = Vec::new();
         for _ in 0..8 {
@@ -1306,15 +1551,10 @@ mod tests {
         }
         let results: Vec<_> = joins.into_iter().map(|join| join.join().unwrap()).collect();
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
-        assert!(
-            results
-                .iter()
-                .filter(|result| result.is_err())
-                .all(|result| matches!(
-                    result,
-                    Err(TerminalDeliveryError::RevisionConflict { .. })
-                ))
-        );
+        assert!(results
+            .iter()
+            .filter(|result| result.is_err())
+            .all(|result| matches!(result, Err(TerminalDeliveryError::RevisionConflict { .. }))));
     }
 
     #[test]
