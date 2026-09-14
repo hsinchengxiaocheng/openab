@@ -118,6 +118,11 @@ pub struct AgentWorkRequest {
     pub workflow_run_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
+    /// Canonical repository / workspace root supplied by AAP Runtime.
+    /// This is trusted structured dispatch metadata, not agent-authored
+    /// assignment prose. AAP-native completion identity requires it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<String>,
     pub task_id: String,
     pub role: String,
     pub agent: String,
@@ -1562,6 +1567,7 @@ impl CtlHandler for RuntimeHandler {
             conversation_key: request.conversation_key.clone(),
             workflow_run_id: request.workflow_run_id.clone(),
             project_id: request.project_id.clone(),
+            project_root: request.project_root.clone(),
             task_id: request.task_id.clone(),
             role: request.role.clone(),
             agent: request.agent.clone(),
@@ -1569,7 +1575,6 @@ impl CtlHandler for RuntimeHandler {
             lease_generation: request.lease_generation,
             expected_revision: request.expected_revision,
             language: Some(request.language.clone()),
-            project_root: None,
             // Phase 6.2.9: the native-work authority carries its own
             // per-dispatch execution-session key. The pool guarantees a
             // fresh `session/new` and never replays historical turns for
@@ -1884,6 +1889,7 @@ mod tests {
             dispatch_id: "dispatch-1".into(),
             workflow_run_id: "run-1".into(),
             project_id: Some("project-1".into()),
+            project_root: Some("/home/arthur/workspace/ai-workstation".into()),
             task_id: "task-1".into(),
             role: "PRIMARY".into(),
             agent: "ArthurClaude".into(),
@@ -2090,6 +2096,30 @@ mod tests {
         assert_eq!(ack["role"], request.role);
         assert_eq!(ack["conversation_key"], request.conversation_key);
         assert_eq!(ack["admission_id"], "admission-1");
+    }
+
+    #[tokio::test]
+    async fn ctl_agent_work_preserves_project_identity_in_native_metadata() {
+        let admission = Arc::new(RecordingAdmissionPort::new("admission-project"));
+        let handler = native_work_handler(admission.clone());
+        let request = native_work_request();
+
+        let response = handler.handle_agent_work(Some(&request)).await;
+        assert!(response.ok, "{}", response.message);
+
+        let (_channel, metadata) = admission.last_admission();
+        let metadata = metadata.expect("native workflow metadata must be present");
+
+        assert_eq!(
+            metadata.project_id.as_deref(),
+            Some("project-1"),
+            "project_id must survive agent.work admission"
+        );
+        assert_eq!(
+            metadata.project_root.as_deref(),
+            Some("/home/arthur/workspace/ai-workstation"),
+            "project_root must survive agent.work admission"
+        );
     }
 
     // ── Phase 6.4.x Round 3 — heartbeat defense-in-depth admission ─────
