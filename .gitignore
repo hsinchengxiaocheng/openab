@@ -10,3 +10,9 @@ config.toml
 CLAUDE.md
 .claude/
 .claude.local.md
+
+# OpenAB/AAP generated workflow runtime projections
+/.agents/workflow_assignment.json
+/.openab/workflow_assignment.json
+/.openab/workflow_transitions.json
+/.openab/workflow_assignment.*.backup.*.json
