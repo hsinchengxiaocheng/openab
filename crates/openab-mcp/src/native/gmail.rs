@@ -122,6 +122,7 @@ impl GmailNative {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     fn with_api_base(mut self, base: &str) -> Self {
         self.api_base = base.to_string();
         self

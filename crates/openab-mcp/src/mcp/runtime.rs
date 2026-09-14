@@ -3183,7 +3183,7 @@ mod tests {
 
     // start_paste_login + builtin_client_id race on the same OS env var —
     // `set_var` is unsound under concurrent reads, so serialize them.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn linear_custom_cfg() -> &'static str {
         r#"{
@@ -3319,7 +3319,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_paste_login_builtin_without_env_var_errors_loud() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         unsafe {
             std::env::remove_var("OPENAB_MCP_ANTHROPIC_CLIENT_ID");
         }
