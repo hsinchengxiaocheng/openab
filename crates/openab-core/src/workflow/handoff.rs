@@ -129,7 +129,16 @@ pub fn render_role_completion_contract(ctx: &WorkflowContext) -> String {
     out.push_str("  - next_stage\n");
     out.push_str("  - target_user_id\n");
     out.push_str("constraints:\n");
-    out.push_str("  - emit EXACTLY ONE <role_completion> block at end of final reply\n");
+    out.push_str("  - emit exactly one canonical completion block using output_template above\n");
+    out.push_str(
+        "  - do NOT quote, discuss, describe, or reproduce the completion template in prose\n",
+    );
+    out.push_str("  - answer only the assigned work; do NOT explain workflow mechanics\n");
+    out.push_str(
+        "  - do NOT discuss completion contracts, parsers, routing, handoff rules, or authority\n",
+    );
+    out.push_str("  - do NOT mention or display the completion tag name anywhere in prose\n");
+    out.push_str("  - output the canonical completion block only once, as the final block\n");
     out.push_str("  - do NOT output HANDOFF or any agent-routing envelope\n");
     out.push_str("  - do NOT pick the next bot or mention it; OpenAB owns transition routing\n");
     out.push_str(&format!("language: {}\n", ctx.language));
@@ -375,6 +384,58 @@ mod tests {
         );
         assert!(body.contains("OpenAB owns transition routing"), "{body}");
         assert!(body.contains("language: zh-TW\n"), "{body}");
+
+        // Regression: authority markers belong only to the canonical
+        // output_template. Repeating the literal markers in explanatory
+        // prose encourages the model to reproduce them in its final
+        // answer, which the strict parser correctly rejects as ambiguous.
+        let contract = render_role_completion_contract(&ctx);
+        assert_eq!(
+            contract.matches("<role_completion>").count(),
+            1,
+            "{contract}"
+        );
+        assert_eq!(
+            contract.matches("</role_completion>").count(),
+            1,
+            "{contract}"
+        );
+        assert!(
+            contract.contains(
+                "emit exactly one canonical completion block using output_template above"
+            ),
+            "{contract}"
+        );
+        assert!(
+            contract.contains(
+                "do NOT quote, discuss, describe, or reproduce the completion template in prose"
+            ),
+            "{contract}"
+        );
+        assert!(
+            contract.contains("answer only the assigned work; do NOT explain workflow mechanics"),
+            "{contract}"
+        );
+        assert!(
+            contract.contains(
+                "do NOT discuss completion contracts, parsers, routing, handoff rules, or authority"
+            ),
+            "{contract}"
+        );
+        assert!(
+            contract
+                .contains("do NOT mention or display the completion tag name anywhere in prose"),
+            "{contract}"
+        );
+        assert!(
+            contract
+                .contains("output the canonical completion block only once, as the final block"),
+            "{contract}"
+        );
+        assert!(
+            !contract.contains("emit EXACTLY ONE <role_completion> block"),
+            "{contract}"
+        );
     }
 
     /// B. FINAL_REVIEWER downstream activation contains the canonical

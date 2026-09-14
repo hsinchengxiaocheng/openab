@@ -259,9 +259,13 @@ native role and assignment for this turn.\n\
 \
 For AAP-native terminal role completion, follow the canonical \
 <role_completion_contract> supplied in the current WORKFLOW_DISPATCH assignment. \
-Do not emit legacy standalone verdict tokens such as VERIFIER_PASS, \
-VERIFIER_FAIL, FINAL_REVIEWER_PASS, or FINAL_REVIEWER_FAIL. ACP end_turn alone \
-is not a workflow verdict.\n\
+Answer only the assigned work. Do not explain workflow mechanics, completion \
+contracts, parsers, routing, handoff rules, or authority in the assistant-visible \
+reply. Do not mention or display the completion tag name in prose. Append the \
+canonical completion block directly at the end and end the reply. Do not emit \
+legacy standalone verdict tokens such as VERIFIER_PASS, VERIFIER_FAIL, \
+FINAL_REVIEWER_PASS, or FINAL_REVIEWER_FAIL. ACP end_turn alone is not a \
+workflow verdict.\n\
 </native_work_authority>",
         metadata.dispatch_id,
         metadata.workflow_run_id,
@@ -923,6 +927,19 @@ mod tests {
         // Legacy projections remain non-authoritative (Test 6).
         assert!(block.contains("workflow_assignment.json"));
         assert!(block.contains("non-authoritative projections"));
+
+        // Native completion authority must suppress control-plane
+        // narration in assistant-visible output. The strict parser
+        // scans the whole reply, so prose must never repeat the
+        // canonical completion tag name.
+        assert!(block.contains("Answer only the assigned work."));
+        assert!(block.contains(
+            "Do not explain workflow mechanics, completion contracts, parsers, routing, handoff rules, or authority"
+        ));
+        assert!(block.contains("Do not mention or display the completion tag name in prose"));
+        assert!(block.contains(
+            "Append the canonical completion block directly at the end and end the reply"
+        ));
     }
 
     #[test]
