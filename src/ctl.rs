@@ -1556,6 +1556,29 @@ impl CtlHandler for RuntimeHandler {
             );
         }
         let channel = crate::adapter::ChannelRef::from(structured);
+        // Delivery routing remains authoritative for all native-work handling.
+        // A Discord message-created thread is the one exception where its
+        // starter message lives in the parent channel: Discord assigns that
+        // starter message ID as the new thread ID. Build a reaction-only
+        // reference for that shape so status emoji calls target the message's
+        // actual channel, without changing delivery/workflow routing.
+        let reaction_channel = if channel.platform == "discord"
+            && channel.origin_event_id.as_deref() == Some(channel.channel_id.as_str())
+        {
+            if let Some(parent_id) = channel.parent_id.as_ref() {
+                crate::adapter::ChannelRef {
+                    platform: channel.platform.clone(),
+                    channel_id: parent_id.clone(),
+                    thread_id: None,
+                    parent_id: None,
+                    origin_event_id: channel.origin_event_id.clone(),
+                }
+            } else {
+                channel.clone()
+            }
+        } else {
+            channel.clone()
+        };
         let Some(adapter) = self.adapters.get(&channel.platform).cloned() else {
             return agent_work_error(
                 "NATIVE_DELIVERY_TARGET_UNAVAILABLE",
@@ -1636,8 +1659,14 @@ impl CtlHandler for RuntimeHandler {
             prompt: request.assignment.clone(),
             extra_blocks: Vec::new(),
             trigger_msg: MessageRef {
-                channel: channel.clone(),
-                message_id: request.dispatch_id.clone(),
+                channel: reaction_channel,
+                // Native dispatch IDs identify scheduler work, not Discord
+                // messages. Reactions must only target the authoritative
+                // inbound Discord message identity carried by the delivery
+                // destination. An absent origin event is admitted for
+                // backwards compatibility; the empty ID is intentionally
+                // non-actionable so dispatch disables cosmetic reactions.
+                message_id: channel.origin_event_id.clone().unwrap_or_default(),
             },
             arrived_at: Instant::now(),
             estimated_tokens: request.assignment.len() / 4,
@@ -1915,6 +1944,7 @@ mod tests {
         calls: AtomicUsize,
         admission_id: String,
         last_admission: StdMutex<Option<(ChannelRef, Option<NativeWorkflowMetadata>)>>,
+        last_trigger_msg: StdMutex<Option<MessageRef>>,
     }
 
     impl RecordingAdmissionPort {
@@ -1923,6 +1953,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 admission_id: admission_id.into(),
                 last_admission: StdMutex::new(None),
+                last_trigger_msg: StdMutex::new(None),
             }
         }
 
@@ -1932,6 +1963,14 @@ mod tests {
 
         fn last_admission(&self) -> (ChannelRef, Option<NativeWorkflowMetadata>) {
             self.last_admission
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("admission request was recorded")
+        }
+
+        fn last_trigger_msg(&self) -> MessageRef {
+            self.last_trigger_msg
                 .lock()
                 .unwrap()
                 .clone()
@@ -1950,6 +1989,7 @@ mod tests {
                 request.conversation.clone(),
                 request.native_workflow.clone(),
             ));
+            *self.last_trigger_msg.lock().unwrap() = Some(request.message.trigger_msg.clone());
             Ok(WorkAdmissionAck {
                 admission_id: self.admission_id.clone(),
                 conversation_key: request.conversation.session_pool_key(),
@@ -2454,6 +2494,92 @@ mod tests {
         let (channel, _metadata) = admission.last_admission();
         assert_eq!(channel.platform, "discord");
         assert_eq!(channel.channel_id, "111111111111111111");
+    }
+
+    #[tokio::test]
+    async fn native_work_reacts_to_message_created_thread_starter_in_parent_channel() {
+        let admission = Arc::new(RecordingAdmissionPort::new("admission-reaction-anchor"));
+        let handler = native_work_handler_with_trust(
+            admission.clone(),
+            Some(trust_allowing_only(&["222222222222222222"])),
+        );
+        let mut request = native_work_request();
+        request.dispatch_id = "oad-dispatch-not-a-discord-snowflake".into();
+        request.delivery_destination = Some(AgentWorkDeliveryDestination {
+            platform: "discord".into(),
+            channel_id: "222222222222222222".into(),
+            thread_id: None,
+            parent_id: Some("111111111111111111".into()),
+            origin_event_id: Some("222222222222222222".into()),
+        });
+
+        assert!(handler.handle_agent_work(Some(&request)).await.ok);
+        let trigger = admission.last_trigger_msg();
+        assert_eq!(trigger.message_id, "222222222222222222");
+        assert_eq!(trigger.channel.channel_id, "111111111111111111");
+        assert!(trigger.channel.thread_id.is_none());
+        assert_ne!(trigger.message_id, request.dispatch_id);
+
+        let (delivery_channel, metadata) = admission.last_admission();
+        assert_eq!(delivery_channel.channel_id, "222222222222222222");
+        assert_eq!(
+            delivery_channel.parent_id.as_deref(),
+            Some("111111111111111111")
+        );
+        assert_eq!(
+            metadata
+                .and_then(|metadata| metadata.delivery_destination)
+                .expect("native metadata retains delivery destination")
+                .channel_id,
+            "222222222222222222"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_work_reacts_to_existing_thread_message_in_thread_channel() {
+        let admission = Arc::new(RecordingAdmissionPort::new("admission-existing-thread"));
+        let handler = native_work_handler_with_trust(
+            admission.clone(),
+            Some(trust_allowing_only(&["222222222222222222"])),
+        );
+        let mut request = native_work_request();
+        request.delivery_destination = Some(AgentWorkDeliveryDestination {
+            platform: "discord".into(),
+            channel_id: "222222222222222222".into(),
+            thread_id: None,
+            parent_id: Some("111111111111111111".into()),
+            origin_event_id: Some("333333333333333333".into()),
+        });
+
+        assert!(handler.handle_agent_work(Some(&request)).await.ok);
+        let trigger = admission.last_trigger_msg();
+        assert_eq!(trigger.message_id, "333333333333333333");
+        assert_eq!(trigger.channel.channel_id, "222222222222222222");
+        assert_eq!(
+            trigger.channel.parent_id.as_deref(),
+            Some("111111111111111111")
+        );
+    }
+
+    #[tokio::test]
+    async fn native_work_without_origin_event_is_admitted_with_empty_reaction_anchor() {
+        let admission = Arc::new(RecordingAdmissionPort::new("admission-no-reaction-anchor"));
+        let handler = native_work_handler_with_trust(
+            admission.clone(),
+            Some(trust_allowing_only(&["111111111111111111"])),
+        );
+        let mut request = native_work_request();
+        request.delivery_destination = Some(AgentWorkDeliveryDestination {
+            platform: "discord".into(),
+            channel_id: "111111111111111111".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: None,
+        });
+
+        assert!(handler.handle_agent_work(Some(&request)).await.ok);
+        assert_eq!(admission.calls(), 1);
+        assert!(admission.last_trigger_msg().message_id.is_empty());
     }
 
     /// G — operator-configured `allowed_channels=["111111111111111111"]` +
