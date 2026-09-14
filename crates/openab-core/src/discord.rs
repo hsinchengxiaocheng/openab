@@ -3469,17 +3469,21 @@ fn build_usage_reply(report: &UsageReport) -> (String, CreateEmbed) {
     (content, embed)
 }
 
-fn discord_msg_ref(msg: &Message) -> MessageRef {
+fn discord_msg_ref_from_ids(channel_id: String, message_id: String) -> MessageRef {
     MessageRef {
         channel: ChannelRef {
             platform: "discord".into(),
-            channel_id: msg.channel_id.get().to_string(),
+            channel_id,
             thread_id: None,
             parent_id: None,
-            origin_event_id: None,
+            origin_event_id: Some(message_id.clone()),
         },
-        message_id: msg.id.to_string(),
+        message_id,
     }
+}
+
+fn discord_msg_ref(msg: &Message) -> MessageRef {
+    discord_msg_ref_from_ids(msg.channel_id.get().to_string(), msg.id.to_string())
 }
 
 struct ExportResult {
@@ -4237,6 +4241,20 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::time::Instant;
+
+    #[test]
+    fn discord_msg_ref_preserves_inbound_message_identity() {
+        let message_id = "1548869600928731137".to_string();
+        let message_ref =
+            discord_msg_ref_from_ids("1536735741642547262".to_string(), message_id.clone());
+
+        assert_eq!(message_ref.message_id, message_id);
+        assert_eq!(
+            message_ref.channel.origin_event_id.as_deref(),
+            Some("1548869600928731137")
+        );
+        assert_eq!(message_ref.channel.channel_id, "1536735741642547262");
+    }
 
     struct RecordingAdmissionPort(AtomicUsize);
 
