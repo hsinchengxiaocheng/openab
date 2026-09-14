@@ -1068,7 +1068,15 @@ async fn dispatch_batch(
     if !assistant_status {
         let queued_emoji = &target.reactions_config().emojis.queued;
         for msg in batch.iter() {
-            let _ = adapter.add_reaction(&msg.trigger_msg, queued_emoji).await;
+            // Native work can be admitted without an inbound Discord message
+            // identity. In that compatibility case its trigger ID is empty,
+            // so reactions are cosmetic no-ops rather than invalid Discord
+            // API calls. Ordinary turns retain their existing behavior.
+            let has_native_reaction_anchor =
+                msg.native_workflow.is_none() || !msg.trigger_msg.message_id.is_empty();
+            if has_native_reaction_anchor {
+                let _ = adapter.add_reaction(&msg.trigger_msg, queued_emoji).await;
+            }
         }
     }
 
@@ -1608,8 +1616,10 @@ async fn dispatch_batch(
     let packed_block_count = content_blocks.len();
 
     let reactions_config = target.reactions_config().clone();
+    let reactions_enabled = reactions_config.enabled
+        && (native_workflow.is_none() || !trigger_msg.message_id.is_empty());
     let reactions = Arc::new(StatusReactionController::new(
-        reactions_config.enabled,
+        reactions_enabled,
         adapter.clone(),
         trigger_msg,
         reactions_config.emojis.clone(),
@@ -2717,6 +2727,57 @@ mod tests {
         async fn remove_reaction(&self, _msg: &MessageRef, _emoji: &str) -> Result<()> {
             Ok(())
         }
+        fn use_streaming(&self, _other_bot_present: bool) -> bool {
+            false
+        }
+    }
+
+    struct ReactionRecordingAdapter {
+        reactions: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    #[async_trait]
+    impl ChatAdapter for ReactionRecordingAdapter {
+        fn platform(&self) -> &'static str {
+            "mock"
+        }
+
+        fn message_limit(&self) -> usize {
+            2000
+        }
+
+        async fn send_message(&self, channel: &ChannelRef, _content: &str) -> Result<MessageRef> {
+            Ok(MessageRef {
+                channel: channel.clone(),
+                message_id: "mock-msg".into(),
+            })
+        }
+
+        async fn create_thread(
+            &self,
+            channel: &ChannelRef,
+            _trigger_msg: &MessageRef,
+            _title: &str,
+        ) -> Result<ChannelRef> {
+            Ok(channel.clone())
+        }
+
+        async fn add_reaction(&self, msg: &MessageRef, emoji: &str) -> Result<()> {
+            self.reactions
+                .lock()
+                .unwrap()
+                .push((msg.message_id.clone(), emoji.into()));
+            Ok(())
+        }
+
+        async fn remove_reaction(&self, msg: &MessageRef, emoji: &str) -> Result<()> {
+            self.reactions
+                .lock()
+                .unwrap()
+                .push((msg.message_id.clone(), emoji.into()));
+            Ok(())
+        }
+
         fn use_streaming(&self, _other_bot_present: bool) -> bool {
             false
         }
@@ -4264,6 +4325,69 @@ mod tests {
         .await;
 
         (mock.calls(), mock.session_keys(), mock)
+    }
+
+    async fn dispatch_with_reaction_recording(message: BufferedMessage) -> Vec<(String, String)> {
+        let target: Arc<dyn DispatchTarget> = Arc::new(MockDispatchTarget::new());
+        let reaction_calls = Arc::new(Mutex::new(Vec::new()));
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(ReactionRecordingAdapter {
+            reactions: reaction_calls.clone(),
+        });
+        let channel = message.trigger_msg.channel.clone();
+
+        dispatch_batch(
+            &channel.session_pool_key(),
+            &channel,
+            &target,
+            None,
+            &adapter,
+            vec![message],
+            false,
+        )
+        .await;
+
+        let calls = reaction_calls.lock().unwrap().clone();
+        calls
+    }
+
+    #[tokio::test]
+    async fn native_work_without_reaction_anchor_skips_cosmetic_reactions() {
+        let mut native = make_native_msg_targeted(
+            "perform bounded work",
+            "ArthurClaude",
+            "oad-not-a-discord-message",
+            "1539923659345502208",
+        );
+        native.trigger_msg.message_id.clear();
+
+        let reaction_calls = dispatch_with_reaction_recording(native).await;
+
+        assert!(
+            reaction_calls.is_empty(),
+            "native work without an inbound message identity must not call reaction APIs: {reaction_calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_discord_turns_keep_reaction_behavior() {
+        let mut ordinary = make_msg("human message", 10);
+        ordinary.trigger_msg.channel = ChannelRef {
+            platform: "discord".into(),
+            channel_id: "1539923659345502208".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: Some("222222222222222222".into()),
+        };
+        ordinary.trigger_msg.message_id = "222222222222222222".into();
+
+        let reaction_calls = dispatch_with_reaction_recording(ordinary).await;
+
+        assert!(
+            reaction_calls
+                .iter()
+                .any(|(message_id, _)| message_id == "222222222222222222"),
+            "ordinary Discord turns must retain reaction calls: {reaction_calls:?}"
+        );
     }
 
     #[tokio::test]
