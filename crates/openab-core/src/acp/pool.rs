@@ -2464,6 +2464,47 @@ impl SessionPool {
         }
     }
 
+    /// Resume one approval decision on the active ACP session for this thread.
+    pub async fn resume_approval(
+        &self,
+        thread_id: &str,
+        expected_session_id: &str,
+        approval_id: &str,
+        decision: &str,
+        conversation_id: &str,
+        expected_revision: u64,
+        identity: crate::acp::connection::AcpPromptIdentity,
+    ) -> Result<serde_json::Value> {
+        let expected_session_id = expected_session_id.to_string();
+        let approval_id = approval_id.to_string();
+        let decision = decision.to_string();
+        let conversation_id = conversation_id.to_string();
+
+        self.with_connection(thread_id, move |conn| {
+            Box::pin(async move {
+                let current_session_id = conn
+                    .current_session_id()
+                    .ok_or_else(|| anyhow!("no session"))?;
+
+                if current_session_id != expected_session_id {
+                    return Err(anyhow!(
+                        "approval session mismatch: pending approval is bound to a different ACP session"
+                    ));
+                }
+
+                conn.resume_approval(
+                    &approval_id,
+                    &decision,
+                    &conversation_id,
+                    expected_revision,
+                    &identity,
+                )
+                .await
+            })
+        })
+        .await
+    }
+
     /// Query account-level usage/billing from the backend agent for a session
     /// (kiro-cli extension). Fails when there is no active session for the
     /// thread or the backend does not support usage queries.
@@ -6824,6 +6865,53 @@ done
         assert_eq!(active_len(&pool).await, 1);
         assert!(is_active(&pool, "B").await);
         assert!(!is_active(&pool, "A").await);
+    }
+
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn approval_resume_rejects_mismatched_acp_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let agent_script = write_test_agent_script(temp.path());
+
+        let pool = SessionPool::with_test_state(
+            AgentConfig {
+                command: agent_script.to_string_lossy().into(),
+                args: Vec::new(),
+                working_dir: temp.path().to_string_lossy().into(),
+                env: HashMap::new(),
+                inherit_env: Vec::new(),
+                command_explicit: true,
+            },
+            SessionPoolTestState::default(),
+            temp.path().join("session_projects_approval_mismatch.json"),
+        );
+
+        pool.get_or_create("approval-thread", None)
+            .await
+            .expect("seed approval session");
+
+        let error = pool
+            .resume_approval(
+                "approval-thread",
+                "definitely-not-the-current-session",
+                "apr-123",
+                "approve",
+                "wfc-456",
+                2,
+                crate::acp::connection::AcpPromptIdentity {
+                    user_id: Some("user-123".into()),
+                    thread_id: Some("approval-thread".into()),
+                    openab_message_id: None,
+                },
+            )
+            .await
+            .expect_err("mismatched ACP session must fail closed");
+
+        assert!(
+            error.to_string().contains("approval session mismatch"),
+            "unexpected error: {error}"
+        );
     }
 
     // ── TEST R ────────────────────────────────────────────────────────────

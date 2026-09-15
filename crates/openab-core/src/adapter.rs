@@ -630,10 +630,24 @@ pub trait ChatAdapter: Send + Sync + 'static {
 
 // --- AdapterRouter ---
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingApprovalRecord {
+    pub approval_id: String,
+    pub conversation_id: String,
+    pub expected_revision: u64,
+    pub session_id: String,
+    pub identity: AcpPromptIdentity,
+}
+
 /// Shared logic for routing messages to ACP agents, managing sessions,
 /// streaming edits, and controlling reactions. Platform-independent.
 pub struct AdapterRouter {
     pool: Arc<SessionPool>,
+    pending_approvals: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, PendingApprovalRecord>
+        >
+    >,
     reactions_config: ReactionsConfig,
     table_mode: TableMode,
     prompt_hard_timeout: std::time::Duration,
@@ -704,6 +718,9 @@ impl AdapterRouter {
         }
         Self {
             pool,
+            pending_approvals: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             reactions_config,
             table_mode,
             prompt_hard_timeout: std::time::Duration::from_secs(prompt_hard_timeout_secs),
@@ -875,6 +892,81 @@ impl AdapterRouter {
     /// Access the underlying session pool (e.g. for config option queries).
     pub fn pool(&self) -> &Arc<SessionPool> {
         &self.pool
+    }
+
+
+    pub async fn capture_pending_approval(
+        &self,
+        session_key: &str,
+        record: PendingApprovalRecord,
+    ) {
+        self.pending_approvals
+            .lock()
+            .await
+            .insert(session_key.to_string(), record);
+    }
+
+    pub async fn pending_approval(
+        &self,
+        session_key: &str,
+    ) -> Option<PendingApprovalRecord> {
+        self.pending_approvals
+            .lock()
+            .await
+            .get(session_key)
+            .cloned()
+    }
+
+    pub async fn clear_pending_approval(
+        &self,
+        session_key: &str,
+    ) -> Option<PendingApprovalRecord> {
+        self.pending_approvals
+            .lock()
+            .await
+            .remove(session_key)
+    }
+
+
+    pub async fn resume_pending_approval(
+        &self,
+        session_key: &str,
+        caller_user_id: &str,
+        decision: &str,
+    ) -> Result<serde_json::Value> {
+        if decision != "approve" && decision != "deny" {
+            return Err(anyhow::anyhow!(
+                "invalid approval decision: expected approve or deny"
+            ));
+        }
+
+        let pending = self
+            .pending_approval(session_key)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("no pending approval for this session"))?;
+
+        if pending.identity.user_id.as_deref() != Some(caller_user_id) {
+            return Err(anyhow::anyhow!(
+                "approval identity mismatch: caller does not own this pending approval"
+            ));
+        }
+
+        let result = self
+            .pool
+            .resume_approval(
+                session_key,
+                &pending.session_id,
+                &pending.approval_id,
+                decision,
+                &pending.conversation_id,
+                pending.expected_revision,
+                pending.identity.clone(),
+            )
+            .await?;
+
+        self.clear_pending_approval(session_key).await;
+
+        Ok(result)
     }
 
     /// Access the reactions config (used by dispatch.rs).
@@ -1132,6 +1224,7 @@ impl AdapterRouter {
         let session_key_for_hook: String = thread_key.to_string();
         let channel_for_hook: crate::adapter::ChannelRef = thread_channel.clone();
         let terminal_delivery_worker = self.terminal_delivery_worker.clone();
+        let pending_approvals = self.pending_approvals.clone();
 
         let inner = self.pool
             .with_connection(thread_key, |conn| {
@@ -1142,6 +1235,7 @@ impl AdapterRouter {
             let channel = channel_for_hook.clone();
             let identity = identity.clone();
             Box::pin(async move {
+                let approval_identity = identity.clone();
                 let reset = conn.session_reset;
                 conn.session_reset = false;
 
@@ -1479,6 +1573,20 @@ impl AdapterRouter {
 
                     conn.prompt_done().await;
 
+                    if let Some(result) = terminal_result.as_ref() {
+                        let session_id = conn.current_session_id().unwrap_or("");
+                        if let Some(record) = pending_approval_from_result(
+                            result,
+                            session_id,
+                            &approval_identity,
+                        ) {
+                            pending_approvals
+                                .lock()
+                                .await
+                                .insert(session_key.clone(), record);
+                        }
+                    }
+
                     // An ACP terminal result that declares Runtime metadata is
                     // authoritative final delivery input.  Once configured it
                     // either hands off to the durable worker or fails closed;
@@ -1487,8 +1595,7 @@ impl AdapterRouter {
                         && is_terminal_stop_reason(&turn_result)
                         && terminal_result
                             .as_ref()
-                            .and_then(|result| result.get("metadata"))
-                            .is_some()
+                            .is_some_and(is_runtime_terminal_result)
                     {
                         let Some(worker) = terminal_delivery_worker.as_ref() else {
                             tracing::error!("terminal Runtime result received without durable delivery worker; final Discord reply suppressed");
@@ -1842,6 +1949,80 @@ impl AdapterRouter {
             })
             .await;
         inner
+    }
+}
+
+fn pending_approval_from_result(
+    result: &serde_json::Value,
+    session_id: &str,
+    identity: &AcpPromptIdentity,
+) -> Option<PendingApprovalRecord> {
+    let metadata = result.get("metadata")?.as_object()?;
+
+    if metadata
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        != Some("confirmation_required")
+    {
+        return None;
+    }
+
+    if metadata
+        .get("approval_required")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return None;
+    }
+
+    let approval_id = metadata
+        .get("approval_id")?
+        .as_str()?
+        .trim();
+    let conversation_id = metadata
+        .get("conversation_id")?
+        .as_str()?
+        .trim();
+    let expected_revision = metadata
+        .get("expected_revision")?
+        .as_u64()?;
+
+    if approval_id.is_empty()
+        || conversation_id.is_empty()
+        || session_id.trim().is_empty()
+    {
+        return None;
+    }
+
+    Some(PendingApprovalRecord {
+        approval_id: approval_id.to_string(),
+        conversation_id: conversation_id.to_string(),
+        expected_revision,
+        session_id: session_id.to_string(),
+        identity: identity.clone(),
+    })
+}
+
+fn is_runtime_terminal_result(result: &serde_json::Value) -> bool {
+    let Some(metadata) = result
+        .get("metadata")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
+    };
+
+    if metadata
+        .get("approval_required")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return false;
+    }
+
+    match metadata.get("status").and_then(serde_json::Value::as_str) {
+        Some("confirmation_required") => false,
+        Some("completed" | "failed" | "cancelled") => true,
+        _ => true,
     }
 }
 
@@ -3173,8 +3354,10 @@ mod tests {
 
 #[cfg(test)]
 mod directive_tests {
-    use super::parse_output_directives;
-    use super::{classify_empty_turn, SILENT_FAILURE_MSG};
+    use super::{
+        classify_empty_turn, pending_approval_from_result, parse_output_directives,
+        AcpPromptIdentity, SILENT_FAILURE_MSG,
+    };
     use crate::acp::TurnResult;
 
     #[test]
@@ -3383,6 +3566,79 @@ mod directive_tests {
         };
         let result = classify_empty_turn(None, &tr);
         assert_eq!(result, "_(no response)_");
+    }
+
+    #[test]
+    fn pending_approval_parser_accepts_complete_confirmation_required() {
+        let result = serde_json::json!({
+            "stopReason": "end_turn",
+            "metadata": {
+                "status": "confirmation_required",
+                "approval_required": true,
+                "approval_id": "apr-123",
+                "conversation_id": "wfc-456",
+                "expected_revision": 2
+            }
+        });
+
+        let identity = AcpPromptIdentity {
+            user_id: Some("user-123".into()),
+            thread_id: Some("thread-456".into()),
+            openab_message_id: Some("msg-789".into()),
+        };
+
+        let record =
+            pending_approval_from_result(&result, "acp-session-1", &identity)
+                .expect("complete approval metadata should parse");
+
+        assert_eq!(record.approval_id, "apr-123");
+        assert_eq!(record.conversation_id, "wfc-456");
+        assert_eq!(record.expected_revision, 2);
+        assert_eq!(record.session_id, "acp-session-1");
+        assert_eq!(record.identity, identity);
+    }
+
+    #[test]
+    fn pending_approval_parser_rejects_incomplete_metadata() {
+        let base = serde_json::json!({
+            "metadata": {
+                "status": "confirmation_required",
+                "approval_required": true,
+                "conversation_id": "wfc-456",
+                "expected_revision": 2
+            }
+        });
+
+        assert!(
+            pending_approval_from_result(
+                &base,
+                "acp-session-1",
+                &AcpPromptIdentity::default(),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn pending_approval_parser_rejects_completed_result() {
+        let result = serde_json::json!({
+            "metadata": {
+                "status": "completed",
+                "approval_required": false,
+                "approval_id": "apr-123",
+                "conversation_id": "wfc-456",
+                "expected_revision": 2
+            }
+        });
+
+        assert!(
+            pending_approval_from_result(
+                &result,
+                "acp-session-1",
+                &AcpPromptIdentity::default(),
+            )
+            .is_none()
+        );
     }
 
     #[test]

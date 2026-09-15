@@ -66,8 +66,16 @@ while IFS= read -r line; do
       printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"progress"}}}}'
       if [ "$FAKE_MODE" = "missing-runtime" ]; then
         printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn","metadata":{"workflow_run_id":"WORKFLOW-B","conversation_id":"CONVERSATION-C"}}}'
+      elif [ "$FAKE_MODE" = "awaiting-approval" ] || [ "$FAKE_MODE" = "awaiting-approval-resume-error" ]; then
+        printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn","metadata":{"status":"confirmation_required","approval_required":true,"approval_id":"APR-A","expected_revision":2,"runtime_run_id":"RUNTIME-A","run_id":"RUNTIME-A","conversation_id":"CONVERSATION-C"}}}'
       else
         printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn","metadata":{"runtime_run_id":"RUNTIME-A","run_id":"RUNTIME-A","workflow_run_id":"WORKFLOW-B","conversation_id":"CONVERSATION-C"}}}'
+      fi ;;
+    *'"method":"session/resume"'*)
+      if [ "$FAKE_MODE" = "resume-error" ] || [ "$FAKE_MODE" = "awaiting-approval-resume-error" ]; then
+        printf '%s\n' '{"jsonrpc":"2.0","id":4,"error":{"code":-32000,"message":"fake resume failure"}}'
+      else
+        printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"status":"accepted"}}'
       fi ;;
   esac
 done
@@ -324,4 +332,137 @@ async fn durable_terminal_port_failure_has_no_legacy_discord_fallback() {
     let seen = observations.lock().unwrap();
     assert!(seen.sends.is_empty());
     assert_eq!(seen.edits, 0);
+}
+
+
+#[tokio::test]
+async fn failed_approval_resume_preserves_pending_approval() {
+    let _lock = ENV_LOCK.lock().await;
+    let temp = TempDir::new().unwrap();
+    let _env = EnvGuard::install(temp.path());
+
+    let db_path = temp.path().join("approval-resume-error.db");
+    let repo = Arc::new(TerminalDeliveryRepository::open_path(&db_path).unwrap());
+    let lookup = Arc::new(RecordingLookup::default());
+
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    let adapter: Arc<dyn ChatAdapter> = Arc::new(RecordingDiscord {
+        observations,
+        database_path: db_path,
+    });
+
+    let router = router_for(
+        &temp,
+        "awaiting-approval-resume-error",
+        repo,
+        lookup.clone(),
+    );
+
+    router.handle_message(&adapter, context()).await.unwrap();
+
+    assert!(
+        router.pending_approval("discord:1").await.is_some(),
+        "confirmation-required response must create pending approval"
+    );
+
+    let error = router
+        .resume_pending_approval("discord:1", "user-1", "approve")
+        .await
+        .expect_err("ACP resume failure must propagate");
+
+    assert!(
+        error.to_string().contains("fake resume failure"),
+        "unexpected error: {error}"
+    );
+
+    assert!(
+        router.pending_approval("discord:1").await.is_some(),
+        "failed approval resume must preserve pending approval"
+    );
+
+    assert!(
+        lookup.calls.lock().unwrap().is_empty(),
+        "failed approval resume must not enter terminal-result lookup"
+    );
+}
+
+#[tokio::test]
+async fn awaiting_approval_end_turn_does_not_enter_durable_terminal_delivery() {
+    let _lock = ENV_LOCK.lock().await;
+    let temp = TempDir::new().unwrap();
+    let _env = EnvGuard::install(temp.path());
+
+    let db_path = temp.path().join("approval.db");
+    let repo = Arc::new(TerminalDeliveryRepository::open_path(&db_path).unwrap());
+    let lookup = Arc::new(RecordingLookup::default());
+
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    let adapter: Arc<dyn ChatAdapter> = Arc::new(RecordingDiscord {
+        observations,
+        database_path: db_path,
+    });
+
+    let router = router_for(&temp, "awaiting-approval", repo, lookup.clone());
+
+    router.handle_message(&adapter, context()).await.unwrap();
+
+    assert!(
+        lookup.calls.lock().unwrap().is_empty(),
+        "awaiting approval must not query Runtime terminal-result"
+    );
+
+
+    let pending = router
+        .pending_approval("discord:1")
+        .await
+        .expect("awaiting approval should persist pending approval");
+
+    assert_eq!(pending.approval_id, "APR-A");
+    assert_eq!(pending.conversation_id, "CONVERSATION-C");
+    assert_eq!(pending.expected_revision, 2);
+    assert_eq!(pending.identity.user_id.as_deref(), Some("user-1"));
+
+
+    let error = router
+        .resume_pending_approval("discord:1", "different-user", "approve")
+        .await
+        .expect_err("different Discord user must not approve");
+
+    assert!(
+        error.to_string().contains("approval identity mismatch"),
+        "unexpected error: {error}"
+    );
+
+    assert!(
+        router.pending_approval("discord:1").await.is_some(),
+        "identity mismatch must not consume pending approval"
+    );
+
+
+    let error = router
+        .resume_pending_approval("discord:1", "user-1", "maybe")
+        .await
+        .expect_err("invalid decision must fail closed");
+
+    assert!(
+        error.to_string().contains("invalid approval decision"),
+        "unexpected error: {error}"
+    );
+
+    assert!(
+        router.pending_approval("discord:1").await.is_some(),
+        "invalid decision must not consume pending approval"
+    );
+
+    let result = router
+        .resume_pending_approval("discord:1", "user-1", "approve")
+        .await
+        .expect("valid approval should resume ACP session");
+
+    assert_eq!(result["status"], "accepted");
+
+    assert!(
+        router.pending_approval("discord:1").await.is_none(),
+        "successful approval resume must consume pending approval"
+    );
 }

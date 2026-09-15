@@ -82,6 +82,25 @@ fn session_prompt_params(
     })
 }
 
+fn session_resume_params(
+    session_id: &str,
+    approval_id: &str,
+    decision: &str,
+    conversation_id: &str,
+    expected_revision: u64,
+    identity: &AcpPromptIdentity,
+) -> Value {
+    json!({
+        "sessionId": session_id,
+        "approvalId": approval_id,
+        "decision": decision,
+        "conversationId": conversation_id,
+        "expectedRevision": expected_revision,
+        "userId": identity.user_id,
+        "threadId": identity.thread_id,
+    })
+}
+
 /// Serialize an outgoing JSON-RPC request before ACP stdio line framing.
 fn serialize_json_rpc_request(request: &JsonRpcRequest) -> Result<String> {
     Ok(serde_json::to_string(request)?)
@@ -1109,6 +1128,38 @@ impl AcpConnection {
             .ok_or_else(|| anyhow!("could not parse usage response from agent"))
     }
 
+    /// Resume one approval decision on the currently bound ACP session.
+    pub async fn resume_approval(
+        &mut self,
+        approval_id: &str,
+        decision: &str,
+        conversation_id: &str,
+        expected_revision: u64,
+        identity: &AcpPromptIdentity,
+    ) -> Result<Value> {
+        let session_id = self
+            .current_session_id()
+            .ok_or_else(|| anyhow!("no session"))?
+            .to_string();
+
+        let resp = self
+            .send_request(
+                "session/resume",
+                Some(session_resume_params(
+                    &session_id,
+                    approval_id,
+                    decision,
+                    conversation_id,
+                    expected_revision,
+                    identity,
+                )),
+            )
+            .await?;
+
+        resp.result
+            .ok_or_else(|| anyhow!("empty session/resume response"))
+    }
+
     /// Send a prompt with content blocks (text and/or images) and return a receiver
     /// for streaming notifications. The final message on the channel will have id set
     /// (the prompt response).
@@ -1341,7 +1392,8 @@ impl Drop for AcpConnection {
 mod tests {
     use super::{
         build_agent_env, build_permission_response, build_permission_response_with_policy,
-        pick_best_option, session_prompt_params, tool_kind_denied_for_read_only,
+        pick_best_option, session_prompt_params, session_resume_params,
+        tool_kind_denied_for_read_only,
         tool_title_denied_for_read_only, AcpPromptIdentity, WritePolicyGuard,
         WRITE_POLICY_MODIFY_ALLOWED, WRITE_POLICY_READ_ONLY,
     };
@@ -1438,6 +1490,52 @@ mod tests {
         assert_eq!(params["openab_message_id"], "inbound-discord-mid");
         // This is the inbound trigger identity, never a terminal-delivery id.
         assert_ne!(params["openab_message_id"], "terminal-delivery-mid");
+    }
+
+    #[test]
+    fn session_resume_params_preserve_approval_cas_and_identity() {
+        let params = session_resume_params(
+            "acp-session-789",
+            "apr-123",
+            "approve",
+            "wfc-456",
+            2,
+            &AcpPromptIdentity {
+                user_id: Some("user-123".into()),
+                thread_id: Some("thread-456".into()),
+                openab_message_id: Some("inbound-discord-mid".into()),
+            },
+        );
+
+        assert_eq!(params["sessionId"], "acp-session-789");
+        assert_eq!(params["approvalId"], "apr-123");
+        assert_eq!(params["decision"], "approve");
+        assert_eq!(params["conversationId"], "wfc-456");
+        assert_eq!(params["expectedRevision"], 2);
+        assert_eq!(params["userId"], "user-123");
+        assert_eq!(params["threadId"], "thread-456");
+        assert!(params.get("openab_message_id").is_none());
+    }
+
+    #[test]
+    fn session_resume_params_preserve_non_thread_null() {
+        let params = session_resume_params(
+            "acp-session-789",
+            "apr-123",
+            "deny",
+            "wfc-456",
+            7,
+            &AcpPromptIdentity {
+                user_id: Some("user-123".into()),
+                thread_id: None,
+                openab_message_id: None,
+            },
+        );
+
+        assert_eq!(params["decision"], "deny");
+        assert_eq!(params["expectedRevision"], 7);
+        assert_eq!(params["userId"], "user-123");
+        assert!(params["threadId"].is_null());
     }
 
     #[test]
