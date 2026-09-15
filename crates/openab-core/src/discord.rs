@@ -2568,6 +2568,13 @@ impl Handler {
         let session_key = format!("discord:{}", cmd.channel_id.get());
         let caller_user_id = cmd.user.id.get().to_string();
 
+        tracing::info!(
+            command = decision,
+            session_key = %session_key,
+            caller_user_id = %caller_user_id,
+            "discord approval command received"
+        );
+
         let followup = match self
             .router
             .resume_pending_approval(&session_key, &caller_user_id, decision)
