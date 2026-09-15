@@ -2170,6 +2170,9 @@ impl EventHandler for Handler {
             CreateCommand::new("models").description("Select the AI model for this session"),
             CreateCommand::new("agents").description("Select the agent mode for this session"),
             CreateCommand::new("cancel").description("Cancel the current operation"),
+            CreateCommand::new("approve")
+                .description("Approve the pending operation for this session"),
+            CreateCommand::new("deny").description("Deny the pending operation for this session"),
             CreateCommand::new("cancel-all")
                 .description("Cancel current operation and drop all buffered messages"),
             CreateCommand::new("reset").description("Reset the conversation session"),
@@ -2302,6 +2305,12 @@ impl EventHandler for Handler {
             }
             Interaction::Command(cmd) if cmd.data.name == "cancel" => {
                 self.handle_cancel_command(&ctx, &cmd).await;
+            }
+            Interaction::Command(cmd) if cmd.data.name == "approve" => {
+                self.handle_approval_command(&ctx, &cmd, "approve").await;
+            }
+            Interaction::Command(cmd) if cmd.data.name == "deny" => {
+                self.handle_approval_command(&ctx, &cmd, "deny").await;
             }
             Interaction::Command(cmd) if cmd.data.name == "cancel-all" => {
                 self.handle_cancel_all_command(&ctx, &cmd).await;
@@ -2535,6 +2544,52 @@ impl Handler {
         };
         if let Err(e) = cmd.create_followup(&ctx.http, followup).await {
             tracing::error!(error = %e, "failed to send /usage followup");
+        }
+    }
+
+    async fn handle_approval_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+        decision: &str,
+    ) {
+        let defer = CreateInteractionResponse::Defer(
+            CreateInteractionResponseMessage::new().ephemeral(true),
+        );
+        if let Err(e) = cmd.create_response(&ctx.http, defer).await {
+            tracing::error!(
+                error = %e,
+                decision,
+                "failed to defer approval command response"
+            );
+            return;
+        }
+
+        let session_key = format!("discord:{}", cmd.channel_id.get());
+        let caller_user_id = cmd.user.id.get().to_string();
+
+        let followup = match self
+            .router
+            .resume_pending_approval(&session_key, &caller_user_id, decision)
+            .await
+        {
+            Ok(_) if decision == "approve" => CreateInteractionResponseFollowup::new()
+                .content("✅ Pending operation approved.")
+                .ephemeral(true),
+            Ok(_) => CreateInteractionResponseFollowup::new()
+                .content("⛔ Pending operation denied.")
+                .ephemeral(true),
+            Err(e) => CreateInteractionResponseFollowup::new()
+                .content(format!("⚠️ {e}"))
+                .ephemeral(true),
+        };
+
+        if let Err(e) = cmd.create_followup(&ctx.http, followup).await {
+            tracing::error!(
+                error = %e,
+                decision,
+                "failed to send approval command followup"
+            );
         }
     }
 
