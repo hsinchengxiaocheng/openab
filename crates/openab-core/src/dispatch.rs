@@ -1532,7 +1532,10 @@ async fn dispatch_batch(
                     trace_id: session_key.to_string(),
                     task_id: None,
                     target_workflow_id,
-                    primary_agent: agent_name.unwrap_or("").to_string(),
+                    primary_agent: aap_cfg
+                        .and_then(|cfg| cfg.primary_agent.as_deref())
+                        .unwrap_or_else(|| agent_name.unwrap_or(""))
+                        .to_string(),
                     language,
                     metadata: crate::autonomous_ingress::AutonomousIngressMetadata {
                         discord_message_id: Some(trigger_msg.message_id.clone()),
@@ -4666,6 +4669,7 @@ mod tests {
     fn phase64_config(agents: &[&str], universal: bool) -> crate::config::AutonomousIngressConfig {
         crate::config::AutonomousIngressConfig {
             aap_agents: agents.iter().map(|s| s.to_string()).collect(),
+            primary_agent: None,
             aap_runtime_url: "http://127.0.0.1:8000".into(),
             aap_credential_env: "TEST_TOKEN_ENV".into(),
             project_id: "arthur-ai-platform".into(),

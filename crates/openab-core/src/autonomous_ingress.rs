@@ -1043,6 +1043,7 @@ mod tests {
     fn cfg_with_agents(agents: &[&str], universal: bool) -> AutonomousIngressConfig {
         AutonomousIngressConfig {
             aap_agents: agents.iter().map(|s| s.to_string()).collect(),
+            primary_agent: None,
             aap_runtime_url: "http://127.0.0.1:8000".into(),
             aap_credential_env: "TEST_TOKEN_ENV".into(),
             project_id: "arthur-ai-platform".into(),
@@ -1523,6 +1524,7 @@ mod tests {
     fn autonomous_ingress_config_without_credential_fails_closed() {
         let cfg = AutonomousIngressConfig {
             aap_agents: vec!["ArthurClaude".into()],
+            primary_agent: None,
             aap_runtime_url: "http://127.0.0.1:8000".into(),
             // Use a credential env var name that is NOT set in the
             // test process. Production startup-time check is
