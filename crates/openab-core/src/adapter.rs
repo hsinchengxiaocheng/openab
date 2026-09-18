@@ -827,18 +827,27 @@ impl AdapterRouter {
     /// fallback should consult AAP Runtime. Reading at call time (not
     /// cached at startup) lets test fixtures mutate the env without
     /// rebuilding the router.
-    pub fn resolved_agent_name(&self) -> Option<&'static str> {
-        // `current_agent_identity_from_env` reads `ARTHUR_AGENT_NAME`
-        // each call. The returned `AgentIdentity` borrows from a
-        // process-global cache inside the identity module, so the
-        // `&'static str` projection is sound for the daemon's
-        // lifetime. Returning `None` for unknown identities is the
-        // documented fail-closed behavior — never fall through to a
-        // silent default.
-        match crate::workflow::identity::current_agent_identity_from_env() {
-            Ok(id) => Some(id.as_str()),
-            Err(_) => None,
+    pub fn resolved_agent_name(&self) -> Option<&str> {
+        // Autonomous ingress has a distinct identity domain from the
+        // canonical three-agent workflow role gate. A front-door daemon
+        // such as `Arthuraap` must not be parsed through `AgentIdentity`,
+        // whose strict domain is ArthurClaude / ArthurCodex / ArthurGemini.
+        //
+        // Fail closed: return the raw daemon identity only when it is
+        // explicitly present in this deployment's autonomous allow-list.
+        // A13 and workflow-role resolution continue to use the strict
+        // canonical identity parser independently.
+        let raw = std::env::var(crate::workflow::identity::ARTHUR_AGENT_NAME_ENV).ok()?;
+        if raw.is_empty() {
+            return None;
         }
+
+        self.autonomous_ingress_config
+            .as_ref()?
+            .aap_agents
+            .iter()
+            .find(|configured| configured.as_str() == raw)
+            .map(String::as_str)
     }
 
     /// Phase 4.1: read-only access to the configured

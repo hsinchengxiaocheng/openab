@@ -434,11 +434,21 @@ pub struct AutonomousIngressConfig {
     /// Discord channel — or any sender when `aap_universal_humans = true`
     /// — are routed to AAP Runtime autonomous ingress.
     ///
-    /// Matching is exact case-sensitive against the canonical
-    /// [`crate::workflow::identity::AgentIdentity`] string form
-    /// (e.g. `ArthurClaude`, `ArthurCodex`, `ArthurGemini`).
+    /// Matching is exact and case-sensitive against the deployment's
+    /// front-door daemon identity (for example `Arthuraap`). This identity
+    /// domain is deliberately separate from the canonical three-agent
+    /// workflow identities.
     #[serde(default)]
     pub aap_agents: Vec<String>,
+
+    /// Optional canonical workflow PRIMARY identity supplied to AAP Runtime
+    /// after this front-door daemon is admitted by `aap_agents`.
+    ///
+    /// For legacy deployments where the daemon itself is one of the
+    /// canonical workflow agents this may be omitted; the admitted daemon
+    /// identity is then preserved as the workflow PRIMARY.
+    #[serde(default)]
+    pub primary_agent: Option<String>,
 
     /// HTTP base URL for the AAP Runtime autonomous ingress endpoint,
     /// e.g. `http://127.0.0.1:8000`. The gate calls
@@ -4474,6 +4484,28 @@ cancel_strategy = "noop"
     }
 
     // ---- Phase 4 production config-wiring tests (Section 19) ----
+
+    #[test]
+    fn autonomous_ingress_parses_front_door_and_primary_identities_separately() {
+        let raw = r#"
+[autonomous_ingress]
+aap_agents = ["Arthuraap"]
+primary_agent = "ArthurClaude"
+aap_runtime_url = "http://127.0.0.1:8000"
+project_id = "arthur-ai-platform"
+aap_universal_humans = false
+"#;
+
+        let cfg = parse_config_str(raw, "<test>").expect("autonomous ingress topology must parse");
+        let autonomous = cfg
+            .autonomous_ingress
+            .expect("autonomous ingress must be configured");
+
+        assert_eq!(autonomous.aap_agents, vec!["Arthuraap".to_string()]);
+        assert_eq!(autonomous.primary_agent.as_deref(), Some("ArthurClaude"));
+        assert!(autonomous.declares_agent("Arthuraap"));
+        assert!(!autonomous.declares_agent("ArthurClaude"));
+    }
 
     #[test]
     fn workflow_config_parses_tech_lead_user_ids() {
