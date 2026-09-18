@@ -1481,6 +1481,16 @@ async fn dispatch_batch(
                         first_msg.sender_is_bot,
                         authority_attachments,
                     );
+
+                // Phase 8.x — explicit WorkflowRun continuation authority.
+                // Only the leading canonical human-header block may
+                // declare a target. Ordinary prose is never promoted
+                // into execution authority. AAP Runtime validates the
+                // target and fails closed when continuation is illegal.
+                let target_workflow_id =
+                    crate::autonomous_ingress::extract_canonical_workflow_target(
+                        &original_human_prompt,
+                    );
                 // Phase 6.4.4 — assemble `user_objective` from the
                 // human prompt and the typed text-attachment bodies.
                 // When the human author did not supply a `message.txt`
@@ -1521,6 +1531,7 @@ async fn dispatch_batch(
                     title: canonical_title,
                     trace_id: session_key.to_string(),
                     task_id: None,
+                    target_workflow_id,
                     primary_agent: agent_name.unwrap_or("").to_string(),
                     language,
                     metadata: crate::autonomous_ingress::AutonomousIngressMetadata {
@@ -4778,6 +4789,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn phase8_canonical_workflow_target_reaches_autonomous_ingress_request() {
+        std::env::set_var("ARTHUR_AGENT_NAME", "ArthurClaude");
+
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids = std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+
+        let msg = make_msg_with_sender(
+            "Canonical workflow: wfr629e138f1defa7e9\n\nContinue the SAME workflow.",
+            20,
+            tech_lead_sender_json(tech_lead_id),
+        );
+
+        let fake = crate::autonomous_ingress::FakeAutonomousIngressClient::always_accept();
+
+        let client: Arc<dyn crate::autonomous_ingress::AutonomousIngressClient> = fake.clone();
+
+        let calls = run_phase64(
+            msg,
+            client,
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+
+        assert!(
+            calls.is_empty(),
+            "AAP accepted continuation; ordinary ACP must not run",
+        );
+
+        assert_eq!(fake.call_count(), 1);
+
+        let recorded = &fake.calls.lock().unwrap()[0];
+
+        assert_eq!(
+            recorded.target_workflow_id.as_deref(),
+            Some("wfr629e138f1defa7e9"),
+            "canonical workflow authority must reach AAP ingress",
+        );
+    }
+
+    #[tokio::test]
     async fn phase64_human_autonomous_request_routes_to_aap_before_acp() {
         // Spec scenario 1: a Tech-Lead-authorized human message arrives,
         // no workflow_assignment.json exists, the daemon is declared
@@ -5429,6 +5483,7 @@ mod tests {
             title: crate::autonomous_ingress::extract_canonical_title(prompt_text),
             trace_id: "trace-stale".into(),
             task_id: None,
+            target_workflow_id: None,
             primary_agent: "ArthurClaude".into(),
             language: None,
             metadata: crate::autonomous_ingress::AutonomousIngressMetadata::default(),
@@ -5469,6 +5524,7 @@ mod tests {
             title: crate::autonomous_ingress::extract_canonical_title(prompt_text),
             trace_id: "trace-no-asgn".into(),
             task_id: None,
+            target_workflow_id: None,
             primary_agent: "ArthurClaude".into(),
             language: None,
             metadata: crate::autonomous_ingress::AutonomousIngressMetadata::default(),
@@ -5551,6 +5607,7 @@ mod tests {
             title: crate::autonomous_ingress::extract_canonical_title(prompt_text),
             trace_id: "trace-legacy".into(),
             task_id: None,
+            target_workflow_id: None,
             primary_agent: "ArthurClaude".into(),
             language: Some("en".into()),
             metadata: crate::autonomous_ingress::AutonomousIngressMetadata::default(),
@@ -5937,6 +5994,7 @@ mod tests {
             title: crate::autonomous_ingress::extract_canonical_title(prompt_text),
             trace_id: "trace-stale-46".into(),
             task_id: None,
+            target_workflow_id: None,
             primary_agent: "ArthurClaude".into(),
             language: None,
             metadata: crate::autonomous_ingress::AutonomousIngressMetadata::default(),

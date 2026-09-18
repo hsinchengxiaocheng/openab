@@ -110,6 +110,51 @@ pub const CANONICAL_TITLE_HEADER: &str = "Canonical title:";
 /// existing canonical leading/trailing whitespace normalization
 /// (``str::strip`` on ``user_objective``); that normalization is
 /// orthogonal to and pre-dates this extractor.
+pub const CANONICAL_WORKFLOW_HEADER: &str = "Canonical workflow:";
+
+/// Phase 8.x — extract an explicit WorkflowRun continuation target
+/// from the leading canonical-header block.
+///
+/// Authority contract:
+///
+/// * Only the exact `Canonical workflow:` token is authoritative.
+/// * Leading blank lines are ignored.
+/// * `Canonical title:` may appear before the workflow header.
+/// * Once ordinary prose begins, scanning stops permanently.
+/// * Ordinary prose such as `workflow_id: ...` never acquires
+///   targeting authority.
+/// * The returned value is intentionally not interpreted here; AAP
+///   Runtime remains the canonical authority that validates whether
+///   the WorkflowRun exists and may legally be continued.
+pub fn extract_canonical_workflow_target(prompt: &str) -> Option<String> {
+    for raw_line in prompt.split('\n') {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+
+        if line.chars().all(|c| c.is_whitespace()) {
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix(CANONICAL_WORKFLOW_HEADER) {
+            let trimmed = rest.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            return Some(trimmed.to_string());
+        }
+
+        // Another recognized canonical header may precede the workflow
+        // header. Do not let it terminate the canonical-header block.
+        if line.strip_prefix(CANONICAL_TITLE_HEADER).is_some() {
+            continue;
+        }
+
+        // First non-canonical content terminates authority scanning.
+        return None;
+    }
+
+    None
+}
+
 pub fn extract_canonical_title(prompt: &str) -> Option<String> {
     for raw_line in prompt.split('\n') {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
@@ -421,6 +466,13 @@ pub struct AutonomousIngressRequest {
     pub title: Option<String>,
     pub trace_id: String,
     pub task_id: Option<String>,
+    /// Phase 8.x — explicit existing WorkflowRun continuation authority.
+    /// This value is sourced only from the canonical human-ingress
+    /// directive and is forwarded verbatim to AAP Runtime, which owns
+    /// existence/state/project/binding validation. Ordinary prompt prose
+    /// never populates this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_workflow_id: Option<String>,
     pub primary_agent: String,
     /// Phase 6.4.4 / 6.4.5 — language is the AAP canonical ingress
     /// boundary's authority, NOT the OpenAB dispatcher. The OpenAB
@@ -1162,6 +1214,7 @@ mod tests {
             title: None,
             trace_id: "trace-1".into(),
             task_id: None,
+            target_workflow_id: None,
             primary_agent: "ArthurClaude".into(),
             language: None,
             metadata: AutonomousIngressMetadata::default(),
@@ -1185,6 +1238,7 @@ mod tests {
             title: None,
             trace_id: "trace-1".into(),
             task_id: None,
+            target_workflow_id: None,
             primary_agent: "ArthurClaude".into(),
             language: None,
             metadata: AutonomousIngressMetadata::default(),
@@ -1307,6 +1361,7 @@ mod tests {
             title: Some("Phase 7.1 — Obsidian MCP".into()),
             trace_id: "trace-1".into(),
             task_id: None,
+            target_workflow_id: None,
             primary_agent: "ArthurClaude".into(),
             language: None,
             metadata: AutonomousIngressMetadata::default(),
@@ -1338,6 +1393,7 @@ mod tests {
             title: None,
             trace_id: "trace-1".into(),
             task_id: None,
+            target_workflow_id: None,
             primary_agent: "ArthurClaude".into(),
             language: None,
             metadata: AutonomousIngressMetadata::default(),
@@ -1404,6 +1460,7 @@ mod tests {
             title: extract_canonical_title(original),
             trace_id: "trace-1".into(),
             task_id: None,
+            target_workflow_id: None,
             primary_agent: "ArthurClaude".into(),
             language: None,
             metadata: AutonomousIngressMetadata::default(),
@@ -1682,6 +1739,7 @@ mod tests {
             title: extract_canonical_title(prompt_text),
             trace_id: "trace-1".into(),
             task_id: None,
+            target_workflow_id: None,
             primary_agent: "ArthurClaude".into(),
             language: None,
             metadata: AutonomousIngressMetadata::default(),
@@ -1733,6 +1791,7 @@ mod tests {
             title: extract_canonical_title(prompt_text),
             trace_id: "trace-1".into(),
             task_id: None,
+            target_workflow_id: None,
             primary_agent: "ArthurClaude".into(),
             language: None,
             metadata: AutonomousIngressMetadata::default(),
@@ -1989,5 +2048,140 @@ mod tests {
         assert_eq!(resolved.as_bytes(), b"body");
         assert_eq!(prompt_bytes_before, b"prompt".to_vec());
         assert_eq!(attachments[0].body.as_bytes(), body_bytes_before);
+    }
+}
+
+#[cfg(test)]
+mod phase8_continuation_identity_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_title_may_precede_canonical_workflow_header() {
+        let prompt = "Canonical title: Continuation acceptance\n\
+             Canonical workflow: wfr629e138f1defa7e9\n\n\
+             Continue the SAME workflow.";
+
+        assert_eq!(
+            extract_canonical_workflow_target(prompt).as_deref(),
+            Some("wfr629e138f1defa7e9"),
+        );
+    }
+
+    #[test]
+    fn canonical_workflow_may_precede_canonical_title_header() {
+        let prompt = "Canonical workflow: wfr629e138f1defa7e9\n\
+             Canonical title: Continuation acceptance\n\n\
+             Continue the SAME workflow.";
+
+        assert_eq!(
+            extract_canonical_workflow_target(prompt).as_deref(),
+            Some("wfr629e138f1defa7e9"),
+        );
+    }
+
+    #[test]
+    fn canonical_workflow_header_extracts_exact_target() {
+        let prompt = "Canonical workflow: wfr629e138f1defa7e9\n\nContinue the SAME workflow.";
+
+        assert_eq!(
+            extract_canonical_workflow_target(prompt).as_deref(),
+            Some("wfr629e138f1defa7e9"),
+        );
+    }
+
+    #[test]
+    fn ordinary_prose_workflow_reference_has_no_targeting_authority() {
+        let prompt = "Continue the SAME workflow:\nworkflow_id: wfr629e138f1defa7e9";
+
+        assert_eq!(
+            extract_canonical_workflow_target(prompt),
+            None,
+            "ordinary prose / workflow_id text must never become targeting authority",
+        );
+    }
+
+    #[test]
+    fn late_canonical_workflow_header_has_no_targeting_authority() {
+        let prompt = "Please continue this work.\nCanonical workflow: wfr629e138f1defa7e9";
+
+        assert_eq!(
+            extract_canonical_workflow_target(prompt),
+            None,
+            "canonical workflow authority must be declared at the canonical header boundary",
+        );
+    }
+
+    #[test]
+    fn malformed_or_empty_canonical_workflow_header_has_no_authority() {
+        assert_eq!(
+            extract_canonical_workflow_target("Canonical workflow:   \nbody"),
+            None,
+        );
+
+        assert_eq!(
+            extract_canonical_workflow_target("canonical workflow: wfr629e138f1defa7e9"),
+            None,
+        );
+
+        assert_eq!(
+            extract_canonical_workflow_target("# Canonical workflow: wfr629e138f1defa7e9"),
+            None,
+        );
+    }
+
+    #[test]
+    fn autonomous_ingress_request_serializes_target_workflow_id_when_present() {
+        let req = AutonomousIngressRequest {
+            protocol: "openab",
+            project_id: "arthur-ai-platform".into(),
+            transport: "DISCORD",
+            conversation_key: "discord:c:1".into(),
+            original_human_prompt: "Canonical workflow: wfr629e138f1defa7e9\n\ndo the work".into(),
+            user_objective: "Canonical workflow: wfr629e138f1defa7e9\n\ndo the work".into(),
+            title: None,
+            trace_id: "trace-1".into(),
+            task_id: None,
+            target_workflow_id: Some("wfr629e138f1defa7e9".into()),
+            primary_agent: "ArthurClaude".into(),
+            language: None,
+            metadata: AutonomousIngressMetadata::default(),
+            delivery_destination: None,
+        };
+
+        let value: serde_json::Value = serde_json::to_value(&req).expect("serialize");
+
+        assert_eq!(
+            value
+                .get("target_workflow_id")
+                .and_then(|value| value.as_str()),
+            Some("wfr629e138f1defa7e9"),
+        );
+    }
+
+    #[test]
+    fn autonomous_ingress_request_omits_target_workflow_id_when_absent() {
+        let req = AutonomousIngressRequest {
+            protocol: "openab",
+            project_id: "arthur-ai-platform".into(),
+            transport: "DISCORD",
+            conversation_key: "discord:c:1".into(),
+            original_human_prompt: "do the work".into(),
+            user_objective: "do the work".into(),
+            title: None,
+            trace_id: "trace-1".into(),
+            task_id: None,
+            target_workflow_id: None,
+            primary_agent: "ArthurClaude".into(),
+            language: None,
+            metadata: AutonomousIngressMetadata::default(),
+            delivery_destination: None,
+        };
+
+        let value: serde_json::Value = serde_json::to_value(&req).expect("serialize");
+
+        assert!(
+            value.get("target_workflow_id").is_none(),
+            "legacy/new-work requests must omit target_workflow_id entirely",
+        );
     }
 }
