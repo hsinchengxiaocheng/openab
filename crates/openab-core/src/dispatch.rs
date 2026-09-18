@@ -1815,11 +1815,19 @@ async fn invoke_workflow_hook_after_dispatch(
                 // metadata. Do NOT fall back to plain-token
                 // resolution here — that path is intentionally
                 // blocked on AAP-native dispatch.
+                let rejection_reason =
+                    crate::native_completion::explain_aap_native_completion_rejection(
+                        metadata,
+                        &hook.raw_assistant_text,
+                    )
+                    .unwrap_or_else(|| "unknown canonical completion rejection".to_string());
+
                 tracing::warn!(
                     workflow_run_id   = %metadata.workflow_run_id,
                     dispatch_id       = %metadata.dispatch_id,
                     lease_generation  = metadata.lease_generation,
                     role              = %metadata.role,
+                    rejection_reason  = %rejection_reason,
                     "native terminal turn has no unambiguous canonical role outcome; not capturing completion"
                 );
                 return;
@@ -4078,6 +4086,100 @@ mod tests {
         let pos_submit = logs.find("completion event submitted to port").unwrap();
         assert!(pos_entry < pos_outcome, "ordering broken: {logs}");
         assert!(pos_outcome < pos_submit, "ordering broken: {logs}");
+    }
+
+    #[tokio::test]
+    async fn native_tracing_malformed_final_reviewer_pass_logs_reason_without_capture() {
+        // Regression for the production incident where FINAL_REVIEWER emitted
+        // `result: <PASS>` instead of the canonical `result: PASS`.
+        //
+        // The malformed value must remain fail-closed, MUST NOT reach the
+        // completion port, and the post-turn warning must expose the parser's
+        // bounded diagnostic reason so operators do not have to wait for lease
+        // expiry to identify the formatting defect.
+        let mock = Arc::new(MockDispatchTarget::new());
+        let target: Arc<dyn DispatchTarget> = mock.clone();
+
+        let mut metadata = metadata_for_tracing();
+        metadata.role = "FINAL_REVIEWER".into();
+        metadata.agent = "ArthurGemini".into();
+
+        let hook = crate::workflow::service::WorkflowTurnHookInputs {
+            terminal: true,
+            stop_reason: Some("end_turn".into()),
+            raw_assistant_text: "<role_completion>\n\
+                 role: FINAL_REVIEWER\n\
+                 result: <PASS>\n\
+                 workflow_id: wfrun-trace\n\
+                 project_id: legacy-placeholder\n\
+                 project_root: /legacy-placeholder\n\
+                 </role_completion>"
+                .into(),
+            pinned_project_root: None,
+            session_key: "session-trace".into(),
+            channel: make_channel("T"),
+            agent_identity: None,
+            native_workflow: Some(metadata.clone()),
+        };
+
+        let logs = capture_logs(|| async move {
+            let target_inner = target.clone();
+            super::invoke_workflow_hook_after_dispatch(&target_inner, &hook).await;
+        })
+        .await;
+
+        // Fail closed: malformed FINAL_REVIEWER result must never create a
+        // NativeCompletionEvent.
+        assert!(
+            mock.native_events.lock().unwrap().is_empty(),
+            "malformed <PASS> must not reach native completion port"
+        );
+
+        // Preserve the existing warning surface.
+        assert!(
+            logs.contains(
+                "native terminal turn has no unambiguous canonical role outcome; not capturing completion"
+            ),
+            "fail-closed warning missing: {logs}"
+        );
+
+        // New observability contract: surface the bounded parser diagnostic.
+        assert!(
+            logs.contains("rejection_reason="),
+            "rejection_reason field missing: {logs}"
+        );
+        assert!(
+            logs.contains("invalid result") && logs.contains("<PASS>"),
+            "precise malformed-result diagnostic missing: {logs}"
+        );
+
+        // Correlation authority remains present.
+        assert!(logs.contains("workflow_run_id=wfrun-trace"), "{logs}");
+        assert!(logs.contains("dispatch_id=dispatch-trace"), "{logs}");
+        assert!(logs.contains("lease_generation=7"), "{logs}");
+        assert!(logs.contains("role=FINAL_REVIEWER"), "{logs}");
+
+        // No success-path observations may fire.
+        assert!(
+            !logs.contains("resolved canonical completion outcome"),
+            "malformed result must not resolve an outcome: {logs}"
+        );
+        assert!(
+            !logs.contains("completion event submitted to port"),
+            "malformed result must not submit a completion: {logs}"
+        );
+
+        // Do not dump the raw assistant block into tracing. The bounded
+        // diagnostic may contain `<PASS>`, but authority-bearing block fields
+        // must not be logged wholesale.
+        assert!(
+            !logs.contains("<role_completion>"),
+            "raw assistant completion block leaked into log: {logs}"
+        );
+        assert!(
+            !logs.contains("project_root: /legacy-placeholder"),
+            "raw assistant payload leaked into log: {logs}"
+        );
     }
 
     #[tokio::test]

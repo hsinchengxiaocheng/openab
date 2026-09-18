@@ -104,6 +104,34 @@ pub fn resolve_aap_native_completion_outcome(
     Some(outcome.result)
 }
 
+/// Explain why an AAP-native assistant turn did not produce a canonical
+/// completion outcome.
+///
+/// This helper is diagnostic-only.  It MUST NOT normalize malformed values
+/// (for example `<PASS>` -> `PASS`) and MUST NOT grant completion authority.
+/// The authoritative decision remains `resolve_aap_native_completion_outcome`.
+pub fn explain_aap_native_completion_rejection(
+    metadata: &crate::admission::NativeWorkflowMetadata,
+    raw_assistant_text: &str,
+) -> Option<String> {
+    use crate::role_completion_block::{
+        check_aap_native_claim_against_metadata, parse_role_completion_block, RoleCompletionParse,
+    };
+
+    match parse_role_completion_block(raw_assistant_text) {
+        RoleCompletionParse::NoClaim => Some("no canonical role_completion block".to_string()),
+        RoleCompletionParse::Ambiguous => Some("ambiguous role_completion blocks".to_string()),
+        RoleCompletionParse::Malformed { reason } => Some(reason),
+        RoleCompletionParse::Claim(claim) => {
+            if check_aap_native_claim_against_metadata(&claim, metadata).is_err() {
+                Some("role_completion claim does not match trusted dispatch metadata".to_string())
+            } else {
+                None
+            }
+        }
+    }
+}
+
 fn resolve_reviewer_outcome(role: &str, raw_assistant_text: &str) -> Option<String> {
     let tokens: Vec<&str> = raw_assistant_text
         .lines()
@@ -848,6 +876,43 @@ mod tests {
                         </role_completion>";
         let outcome = resolve_aap_native_completion_outcome(&metadata, malformed);
         assert_eq!(outcome, None);
+    }
+
+    #[test]
+    fn aap_native_angle_bracket_pass_is_rejected_with_diagnostic() {
+        let metadata = aap_native_metadata("FINAL_REVIEWER");
+        let text = well_formed_block("FINAL_REVIEWER", "<PASS>");
+
+        assert_eq!(
+            resolve_aap_native_completion_outcome(&metadata, &text),
+            None
+        );
+
+        let reason = explain_aap_native_completion_rejection(&metadata, &text)
+            .expect("malformed result must expose a diagnostic");
+
+        assert_eq!(reason, r#"invalid result "<PASS>""#);
+    }
+
+    #[test]
+    fn aap_native_diagnostic_does_not_normalize_angle_bracket_pass() {
+        let metadata = aap_native_metadata("FINAL_REVIEWER");
+
+        assert_eq!(
+            resolve_aap_native_completion_outcome(
+                &metadata,
+                &well_formed_block("FINAL_REVIEWER", "<PASS>"),
+            ),
+            None
+        );
+
+        assert_eq!(
+            resolve_aap_native_completion_outcome(
+                &metadata,
+                &well_formed_block("FINAL_REVIEWER", "PASS"),
+            ),
+            Some("PASS".into())
+        );
     }
 
     // 8. Multiple well-formed blocks rejected as ambiguous.
