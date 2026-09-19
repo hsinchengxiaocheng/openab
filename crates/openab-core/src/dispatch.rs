@@ -257,6 +257,16 @@ pub trait DispatchTarget: Send + Sync + 'static {
         &self,
     ) -> Option<Arc<dyn crate::autonomous_ingress::AutonomousIngressClient>>;
 
+    /// Explicit terminal-work reopen mutation capability.
+    ///
+    /// Default `None` keeps existing test doubles and legacy targets
+    /// fail-closed until they deliberately opt into this authority.
+    fn workflow_reopen_client(
+        &self,
+    ) -> Option<Arc<dyn crate::workflow_reopen::WorkflowReopenClient>> {
+        None
+    }
+
     /// Phase 6.4: optional AAP autonomous ingress config. `None`
     /// preserves legacy behavior.
     fn autonomous_ingress_config(&self) -> Option<&crate::config::AutonomousIngressConfig>;
@@ -364,6 +374,12 @@ impl DispatchTarget for AdapterRouter {
         &self,
     ) -> Option<Arc<dyn crate::autonomous_ingress::AutonomousIngressClient>> {
         AdapterRouter::autonomous_ingress_client(self)
+    }
+
+    fn workflow_reopen_client(
+        &self,
+    ) -> Option<Arc<dyn crate::workflow_reopen::WorkflowReopenClient>> {
+        AdapterRouter::workflow_reopen_client(self)
     }
 
     fn autonomous_ingress_config(&self) -> Option<&crate::config::AutonomousIngressConfig> {
@@ -1357,6 +1373,128 @@ async fn dispatch_batch(
                 author_is_bot,
                 &tech_lead_user_ids,
             );
+
+            // Phase 8.x — compute CURRENT-TURN HUMAN TEXT AUTHORITY once,
+            // before either explicit workflow mutation or ordinary autonomous
+            // ingress routing. Mutation authority must never inherit
+            // `aap_universal_humans`; only the explicit Tech Lead identity
+            // gate below may authorize reopen.
+            //
+            // SAME-MESSAGE COMPOSITION is preserved: visible prompt,
+            // typed sender_is_bot and typed message.txt attachment provenance
+            // all come from the same FIFO-first BufferedMessage.
+            let prompt_text =
+                batch.first().map(|m| m.prompt.clone()).unwrap_or_default();
+
+            let first_msg =
+                batch.first().expect("non-empty batch by A13 admit");
+
+            let authority_attachments: &[crate::dispatch::TextAttachment] =
+                &first_msg.discord_text_attachment_bodies;
+
+            let original_human_prompt =
+                crate::autonomous_ingress::resolve_current_human_prompt_authority(
+                    &prompt_text,
+                    first_msg.sender_is_bot,
+                    authority_attachments,
+                );
+
+            let target_workflow_id =
+                crate::autonomous_ingress::extract_canonical_workflow_target(
+                    &original_human_prompt,
+                );
+
+            let canonical_workflow_action =
+                crate::autonomous_ingress::classify_canonical_workflow_action(
+                    &original_human_prompt,
+                );
+
+            // An exact canonical action header with an unsupported or empty
+            // value is explicit mutation intent, but not valid authority.
+            // Consume it here fail-closed rather than reinterpreting it as
+            // ordinary autonomous ingress / continuation / ACP.
+            if canonical_workflow_action
+                == crate::autonomous_ingress::CanonicalWorkflowActionAuthority::Invalid
+            {
+                warn!(
+                    thread_key = %session_key,
+                    channel = %thread_channel.channel_id,
+                    sender_user_id = ?sender_user_id,
+                    "invalid canonical workflow action; fail-closed without ingress or ACP fallback",
+                );
+                return;
+            }
+
+            // Explicit mutation intent is a separate authority domain from
+            // ordinary autonomous ingress. Once exact reopen authority is
+            // present, this turn is consumed here on BOTH success and failure.
+            if canonical_workflow_action
+                == crate::autonomous_ingress::CanonicalWorkflowActionAuthority::ReopenWork
+            {
+                if !tech_lead_authorized {
+                    warn!(
+                        thread_key = %session_key,
+                        channel = %thread_channel.channel_id,
+                        sender_user_id = ?sender_user_id,
+                        action = "reopen-work",
+                        "workflow reopen denied: sender is not Tech Lead authorized; fail-closed",
+                    );
+                    return;
+                }
+
+                let Some(workflow_run_id) = target_workflow_id.as_deref() else {
+                    warn!(
+                        thread_key = %session_key,
+                        channel = %thread_channel.channel_id,
+                        action = "reopen-work",
+                        "workflow reopen denied: canonical workflow target missing; fail-closed",
+                    );
+                    return;
+                };
+
+                let Some(reopen_client) = target.workflow_reopen_client() else {
+                    warn!(
+                        thread_key = %session_key,
+                        channel = %thread_channel.channel_id,
+                        workflow_run_id = %workflow_run_id,
+                        action = "reopen-work",
+                        "workflow reopen client missing; fail-closed",
+                    );
+                    return;
+                };
+
+                match reopen_client.reopen_terminal_work(workflow_run_id).await {
+                    Ok(response) => {
+                        info!(
+                            thread_key = %session_key,
+                            channel = %thread_channel.channel_id,
+                            predecessor_workflow_run_id =
+                                %response.predecessor_workflow_run_id,
+                            successor_workflow_run_id =
+                                %response.successor_workflow_run_id,
+                            successor_state = %response.successor_state,
+                            successor_revision = response.successor_revision,
+                            action = "reopen-work",
+                            consumed = true,
+                            "workflow terminal work reopened; ordinary ingress and ACP suppressed",
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            thread_key = %session_key,
+                            channel = %thread_channel.channel_id,
+                            workflow_run_id = %workflow_run_id,
+                            action = "reopen-work",
+                            error = %error,
+                            consumed = true,
+                            "workflow reopen failed; fail-closed without autonomous ingress or ACP fallback",
+                        );
+                    }
+                }
+
+                return;
+            }
+
             if crate::autonomous_ingress::should_route_to_aap(
                 aap_cfg,
                 agent_name.unwrap_or(""),
@@ -1377,7 +1515,6 @@ async fn dispatch_batch(
                     trigger_msg.message_id.as_str(),
                 );
                 crate::autonomous_ingress::log_candidate(&candidate);
-                let prompt_text = batch.first().map(|m| m.prompt.clone()).unwrap_or_default();
                 // Phase 6.4.9 (Round 2) — SAME-MESSAGE AUTHORITY
                 // COMPOSITION. The Phase 6.4.9 CURRENT-TURN HUMAN TEXT
                 // AUTHORITY tuple MUST be sourced from exactly one
@@ -1400,9 +1537,9 @@ async fn dispatch_batch(
                 // ``message.txt`` body MUST NOT be able to
                 // borrow its body to a human authority that
                 // has its own empty prompt.
-                let first_msg = batch.first().expect("non-empty batch by A13 admit");
-                let authority_attachments: &[crate::dispatch::TextAttachment] =
-                    &first_msg.discord_text_attachment_bodies;
+                // `first_msg` and `authority_attachments` were resolved
+                // once above so explicit mutation and ordinary ingress share
+                // the same current-turn authority tuple.
                 // Phase 6.4.4 — typed Discord text-file attachment
                 // bodies. The ingestion seam records ONLY
                 // `message.txt`-style bodies here, so STT transcripts,
@@ -1475,22 +1612,11 @@ async fn dispatch_batch(
                 // contract (e.g. English visible prompt + Chinese
                 // ``message.txt`` body → ``original_human_prompt``
                 // is the English visible prompt).
-                let original_human_prompt =
-                    crate::autonomous_ingress::resolve_current_human_prompt_authority(
-                        &prompt_text,
-                        first_msg.sender_is_bot,
-                        authority_attachments,
-                    );
-
-                // Phase 8.x — explicit WorkflowRun continuation authority.
-                // Only the leading canonical human-header block may
-                // declare a target. Ordinary prose is never promoted
-                // into execution authority. AAP Runtime validates the
-                // target and fails closed when continuation is illegal.
-                let target_workflow_id =
-                    crate::autonomous_ingress::extract_canonical_workflow_target(
-                        &original_human_prompt,
-                    );
+                // `original_human_prompt` and `target_workflow_id` were
+                // resolved once above from the same-message authority tuple.
+                // Ordinary continuation keeps using those exact values; no
+                // second parsing or cross-message authority reconstruction
+                // occurs here.
                 // Phase 6.4.4 — assemble `user_objective` from the
                 // human prompt and the typed text-attachment bodies.
                 // When the human author did not supply a `message.txt`
@@ -2520,6 +2646,10 @@ mod tests {
             Option<Arc<dyn crate::autonomous_ingress::AutonomousIngressClient>>,
         /// Phase 6.4: optional AAP autonomous ingress config.
         autonomous_ingress_config: Option<crate::config::AutonomousIngressConfig>,
+        /// Phase 8.x: explicit workflow-reopen client injected only by
+        /// focused dispatch tests.
+        workflow_reopen_client:
+            Option<Arc<dyn crate::workflow_reopen::WorkflowReopenClient>>,
         /// Phase 6.4: optional daemon agent identity override (when not
         /// driven by `ARTHUR_AGENT_NAME`).
         autonomous_ingress_agent_identity: Option<String>,
@@ -2541,6 +2671,7 @@ mod tests {
                 session_keys_seen: Mutex::new(Vec::new()),
                 autonomous_ingress_client: None,
                 autonomous_ingress_config: None,
+                workflow_reopen_client: None,
                 autonomous_ingress_agent_identity: None,
                 tech_lead_user_ids: std::collections::HashSet::new(),
             }
@@ -2579,6 +2710,14 @@ mod tests {
             self.autonomous_ingress_client = Some(client);
             self.autonomous_ingress_config = Some(config);
             self.autonomous_ingress_agent_identity = Some(agent.to_string());
+            self
+        }
+
+        fn with_workflow_reopen_client(
+            mut self,
+            client: Arc<dyn crate::workflow_reopen::WorkflowReopenClient>,
+        ) -> Self {
+            self.workflow_reopen_client = Some(client);
             self
         }
 
@@ -2684,6 +2823,12 @@ mod tests {
 
         fn autonomous_ingress_config(&self) -> Option<&crate::config::AutonomousIngressConfig> {
             self.autonomous_ingress_config.as_ref()
+        }
+
+        fn workflow_reopen_client(
+            &self,
+        ) -> Option<Arc<dyn crate::workflow_reopen::WorkflowReopenClient>> {
+            self.workflow_reopen_client.clone()
         }
 
         fn autonomous_ingress_agent_identity(&self) -> Option<&str> {
@@ -4791,6 +4936,767 @@ mod tests {
         .await;
         mock.calls()
     }
+
+
+    #[derive(Clone)]
+    struct RecordingWorkflowReopenClient {
+        calls: Arc<Mutex<Vec<String>>>,
+        outcome: std::result::Result<
+            crate::workflow_reopen::WorkflowReopenResponse,
+            crate::workflow_reopen::WorkflowReopenError,
+        >,
+    }
+
+    impl RecordingWorkflowReopenClient {
+        fn success() -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                outcome: Ok(crate::workflow_reopen::WorkflowReopenResponse {
+                    predecessor_workflow_run_id: "wfr-old".into(),
+                    predecessor_state: "TECH_LEAD_WAIT".into(),
+                    predecessor_revision: 6,
+                    successor_workflow_run_id: "wfr-new".into(),
+                    successor_state: "PRIMARY_ACTIVE".into(),
+                    successor_revision: 1,
+                    successor_defect_loop_count: 0,
+                    actor_client_id: "openab".into(),
+                    reason: "TECH_LEAD_POST_REVIEW_REOPEN".into(),
+                }),
+            }
+        }
+
+        fn failure() -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                outcome: Err(
+                    crate::workflow_reopen::WorkflowReopenError::Http {
+                        status: 409,
+                        body_snippet: "stale revision".into(),
+                    },
+                ),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl crate::workflow_reopen::WorkflowReopenClient
+        for RecordingWorkflowReopenClient
+    {
+        async fn reopen_terminal_work(
+            &self,
+            workflow_run_id: &str,
+        ) -> std::result::Result<
+            crate::workflow_reopen::WorkflowReopenResponse,
+            crate::workflow_reopen::WorkflowReopenError,
+        > {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(workflow_run_id.to_string());
+
+            self.outcome.clone()
+        }
+    }
+
+    async fn run_phase64_with_reopen(
+        msg: BufferedMessage,
+        autonomous_client:
+            Arc<dyn crate::autonomous_ingress::AutonomousIngressClient>,
+        reopen_client:
+            Arc<dyn crate::workflow_reopen::WorkflowReopenClient>,
+        config: crate::config::AutonomousIngressConfig,
+        agent: &str,
+        tech_lead_ids: std::collections::HashSet<u64>,
+    ) -> Vec<RecordedDispatch> {
+        let mock = Arc::new(
+            MockDispatchTarget::new()
+                .with_autonomous_ingress(
+                    autonomous_client,
+                    config,
+                    agent,
+                )
+                .with_workflow_reopen_client(reopen_client)
+                .with_tech_lead_user_ids(tech_lead_ids),
+        );
+
+        let target: Arc<dyn DispatchTarget> = mock.clone();
+        let adapter: Arc<dyn ChatAdapter> =
+            Arc::new(MockChatAdapter);
+
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<BufferedMessage>(1);
+
+        tx.send(msg).await.unwrap();
+        drop(tx);
+
+        consumer_loop(
+            "mock:T".into(),
+            make_channel("T"),
+            rx,
+            target,
+            None,
+            adapter,
+            1,
+            100,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        mock.calls()
+    }
+
+    async fn run_phase64_multi_with_reopen(
+        msgs: Vec<BufferedMessage>,
+        autonomous_client:
+            Arc<dyn crate::autonomous_ingress::AutonomousIngressClient>,
+        reopen_client:
+            Arc<dyn crate::workflow_reopen::WorkflowReopenClient>,
+        config: crate::config::AutonomousIngressConfig,
+        agent: &str,
+        tech_lead_ids: std::collections::HashSet<u64>,
+    ) -> Vec<RecordedDispatch> {
+        assert!(!msgs.is_empty());
+
+        let max_batch = msgs.len();
+
+        let mock = Arc::new(
+            MockDispatchTarget::new()
+                .with_autonomous_ingress(
+                    autonomous_client,
+                    config,
+                    agent,
+                )
+                .with_workflow_reopen_client(reopen_client)
+                .with_tech_lead_user_ids(tech_lead_ids),
+        );
+
+        let target: Arc<dyn DispatchTarget> = mock.clone();
+        let adapter: Arc<dyn ChatAdapter> =
+            Arc::new(MockChatAdapter);
+
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<BufferedMessage>(max_batch);
+
+        for msg in msgs {
+            tx.send(msg).await.unwrap();
+        }
+        drop(tx);
+
+        consumer_loop(
+            "mock:T".into(),
+            make_channel("T"),
+            rx,
+            target,
+            None,
+            adapter,
+            max_batch,
+            10_000,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        mock.calls()
+    }
+
+
+    #[tokio::test]
+    async fn phase8_reopen_exact_authority_calls_reopen_and_never_ingress_or_acp() {
+        std::env::set_var(
+            "ARTHUR_AGENT_NAME",
+            "ArthurClaude",
+        );
+
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids =
+            std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+
+        let msg = make_msg_with_sender(
+            "Canonical workflow: wfr-old\n\
+             Canonical action: reopen-work\n\n\
+             Continue reviewed work.",
+            20,
+            tech_lead_sender_json(tech_lead_id),
+        );
+
+        let ingress =
+            crate::autonomous_ingress::FakeAutonomousIngressClient::
+                always_accept();
+
+        let reopen =
+            RecordingWorkflowReopenClient::success();
+
+        let calls = run_phase64_with_reopen(
+            msg,
+            ingress.clone(),
+            Arc::new(reopen.clone()),
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+
+        assert_eq!(
+            reopen.call_count(),
+            1,
+            "authorized exact reopen must invoke mutation capability exactly once",
+        );
+
+        assert_eq!(
+            reopen.calls(),
+            vec!["wfr-old".to_string()],
+        );
+
+        assert_eq!(
+            ingress.call_count(),
+            0,
+            "explicit reopen must never fall through to autonomous ingress",
+        );
+
+        assert!(
+            calls.is_empty(),
+            "explicit reopen must never fall through to ordinary ACP",
+        );
+    }
+
+    #[tokio::test]
+    async fn phase8_plain_continuation_does_not_call_reopen() {
+        std::env::set_var(
+            "ARTHUR_AGENT_NAME",
+            "ArthurClaude",
+        );
+
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids =
+            std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+
+        let msg = make_msg_with_sender(
+            "Canonical workflow: wfr-old\n\n\
+             Continue the SAME workflow.",
+            20,
+            tech_lead_sender_json(tech_lead_id),
+        );
+
+        let ingress =
+            crate::autonomous_ingress::FakeAutonomousIngressClient::
+                always_accept();
+
+        let reopen =
+            RecordingWorkflowReopenClient::success();
+
+        let calls = run_phase64_with_reopen(
+            msg,
+            ingress.clone(),
+            Arc::new(reopen.clone()),
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+
+        assert_eq!(
+            reopen.call_count(),
+            0,
+            "ordinary continuation must never acquire reopen authority",
+        );
+
+        assert_eq!(
+            ingress.call_count(),
+            1,
+            "ordinary continuation must preserve autonomous ingress",
+        );
+
+        assert!(
+            calls.is_empty(),
+            "accepted continuation must not reach ACP",
+        );
+    }
+
+    #[tokio::test]
+    async fn phase8_reopen_failure_is_consumed_fail_closed() {
+        std::env::set_var(
+            "ARTHUR_AGENT_NAME",
+            "ArthurClaude",
+        );
+
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids =
+            std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+
+        let msg = make_msg_with_sender(
+            "Canonical workflow: wfr-old\n\
+             Canonical action: reopen-work\n\n\
+             Retry reviewed work.",
+            20,
+            tech_lead_sender_json(tech_lead_id),
+        );
+
+        let ingress =
+            crate::autonomous_ingress::FakeAutonomousIngressClient::
+                always_accept();
+
+        let reopen =
+            RecordingWorkflowReopenClient::failure();
+
+        let calls = run_phase64_with_reopen(
+            msg,
+            ingress.clone(),
+            Arc::new(reopen.clone()),
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+
+        assert_eq!(
+            reopen.call_count(),
+            1,
+            "explicit reopen must call mutation capability once",
+        );
+
+        assert_eq!(
+            ingress.call_count(),
+            0,
+            "failed reopen must never fall through to ingress",
+        );
+
+        assert!(
+            calls.is_empty(),
+            "failed reopen must never fall through to ACP",
+        );
+    }
+
+    #[tokio::test]
+    async fn phase8_reopen_without_canonical_workflow_fails_closed() {
+        std::env::set_var(
+            "ARTHUR_AGENT_NAME",
+            "ArthurClaude",
+        );
+
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids =
+            std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+
+        let msg = make_msg_with_sender(
+            "Canonical action: reopen-work\n\n\
+             Reopen it.",
+            20,
+            tech_lead_sender_json(tech_lead_id),
+        );
+
+        let ingress =
+            crate::autonomous_ingress::FakeAutonomousIngressClient::
+                always_accept();
+
+        let reopen =
+            RecordingWorkflowReopenClient::success();
+
+        let calls = run_phase64_with_reopen(
+            msg,
+            ingress.clone(),
+            Arc::new(reopen.clone()),
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+
+        assert_eq!(
+            reopen.call_count(),
+            0,
+            "missing canonical workflow must not mutate",
+        );
+
+        assert_eq!(
+            ingress.call_count(),
+            0,
+            "incomplete explicit mutation intent must not become ingress",
+        );
+
+        assert!(
+            calls.is_empty(),
+            "incomplete explicit mutation intent must fail closed",
+        );
+    }
+
+    #[tokio::test]
+    async fn phase8_invalid_exact_action_is_consumed_fail_closed() {
+        std::env::set_var(
+            "ARTHUR_AGENT_NAME",
+            "ArthurClaude",
+        );
+
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids =
+            std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+
+        let msg = make_msg_with_sender(
+            "Canonical workflow: wfr-old\n\
+             Canonical action: reopen\n\n\
+             Retry reviewed work.",
+            20,
+            tech_lead_sender_json(tech_lead_id),
+        );
+
+        let ingress =
+            crate::autonomous_ingress::FakeAutonomousIngressClient::
+                always_accept();
+
+        let reopen =
+            RecordingWorkflowReopenClient::success();
+
+        let calls = run_phase64_with_reopen(
+            msg,
+            ingress.clone(),
+            Arc::new(reopen.clone()),
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+
+        assert_eq!(
+            reopen.call_count(),
+            0,
+            "invalid exact action must never invoke reopen",
+        );
+
+        assert_eq!(
+            ingress.call_count(),
+            0,
+            "invalid exact mutation intent must not become autonomous ingress",
+        );
+
+        assert!(
+            calls.is_empty(),
+            "invalid exact mutation intent must not fall through to ACP",
+        );
+    }
+
+    #[tokio::test]
+    async fn phase8_reopen_unauthorized_human_never_mutates_or_falls_through() {
+        std::env::set_var(
+            "ARTHUR_AGENT_NAME",
+            "ArthurClaude",
+        );
+
+        let authorized_tech_lead: u64 =
+            645496545805991947;
+
+        let mut tech_lead_ids =
+            std::collections::HashSet::new();
+        tech_lead_ids.insert(authorized_tech_lead);
+
+        let unauthorized_human: u64 = 11111111;
+
+        let msg = make_msg_with_sender(
+            "Canonical workflow: wfr-old\n\
+             Canonical action: reopen-work\n\n\
+             Reopen reviewed work.",
+            20,
+            ordinary_human_sender_json(
+                unauthorized_human,
+            ),
+        );
+
+        let ingress =
+            crate::autonomous_ingress::FakeAutonomousIngressClient::
+                always_accept();
+
+        let reopen =
+            RecordingWorkflowReopenClient::success();
+
+        let calls = run_phase64_with_reopen(
+            msg,
+            ingress.clone(),
+            Arc::new(reopen.clone()),
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+
+        assert_eq!(
+            reopen.call_count(),
+            0,
+            "non-Tech-Lead sender must never acquire reopen authority",
+        );
+
+        assert_eq!(
+            ingress.call_count(),
+            0,
+            "explicit unauthorized mutation must not become ingress",
+        );
+
+        assert!(
+            calls.is_empty(),
+            "explicit unauthorized mutation must be consumed fail-closed",
+        );
+    }
+
+    #[tokio::test]
+    async fn phase8_reopen_bot_sender_never_mutates_or_falls_through() {
+        std::env::set_var(
+            "ARTHUR_AGENT_NAME",
+            "ArthurClaude",
+        );
+
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids =
+            std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+
+        let msg = make_msg_with_sender_and_typed_bot(
+            "Canonical workflow: wfr-old\n\
+             Canonical action: reopen-work\n\n\
+             Reopen reviewed work.",
+            20,
+            bot_sender_json(),
+            true,
+            Vec::new(),
+        );
+
+        let ingress =
+            crate::autonomous_ingress::FakeAutonomousIngressClient::
+                always_accept();
+
+        let reopen =
+            RecordingWorkflowReopenClient::success();
+
+        let calls = run_phase64_with_reopen(
+            msg,
+            ingress.clone(),
+            Arc::new(reopen.clone()),
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+
+        assert_eq!(
+            reopen.call_count(),
+            0,
+            "bot sender must never acquire Tech Lead reopen authority",
+        );
+
+        assert_eq!(
+            ingress.call_count(),
+            0,
+            "bot mutation-shaped turn must not reach autonomous ingress",
+        );
+
+        assert!(
+            calls.is_empty(),
+            "bot mutation-shaped turn must not fall through to ACP",
+        );
+    }
+
+
+    #[tokio::test]
+    async fn phase8_universal_human_does_not_grant_tech_lead_reopen_authority() {
+        std::env::set_var(
+            "ARTHUR_AGENT_NAME",
+            "ArthurClaude",
+        );
+
+        let authorized_tech_lead: u64 =
+            645496545805991947;
+
+        let mut tech_lead_ids =
+            std::collections::HashSet::new();
+        tech_lead_ids.insert(authorized_tech_lead);
+
+        let unauthorized_human: u64 = 11111111;
+
+        let msg = make_msg_with_sender(
+            "Canonical workflow: wfr-old\n\
+             Canonical action: reopen-work\n\n\
+             Reopen reviewed work.",
+            20,
+            ordinary_human_sender_json(
+                unauthorized_human,
+            ),
+        );
+
+        let ingress =
+            crate::autonomous_ingress::FakeAutonomousIngressClient::
+                always_accept();
+
+        let reopen =
+            RecordingWorkflowReopenClient::success();
+
+        let calls = run_phase64_with_reopen(
+            msg,
+            ingress.clone(),
+            Arc::new(reopen.clone()),
+            // Universal-human admission is deliberately enabled.
+            phase64_config(&["ArthurClaude"], true),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+
+        assert_eq!(
+            reopen.call_count(),
+            0,
+            "aap_universal_humans must not grant Tech Lead mutation authority",
+        );
+
+        assert_eq!(
+            ingress.call_count(),
+            0,
+            "explicit unauthorized reopen must still be consumed fail-closed",
+        );
+
+        assert!(
+            calls.is_empty(),
+            "universal-human admission must not turn unauthorized reopen into ACP",
+        );
+    }
+
+
+    #[tokio::test]
+    async fn phase8_reopen_cannot_borrow_workflow_from_second_message() {
+        std::env::set_var(
+            "ARTHUR_AGENT_NAME",
+            "ArthurClaude",
+        );
+
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids =
+            std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+
+        // FIRST authoritative message contains the mutation action but no
+        // workflow target. A later co-batched message supplies a workflow
+        // header. The dispatcher must not compose those two messages into
+        // one mutation authority tuple.
+        let action_first = make_msg_with_sender(
+            "Canonical action: reopen-work\n\n\
+             Reopen reviewed work.",
+            5,
+            tech_lead_sender_json(tech_lead_id),
+        );
+
+        let workflow_second = make_msg_with_sender(
+            "Canonical workflow: wfr-borrowed",
+            30,
+            tech_lead_sender_json(tech_lead_id),
+        );
+
+        let ingress =
+            crate::autonomous_ingress::FakeAutonomousIngressClient::
+                always_accept();
+
+        let reopen =
+            RecordingWorkflowReopenClient::success();
+
+        let calls = run_phase64_multi_with_reopen(
+            vec![action_first, workflow_second],
+            ingress.clone(),
+            Arc::new(reopen.clone()),
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+
+        assert_eq!(
+            reopen.call_count(),
+            0,
+            "reopen must not borrow a workflow id from another message",
+        );
+
+        assert_eq!(
+            ingress.call_count(),
+            0,
+            "incomplete first-message mutation authority must fail closed",
+        );
+
+        assert!(
+            calls.is_empty(),
+            "cross-message mutation composition must never fall through to ACP",
+        );
+    }
+
+
+    #[tokio::test]
+    async fn phase8_reopen_cannot_borrow_action_from_second_message() {
+        std::env::set_var(
+            "ARTHUR_AGENT_NAME",
+            "ArthurClaude",
+        );
+
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids =
+            std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+
+        // FIRST authoritative message contains only the workflow target.
+        // The second co-batched message carries the mutation action.
+        // It must not upgrade the first message into reopen authority.
+        let workflow_first = make_msg_with_sender(
+            "Canonical workflow: wfr-first\n\n\
+             Continue reviewed work.",
+            5,
+            tech_lead_sender_json(tech_lead_id),
+        );
+
+        let action_second = make_msg_with_sender(
+            "Canonical action: reopen-work",
+            30,
+            tech_lead_sender_json(tech_lead_id),
+        );
+
+        let ingress =
+            crate::autonomous_ingress::FakeAutonomousIngressClient::
+                always_accept();
+
+        let reopen =
+            RecordingWorkflowReopenClient::success();
+
+        let calls = run_phase64_multi_with_reopen(
+            vec![workflow_first, action_second],
+            ingress.clone(),
+            Arc::new(reopen.clone()),
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+        )
+        .await;
+
+        assert_eq!(
+            reopen.call_count(),
+            0,
+            "reopen must not borrow an action from another message",
+        );
+
+        // The authoritative first message is an ordinary continuation, so
+        // preserving its normal autonomous ingress behavior is correct.
+        assert_eq!(
+            ingress.call_count(),
+            1,
+            "first-message ordinary continuation should remain ordinary ingress",
+        );
+
+        assert!(
+            calls.is_empty(),
+            "accepted autonomous continuation must not fall through to ACP",
+        );
+    }
+
 
     #[tokio::test]
     async fn phase8_canonical_workflow_target_reaches_autonomous_ingress_request() {

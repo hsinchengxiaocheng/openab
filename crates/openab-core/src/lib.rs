@@ -38,6 +38,7 @@ pub mod terminal_delivery_worker;
 pub mod timestamp;
 pub mod trust;
 pub mod workflow;
+pub mod workflow_reopen;
 
 #[cfg(feature = "discord")]
 pub mod ambient;

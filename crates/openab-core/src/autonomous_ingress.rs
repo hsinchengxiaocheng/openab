@@ -111,6 +111,7 @@ pub const CANONICAL_TITLE_HEADER: &str = "Canonical title:";
 /// (``str::strip`` on ``user_objective``); that normalization is
 /// orthogonal to and pre-dates this extractor.
 pub const CANONICAL_WORKFLOW_HEADER: &str = "Canonical workflow:";
+pub const CANONICAL_ACTION_HEADER: &str = "Canonical action:";
 
 /// Phase 8.x — extract an explicit WorkflowRun continuation target
 /// from the leading canonical-header block.
@@ -144,7 +145,139 @@ pub fn extract_canonical_workflow_target(prompt: &str) -> Option<String> {
 
         // Another recognized canonical header may precede the workflow
         // header. Do not let it terminate the canonical-header block.
-        if line.strip_prefix(CANONICAL_TITLE_HEADER).is_some() {
+        if line.strip_prefix(CANONICAL_TITLE_HEADER).is_some()
+            || line.strip_prefix(CANONICAL_ACTION_HEADER).is_some()
+        {
+            continue;
+        }
+
+        // First non-canonical content terminates authority scanning.
+        return None;
+    }
+
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalWorkflowActionAuthority {
+    Absent,
+    ReopenWork,
+    Invalid,
+}
+
+/// Classify explicit canonical workflow-action authority.
+///
+/// Security distinction:
+///
+/// * `Absent` — no exact authoritative `Canonical action:` header was
+///   present in the leading canonical-header block. Existing ordinary
+///   continuation / ingress behavior may proceed.
+/// * `ReopenWork` — exact bounded mutation authority.
+/// * `Invalid` — an exact authoritative `Canonical action:` header was
+///   present, but its value was empty or unsupported. The dispatcher
+///   MUST consume the turn fail-closed and MUST NOT reinterpret it as
+///   ordinary autonomous ingress or ACP.
+///
+/// Case variants such as `canonical action:` / `Canonical Action:` are
+/// not canonical headers and therefore never acquire mutation authority.
+///
+/// Security hardening:
+///
+/// * exactly one canonical action may appear in the leading canonical-header
+///   block;
+/// * a duplicate exact `Canonical action:` anywhere in the message is
+///   `Invalid`, even when the first occurrence was valid;
+/// * an exact `Canonical action:` appearing after ordinary prose is `Invalid`,
+///   not `Absent`, so mutation-shaped input cannot fall through to ordinary
+///   autonomous ingress or ACP.
+pub fn classify_canonical_workflow_action(
+    prompt: &str,
+) -> CanonicalWorkflowActionAuthority {
+    let mut leading_canonical_block = true;
+    let mut action: Option<CanonicalWorkflowActionAuthority> = None;
+
+    for raw_line in prompt.lines() {
+        let line = raw_line.trim();
+
+        if line.is_empty() {
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix(CANONICAL_ACTION_HEADER) {
+            // An exact mutation-shaped header outside the leading canonical
+            // block is always fail-closed.
+            if !leading_canonical_block {
+                return CanonicalWorkflowActionAuthority::Invalid;
+            }
+
+            // More than one exact action header is ambiguous authority,
+            // regardless of whether the values agree.
+            if action.is_some() {
+                return CanonicalWorkflowActionAuthority::Invalid;
+            }
+
+            action = Some(if rest.trim() == "reopen-work" {
+                CanonicalWorkflowActionAuthority::ReopenWork
+            } else {
+                CanonicalWorkflowActionAuthority::Invalid
+            });
+
+            continue;
+        }
+
+        if leading_canonical_block
+            && (line.strip_prefix(CANONICAL_TITLE_HEADER).is_some()
+                || line.strip_prefix(CANONICAL_WORKFLOW_HEADER).is_some())
+        {
+            continue;
+        }
+
+        // Ordinary prose terminates the authority block, but scanning must
+        // continue so an exact late Canonical action header is detected and
+        // consumed as Invalid rather than becoming ordinary ingress.
+        leading_canonical_block = false;
+    }
+
+    action.unwrap_or(CanonicalWorkflowActionAuthority::Absent)
+}
+
+/// Extract an explicit canonical workflow action from the leading
+/// canonical-header block.
+///
+/// Authority contract:
+///
+/// * Only the exact, case-sensitive `Canonical action:` token is
+///   recognized.
+/// * The only currently authorized action is `reopen-work`.
+/// * Leading blank lines are ignored.
+/// * `Canonical title:` and `Canonical workflow:` may precede the
+///   action header.
+/// * Once ordinary prose begins, scanning stops permanently.
+/// * Natural-language requests such as `reopen`, `resume`, or
+///   `continue` never acquire mutation authority.
+pub fn extract_canonical_workflow_action(prompt: &str) -> Option<String> {
+    for raw_line in prompt.split('\n') {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+
+        if line.chars().all(|c| c.is_whitespace()) {
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix(CANONICAL_ACTION_HEADER) {
+            let trimmed = rest.trim();
+
+            if trimmed == "reopen-work" {
+                return Some(trimmed.to_string());
+            }
+
+            return None;
+        }
+
+        // Other recognized canonical headers may precede the action
+        // header without terminating the authority block.
+        if line.strip_prefix(CANONICAL_TITLE_HEADER).is_some()
+            || line.strip_prefix(CANONICAL_WORKFLOW_HEADER).is_some()
+        {
             continue;
         }
 
@@ -2186,4 +2319,135 @@ mod phase8_continuation_identity_tests {
             "legacy/new-work requests must omit target_workflow_id entirely",
         );
     }
+}
+
+#[cfg(test)]
+mod phase8_workflow_reopen_action_tests {
+    use super::*;
+
+    #[test]
+    fn exact_reopen_action_is_authoritative() {
+        let prompt = "Canonical workflow: wfr4dfa5d1c7a2a97bd\n\
+             Canonical action: reopen-work\n\n\
+             Reopen the reviewed work.";
+
+        assert_eq!(
+            extract_canonical_workflow_action(prompt).as_deref(),
+            Some("reopen-work")
+        );
+    }
+
+    #[test]
+    fn canonical_title_may_precede_reopen_headers() {
+        let prompt = "Canonical title: Continue reviewed work\n\
+             Canonical workflow: wfr4dfa5d1c7a2a97bd\n\
+             Canonical action: reopen-work\n\n\
+             Continue.";
+
+        assert_eq!(
+            extract_canonical_workflow_target(prompt).as_deref(),
+            Some("wfr4dfa5d1c7a2a97bd")
+        );
+
+        assert_eq!(
+            extract_canonical_workflow_action(prompt).as_deref(),
+            Some("reopen-work")
+        );
+    }
+
+    #[test]
+    fn natural_language_reopen_has_no_mutation_authority() {
+        for prompt in [
+            "Canonical workflow: wfr4dfa5d1c7a2a97bd\n\nReopen work",
+            "Canonical workflow: wfr4dfa5d1c7a2a97bd\n\n請重新開啟 workflow",
+            "Canonical workflow: wfr4dfa5d1c7a2a97bd\n\nresume",
+        ] {
+            assert_eq!(extract_canonical_workflow_action(prompt), None);
+        }
+    }
+
+    #[test]
+    fn malformed_action_has_no_authority() {
+        for prompt in [
+            "Canonical workflow: wfr4dfa5d1c7a2a97bd\ncanonical action: reopen-work",
+            "Canonical workflow: wfr4dfa5d1c7a2a97bd\nCanonical Action: reopen-work",
+            "Canonical workflow: wfr4dfa5d1c7a2a97bd\nCanonical action: reopen",
+            "Canonical workflow: wfr4dfa5d1c7a2a97bd\nCanonical action:",
+        ] {
+            assert_eq!(extract_canonical_workflow_action(prompt), None);
+        }
+    }
+
+    #[test]
+    fn exact_invalid_action_is_distinct_from_absent_action() {
+        for prompt in [
+            "Canonical workflow: wfr4dfa5d1c7a2a97bd\nCanonical action: reopen",
+            "Canonical workflow: wfr4dfa5d1c7a2a97bd\nCanonical action:",
+            "Canonical title: X\nCanonical action: delete-work",
+        ] {
+            assert_eq!(
+                classify_canonical_workflow_action(prompt),
+                CanonicalWorkflowActionAuthority::Invalid,
+            );
+        }
+    }
+
+    #[test]
+    fn absent_or_noncanonical_action_remains_absent() {
+        for prompt in [
+            "Canonical workflow: wfr4dfa5d1c7a2a97bd\n\nContinue.",
+            "Canonical workflow: wfr4dfa5d1c7a2a97bd\ncanonical action: reopen-work",
+            "Canonical workflow: wfr4dfa5d1c7a2a97bd\nCanonical Action: reopen-work",
+        ] {
+            assert_eq!(
+                classify_canonical_workflow_action(prompt),
+                CanonicalWorkflowActionAuthority::Absent,
+            );
+        }
+    }
+
+    #[test]
+    fn exact_reopen_action_classifier_is_authoritative() {
+        assert_eq!(
+            classify_canonical_workflow_action(
+                "Canonical workflow: wfr4dfa5d1c7a2a97bd\nCanonical action: reopen-work",
+            ),
+            CanonicalWorkflowActionAuthority::ReopenWork,
+        );
+    }
+
+    #[test]
+    fn late_exact_action_is_invalid_fail_closed() {
+        let prompt =
+            "Canonical workflow: wfr4dfa5d1c7a2a97bd\nPlease continue.\nCanonical action: reopen-work";
+
+        // The legacy extractor grants no mutation authority outside the
+        // leading canonical-header block.
+        assert_eq!(extract_canonical_workflow_action(prompt), None);
+
+        // The typed classifier must consume exact mutation-shaped input
+        // appearing after prose. It must never fall through as ordinary
+        // autonomous ingress or ACP.
+        assert_eq!(
+            classify_canonical_workflow_action(prompt),
+            CanonicalWorkflowActionAuthority::Invalid,
+        );
+    }
+
+    #[test]
+    fn duplicate_exact_action_headers_are_invalid() {
+        for prompt in [
+            "Canonical workflow: wfr4dfa5d1c7a2a97bd\nCanonical action: reopen-work\nCanonical action: reopen-work",
+            "Canonical action: reopen-work\nCanonical workflow: wfr4dfa5d1c7a2a97bd\nCanonical action: reopen-work",
+            "Canonical action: reopen-work\nPlease continue.\nCanonical action: reopen-work",
+        ] {
+            assert_eq!(
+                classify_canonical_workflow_action(prompt),
+                CanonicalWorkflowActionAuthority::Invalid,
+                "duplicate exact action must fail closed: {prompt:?}",
+            );
+        }
+    }
+
+
 }

@@ -1044,15 +1044,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Phase 6.4: deterministic OpenAB → AAP autonomous ingress routing.
     //
-    // When `[autonomous_ingress]` is configured in `config.toml`, build
-    // a real HTTP client and wire it into the router so human Discord
-    // requests addressed to a declared AAP-autonomous agent are routed
-    // to AAP Runtime BEFORE ordinary ACP dispatch. Absent config =
-    // legacy behavior preserved exactly.
-    //
-    // The router is unwrapped from its single-strong-reference Arc at
-    // this seam (it has not yet been shared with any task); after
-    // wiring we re-wrap it. `with_autonomous_ingress` consumes `self`.
+    // Ordinary human/direct ingress uses the dedicated OpenAB channel
+    // credential and remains independent of workflow-admin mutation authority.
     let router = if let Some(aap_cfg) = cfg.autonomous_ingress.clone() {
         match openab_core::autonomous_ingress::build_production_client(&aap_cfg) {
             Ok(client) => {
@@ -1062,32 +1055,82 @@ async fn main() -> anyhow::Result<()> {
                     aap_agents = ?aap_cfg.aap_agents,
                     "Phase 6.4: OpenAB → AAP autonomous ingress wired into production AdapterRouter",
                 );
+
                 let inner = Arc::try_unwrap(router)
                     .ok()
                     .expect("router has a single strong reference at startup seam");
-                let inner = inner.with_autonomous_ingress(
+
+                Arc::new(inner.with_autonomous_ingress(
                     Arc::new(client)
                         as Arc<dyn openab_core::autonomous_ingress::AutonomousIngressClient>,
                     aap_cfg,
-                );
-                Arc::new(inner)
+                ))
             }
             Err(openab_core::autonomous_ingress::AutonomousIngressError::AuthMissing) => {
                 error!(
                     credential_env = %aap_cfg.aap_credential_env,
-                    "Phase 6.4: autonomous ingress is configured but the credential \
-                     environment variable is missing or empty. Refusing to fall back to \
-                     ordinary ACP for the declared agents; aborting startup.",
+                    "Phase 6.4: autonomous ingress is configured but the credential                      environment variable is missing or empty; aborting startup",
                 );
                 return Err(anyhow::anyhow!(
-                    "Phase 6.4 fail-closed: configured autonomous ingress requires \
-                     `{}` to be set and non-empty",
+                    "Phase 6.4 fail-closed: configured autonomous ingress requires `{}`",
                     aap_cfg.aap_credential_env,
                 ));
             }
             Err(other) => {
-                error!(error = %other, "Phase 6.4: failed to build autonomous ingress client");
-                return Err(anyhow::anyhow!("Phase 6.4 startup error: {other}"));
+                error!(
+                    error = %other,
+                    "Phase 6.4: failed to build autonomous ingress client"
+                );
+                return Err(anyhow::anyhow!(
+                    "Phase 6.4 startup error: {other}"
+                ));
+            }
+        }
+    } else {
+        router
+    };
+
+    // Phase 8.x: explicit terminal WorkflowRun reopen mutation authority.
+    //
+    // This is deliberately composed independently from autonomous ingress.
+    // Presence of `[workflow_reopen]` opts this daemon into the mutation
+    // capability and requires a separate administrative bearer credential.
+    let router = if let Some(reopen_cfg) = cfg.workflow_reopen.clone() {
+        match openab_core::workflow_reopen::build_production_client(&reopen_cfg) {
+            Ok(client) => {
+                info!(
+                    aap_runtime_url = %reopen_cfg.aap_runtime_url,
+                    credential_env = %reopen_cfg.aap_credential_env,
+                    "Phase 8.x: dedicated workflow reopen client wired into production AdapterRouter",
+                );
+
+                let inner = Arc::try_unwrap(router)
+                    .ok()
+                    .expect("router has a single strong reference at workflow reopen startup seam");
+
+                Arc::new(inner.with_workflow_reopen_client(
+                    Arc::new(client)
+                        as Arc<dyn openab_core::workflow_reopen::WorkflowReopenClient>,
+                ))
+            }
+            Err(openab_core::workflow_reopen::WorkflowReopenError::AuthMissing) => {
+                error!(
+                    credential_env = %reopen_cfg.aap_credential_env,
+                    "workflow reopen is configured but its dedicated credential is missing; aborting startup",
+                );
+                return Err(anyhow::anyhow!(
+                    "workflow reopen fail-closed: configured mutation surface requires `{}`",
+                    reopen_cfg.aap_credential_env,
+                ));
+            }
+            Err(other) => {
+                error!(
+                    error = %other,
+                    "failed to build dedicated workflow reopen client"
+                );
+                return Err(anyhow::anyhow!(
+                    "workflow reopen startup error: {other}"
+                ));
             }
         }
     } else {

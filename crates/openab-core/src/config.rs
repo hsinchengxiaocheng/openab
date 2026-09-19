@@ -279,6 +279,13 @@ pub struct Config {
     /// See [`AutonomousIngressConfig`].
     #[serde(default)]
     pub autonomous_ingress: Option<AutonomousIngressConfig>,
+    /// Phase 8.x — explicit terminal WorkflowRun reopen authority.
+    ///
+    /// Deliberately separate from `autonomous_ingress`: ordinary ingress
+    /// uses the channel-gateway credential, while this mutation surface
+    /// requires a dedicated workflow-administrative principal.
+    #[serde(default)]
+    pub workflow_reopen: Option<WorkflowReopenConfig>,
     /// Phase 6.4.x — OpenAB-native agent lease heartbeat producer.
     /// Absent = heartbeat is disabled; AAP's ``expire_stale``
     /// sweep is the only lease lifetime authority (legacy
@@ -510,6 +517,49 @@ impl AutonomousIngressConfig {
         std::env::var(&self.aap_credential_env)
             .ok()
             .filter(|v| !v.is_empty())
+    }
+}
+
+/// Phase 8.x — explicit terminal-work reopen mutation transport.
+///
+/// This authority is intentionally separate from `AutonomousIngressConfig`.
+/// A front-door OpenAB channel credential must not automatically acquire
+/// workflow-administrative mutation authority.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkflowReopenConfig {
+    /// HTTP base URL of the AAP Runtime.
+    #[serde(default = "default_workflow_reopen_runtime_url")]
+    pub aap_runtime_url: String,
+
+    /// Environment variable holding the dedicated Tech Lead mutation
+    /// credential. The secret value is never logged.
+    #[serde(default = "default_workflow_reopen_credential_env")]
+    pub aap_credential_env: String,
+
+    /// Per-request timeout in seconds. No mutation retry is performed.
+    #[serde(default = "default_workflow_reopen_timeout_seconds")]
+    pub request_timeout_seconds: u64,
+}
+
+fn default_workflow_reopen_runtime_url() -> String {
+    "http://127.0.0.1:8000".to_string()
+}
+
+fn default_workflow_reopen_credential_env() -> String {
+    "ARTHUR_RUNTIME_TECH_LEAD_KEY".to_string()
+}
+
+fn default_workflow_reopen_timeout_seconds() -> u64 {
+    30
+}
+
+impl WorkflowReopenConfig {
+    /// Resolve the dedicated mutation credential. Missing or empty fails
+    /// closed at production composition.
+    pub fn resolve_credential(&self) -> Option<String> {
+        std::env::var(&self.aap_credential_env)
+            .ok()
+            .filter(|value| !value.is_empty())
     }
 }
 

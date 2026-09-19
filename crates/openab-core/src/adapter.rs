@@ -692,6 +692,12 @@ pub struct AdapterRouter {
     /// [`AdapterRouter::with_autonomous_ingress`].
     autonomous_ingress_client: Option<Arc<dyn crate::autonomous_ingress::AutonomousIngressClient>>,
     autonomous_ingress_config: Option<crate::config::AutonomousIngressConfig>,
+    /// Explicit Tech Lead terminal-work reopen control client.
+    ///
+    /// This is deliberately separate from autonomous ingress because
+    /// reopen is a bounded mutation authority, not ordinary workflow ingress.
+    workflow_reopen_client:
+        Option<Arc<dyn crate::workflow_reopen::WorkflowReopenClient>>,
     /// Optional durable final-response authority.  It is deliberately absent
     /// for legacy ACP-only deployments.
     terminal_delivery_worker: Option<Arc<dyn TerminalDeliveryPort>>,
@@ -736,6 +742,7 @@ impl AdapterRouter {
             ),
             autonomous_ingress_client: None,
             autonomous_ingress_config: None,
+            workflow_reopen_client: None,
             terminal_delivery_worker: None,
         }
     }
@@ -796,6 +803,25 @@ impl AdapterRouter {
         self.autonomous_ingress_client = Some(client);
         self.autonomous_ingress_config = Some(config);
         self
+    }
+
+    /// Attach the explicit AAP terminal-work reopen client.
+    ///
+    /// `None` by default means no Discord/API surface can acquire reopen
+    /// mutation capability through this router.
+    pub fn with_workflow_reopen_client(
+        mut self,
+        client: Arc<dyn crate::workflow_reopen::WorkflowReopenClient>,
+    ) -> Self {
+        self.workflow_reopen_client = Some(client);
+        self
+    }
+
+    /// Read-only access to the explicit terminal-work reopen client.
+    pub fn workflow_reopen_client(
+        &self,
+    ) -> Option<Arc<dyn crate::workflow_reopen::WorkflowReopenClient>> {
+        self.workflow_reopen_client.clone()
     }
 
     pub fn with_terminal_delivery_worker(mut self, worker: Arc<dyn TerminalDeliveryPort>) -> Self {
