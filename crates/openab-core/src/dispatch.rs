@@ -1987,6 +1987,50 @@ async fn invoke_workflow_hook_after_dispatch(
                 outcome           = %outcome,
                 "native workflow hook: resolved canonical completion outcome"
             );
+
+            // M24 Phase 1.8 transport-compatibility correction.
+            // Runtime requires VERIFIER + FAIL to carry exactly one
+            // bounded structured verifier_defect payload and forbids
+            // defect payloads for every other role/result pair.
+            let verifier_defect = match crate::role_completion_block::parse_verifier_defect_block(
+                &hook.raw_assistant_text,
+            ) {
+                crate::role_completion_block::VerifierDefectParse::Claim(claim) => Some(claim),
+                crate::role_completion_block::VerifierDefectParse::NoClaim => None,
+                crate::role_completion_block::VerifierDefectParse::Ambiguous
+                | crate::role_completion_block::VerifierDefectParse::Malformed { .. } => {
+                    tracing::warn!(
+                        workflow_run_id   = %metadata.workflow_run_id,
+                        dispatch_id       = %metadata.dispatch_id,
+                        lease_generation  = metadata.lease_generation,
+                        role              = %metadata.role,
+                        outcome           = %outcome,
+                        "native terminal turn carries malformed verifier defect; not capturing completion"
+                    );
+                    return;
+                }
+            };
+
+            let defect_pair_is_valid = match (metadata.role.as_str(), outcome.as_str()) {
+                ("VERIFIER", "FAIL") => verifier_defect.is_some(),
+                ("VERIFIER", "PASS") => verifier_defect.is_none(),
+                ("PRIMARY", "COMPLETE") => verifier_defect.is_none(),
+                ("FINAL_REVIEWER", "PASS") => verifier_defect.is_none(),
+                _ => false,
+            };
+
+            if !defect_pair_is_valid {
+                tracing::warn!(
+                    workflow_run_id   = %metadata.workflow_run_id,
+                    dispatch_id       = %metadata.dispatch_id,
+                    lease_generation  = metadata.lease_generation,
+                    role              = %metadata.role,
+                    outcome           = %outcome,
+                    verifier_defect_present = verifier_defect.is_some(),
+                    "native terminal turn violates verifier defect role/result contract; not capturing completion"
+                );
+                return;
+            }
             let event = crate::native_completion::NativeCompletionEvent {
                 record_version: 1,
                 completion_id: String::new(),
@@ -2018,6 +2062,7 @@ async fn invoke_workflow_hook_after_dispatch(
                 // not plumb transport through `agent.work`; Runtime then
                 // falls back to legacy OPENAB semantics.
                 transport: metadata.transport.clone(),
+                verifier_defect,
             };
             match target.native_completion_port().submit(event).await {
                 Ok(()) => {
@@ -3752,8 +3797,12 @@ mod tests {
                 Some("PASS"),
             ),
             (
-                "<role_completion>\nrole: VERIFIER\nresult: FAIL\nworkflow_id: run-verifier\nproject_id: legacy-placeholder\nproject_root: /legacy-placeholder\n</role_completion>",
+                "<verifier_defect>\n{\"summary\":\"blocking verifier defect\",\"correction_spec\":\"correct the production integration defect\",\"evidence\":[\"dispatch regression\"]}\n</verifier_defect>\n<role_completion>\nrole: VERIFIER\nresult: FAIL\nworkflow_id: run-verifier\nproject_id: legacy-placeholder\nproject_root: /legacy-placeholder\n</role_completion>",
                 Some("FAIL"),
+            ),
+            (
+                "<role_completion>\nrole: VERIFIER\nresult: FAIL\nworkflow_id: run-verifier\nproject_id: legacy-placeholder\nproject_root: /legacy-placeholder\n</role_completion>",
+                None,
             ),
             ("done", None),
             ("VERIFIER_PASS\nVERIFIER_FAIL", None),

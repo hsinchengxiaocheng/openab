@@ -40,6 +40,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 use crate::admission::NativeWorkflowMetadata;
 
@@ -48,6 +49,36 @@ const OPENING_MARKER: &str = "<role_completion>";
 
 /// Closing marker for a completion block.
 const CLOSING_MARKER: &str = "</role_completion>";
+
+/// Sibling structured defect block required for VERIFIER + FAIL.
+const VERIFIER_DEFECT_OPENING_MARKER: &str = "<verifier_defect>";
+const VERIFIER_DEFECT_CLOSING_MARKER: &str = "</verifier_defect>";
+
+const VERIFIER_DEFECT_SUMMARY_MAX_CHARS: usize = 2000;
+const VERIFIER_DEFECT_CORRECTION_SPEC_MAX_CHARS: usize = 8000;
+const VERIFIER_DEFECT_EVIDENCE_MAX_ITEMS: usize = 32;
+const VERIFIER_DEFECT_EVIDENCE_ITEM_MAX_CHARS: usize = 512;
+
+/// Transport projection of AAP Runtime VerifierDefectReport.
+///
+/// `deny_unknown_fields` keeps the OpenAB boundary fail-closed and
+/// aligned with Runtime API `extra="forbid"` semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifierDefectClaim {
+    pub summary: String,
+    pub correction_spec: String,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifierDefectParse {
+    NoClaim,
+    Claim(VerifierDefectClaim),
+    Ambiguous,
+    Malformed { reason: String },
+}
 
 /// Fields that MUST be present in every well-formed block.
 ///
@@ -80,6 +111,136 @@ fn block_re() -> &'static Regex {
         let pattern = format!(r"(?s){}(.*?){}", OPENING_MARKER, CLOSING_MARKER);
         Regex::new(&pattern).unwrap()
     })
+}
+
+fn verifier_defect_block_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        let pattern = format!(
+            r"(?s){}(.*?){}",
+            VERIFIER_DEFECT_OPENING_MARKER, VERIFIER_DEFECT_CLOSING_MARKER
+        );
+        Regex::new(&pattern).unwrap()
+    })
+}
+
+/// Parse exactly one sibling `<verifier_defect>` JSON block.
+///
+/// The JSON body must contain exactly `summary`, `correction_spec`,
+/// and `evidence`; malformed, duplicate, oversized, or unknown values
+/// fail closed before a native completion event can be captured.
+pub fn parse_verifier_defect_block(text: &str) -> VerifierDefectParse {
+    let opening_count = text.matches(VERIFIER_DEFECT_OPENING_MARKER).count();
+    let closing_count = text.matches(VERIFIER_DEFECT_CLOSING_MARKER).count();
+    let opening_line_count = text
+        .lines()
+        .filter(|line| line.trim() == VERIFIER_DEFECT_OPENING_MARKER)
+        .count();
+    let closing_line_count = text
+        .lines()
+        .filter(|line| line.trim() == VERIFIER_DEFECT_CLOSING_MARKER)
+        .count();
+
+    if opening_count == 0 && closing_count == 0 {
+        return VerifierDefectParse::NoClaim;
+    }
+
+    if opening_count != 1
+        || closing_count != 1
+        || opening_line_count != 1
+        || closing_line_count != 1
+    {
+        if opening_count > 1
+            && closing_count > 1
+            && opening_count == closing_count
+            && opening_line_count == opening_count
+            && closing_line_count == closing_count
+        {
+            return VerifierDefectParse::Ambiguous;
+        }
+
+        return VerifierDefectParse::Malformed {
+            reason: "invalid verifier_defect marker structure".to_string(),
+        };
+    }
+
+    let captures: Vec<&str> = verifier_defect_block_re()
+        .captures_iter(text)
+        .map(|capture| capture.get(1).unwrap().as_str())
+        .collect();
+
+    let body = match captures.as_slice() {
+        [body] => body.trim(),
+        _ => {
+            return VerifierDefectParse::Malformed {
+                reason: "verifier_defect markers could not form one closed block".to_string(),
+            };
+        }
+    };
+
+    if body.is_empty() {
+        return VerifierDefectParse::Malformed {
+            reason: "verifier_defect body is empty".to_string(),
+        };
+    }
+
+    let claim: VerifierDefectClaim = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(error) => {
+            return VerifierDefectParse::Malformed {
+                reason: format!("invalid verifier_defect JSON: {error}"),
+            };
+        }
+    };
+
+    if claim.summary.trim().is_empty() {
+        return VerifierDefectParse::Malformed {
+            reason: "verifier_defect summary must not be empty".to_string(),
+        };
+    }
+    if claim.summary.chars().count() > VERIFIER_DEFECT_SUMMARY_MAX_CHARS {
+        return VerifierDefectParse::Malformed {
+            reason: "verifier_defect summary exceeds maximum length".to_string(),
+        };
+    }
+
+    if claim.correction_spec.trim().is_empty() {
+        return VerifierDefectParse::Malformed {
+            reason: "verifier_defect correction_spec must not be empty".to_string(),
+        };
+    }
+    if claim.correction_spec.chars().count() > VERIFIER_DEFECT_CORRECTION_SPEC_MAX_CHARS {
+        return VerifierDefectParse::Malformed {
+            reason: "verifier_defect correction_spec exceeds maximum length".to_string(),
+        };
+    }
+
+    if claim.evidence.len() > VERIFIER_DEFECT_EVIDENCE_MAX_ITEMS {
+        return VerifierDefectParse::Malformed {
+            reason: "verifier_defect evidence exceeds maximum item count".to_string(),
+        };
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for item in &claim.evidence {
+        if item.trim().is_empty() {
+            return VerifierDefectParse::Malformed {
+                reason: "verifier_defect evidence item must not be empty".to_string(),
+            };
+        }
+        if item.chars().count() > VERIFIER_DEFECT_EVIDENCE_ITEM_MAX_CHARS {
+            return VerifierDefectParse::Malformed {
+                reason: "verifier_defect evidence item exceeds maximum length".to_string(),
+            };
+        }
+        if !seen.insert(item.as_str()) {
+            return VerifierDefectParse::Malformed {
+                reason: "verifier_defect evidence contains duplicate item".to_string(),
+            };
+        }
+    }
+
+    VerifierDefectParse::Claim(claim)
 }
 
 /// One well-formed completion claim parsed from a single block.
@@ -716,6 +877,95 @@ mod tests {
         assert_eq!(
             parse_role_completion_block("   \n\n  "),
             RoleCompletionParse::NoClaim
+        );
+    }
+
+    #[test]
+    fn verifier_defect_valid_json_parses() {
+        let text = r#"<verifier_defect>
+{"summary":"auth regression","correction_spec":"restore header ordering","evidence":["src/auth.rs:42","test_auth"]}
+</verifier_defect>
+<role_completion>
+role: VERIFIER
+result: FAIL
+workflow_id: wf-test
+project_id: proj-test
+project_root: /tmp
+</role_completion>"#;
+
+        match parse_verifier_defect_block(text) {
+            VerifierDefectParse::Claim(claim) => {
+                assert_eq!(claim.summary, "auth regression");
+                assert_eq!(claim.correction_spec, "restore header ordering");
+                assert_eq!(claim.evidence.len(), 2);
+            }
+            other => panic!("expected Claim, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verifier_defect_absent_is_no_claim() {
+        assert_eq!(
+            parse_verifier_defect_block("<role_completion>\nrole: VERIFIER\nresult: PASS\nworkflow_id: wf-test\nproject_id: proj-test\nproject_root: /tmp\n</role_completion>"),
+            VerifierDefectParse::NoClaim
+        );
+    }
+
+    #[test]
+    fn verifier_defect_unknown_json_key_fails_closed() {
+        let text = r#"<verifier_defect>
+{"summary":"s","correction_spec":"c","evidence":[],"workflow_revision":7}
+</verifier_defect>"#;
+        assert!(matches!(
+            parse_verifier_defect_block(text),
+            VerifierDefectParse::Malformed { .. }
+        ));
+    }
+
+    #[test]
+    fn verifier_defect_duplicate_evidence_fails_closed() {
+        let text = r#"<verifier_defect>
+{"summary":"s","correction_spec":"c","evidence":["same","same"]}
+</verifier_defect>"#;
+        assert!(matches!(
+            parse_verifier_defect_block(text),
+            VerifierDefectParse::Malformed { .. }
+        ));
+    }
+
+    #[test]
+    fn verifier_defect_evidence_may_be_omitted() {
+        let text = r#"<verifier_defect>
+{"summary":"s","correction_spec":"c"}
+</verifier_defect>"#;
+        match parse_verifier_defect_block(text) {
+            VerifierDefectParse::Claim(claim) => assert!(claim.evidence.is_empty()),
+            other => panic!("expected Claim, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verifier_defect_missing_required_field_fails_closed() {
+        let text = r#"<verifier_defect>
+{"summary":"s","evidence":[]}
+</verifier_defect>"#;
+        assert!(matches!(
+            parse_verifier_defect_block(text),
+            VerifierDefectParse::Malformed { .. }
+        ));
+    }
+
+    #[test]
+    fn verifier_defect_multiple_blocks_are_ambiguous() {
+        let text = r#"<verifier_defect>
+{"summary":"a","correction_spec":"c","evidence":[]}
+</verifier_defect>
+<verifier_defect>
+{"summary":"b","correction_spec":"c","evidence":[]}
+</verifier_defect>"#;
+        assert_eq!(
+            parse_verifier_defect_block(text),
+            VerifierDefectParse::Ambiguous
         );
     }
 
