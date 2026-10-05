@@ -1712,7 +1712,24 @@ impl CtlHandler for RuntimeHandler {
                 return agent_work_error(error.code(), &error.to_string());
             }
         };
-        let ack_json = serde_json::json!({"acknowledgement":"WORK_ACCEPTED", "dispatch_id":request.dispatch_id, "admission_id":ack.admission_id, "workflow_run_id":request.workflow_run_id, "role":request.role, "conversation_key":request.conversation_key}).to_string();
+        // AAP Runtime requires a stable, non-empty OpenAB execution identity
+        // in every successful native admission acknowledgement. Keep this
+        // identity domain separate from the ACP SessionPool key
+        // (`native-dispatch:<agent>:<dispatch_id>`): this value identifies the
+        // accepted OpenAB execution durably across retries of the same
+        // scheduler dispatch.
+        let openab_execution_id = format!("openab-native:{}", request.dispatch_id);
+
+        let ack_json = serde_json::json!({
+            "acknowledgement": "WORK_ACCEPTED",
+            "dispatch_id": request.dispatch_id,
+            "admission_id": ack.admission_id,
+            "openab_execution_id": openab_execution_id,
+            "workflow_run_id": request.workflow_run_id,
+            "role": request.role,
+            "conversation_key": request.conversation_key,
+        })
+        .to_string();
         // Promote the InFlight reservation to Done. After this point the
         // guard is disarmed so its Drop will not also release the slot.
         self.ledger.lock().await.complete_with_done(
@@ -2132,10 +2149,56 @@ mod tests {
 
         assert_eq!(admission.calls(), 1);
         assert_eq!(ack["dispatch_id"], request.dispatch_id);
+        assert_eq!(
+            ack["openab_execution_id"],
+            format!("openab-native:{}", request.dispatch_id)
+        );
         assert_eq!(ack["workflow_run_id"], request.workflow_run_id);
         assert_eq!(ack["role"], request.role);
         assert_eq!(ack["conversation_key"], request.conversation_key);
         assert_eq!(ack["admission_id"], "admission-1");
+    }
+
+    #[tokio::test]
+    async fn ctl_work_accepted_execution_id_is_stable_per_dispatch() {
+        let admission = Arc::new(RecordingAdmissionPort::new("admission-exec"));
+        let handler = native_work_handler(admission.clone());
+
+        let mut request_a = native_work_request();
+        request_a.dispatch_id = "oad-exec-a".into();
+
+        let first = handler.handle_agent_work(Some(&request_a)).await;
+        let retry = handler.handle_agent_work(Some(&request_a)).await;
+
+        let first_ack = accepted_ack(&first);
+        let retry_ack = accepted_ack(&retry);
+
+        assert_eq!(first_ack["openab_execution_id"], "openab-native:oad-exec-a");
+        assert_eq!(
+            retry_ack["openab_execution_id"], first_ack["openab_execution_id"],
+            "retry of the same dispatch_id must preserve execution identity"
+        );
+
+        let mut request_b = native_work_request();
+        request_b.dispatch_id = "oad-exec-b".into();
+
+        let second = handler.handle_agent_work(Some(&request_b)).await;
+        let second_ack = accepted_ack(&second);
+
+        assert_eq!(
+            second_ack["openab_execution_id"],
+            "openab-native:oad-exec-b"
+        );
+        assert_ne!(
+            second_ack["openab_execution_id"], first_ack["openab_execution_id"],
+            "distinct dispatch_ids must produce distinct OpenAB execution identities"
+        );
+
+        assert_eq!(
+            admission.calls(),
+            2,
+            "retry of dispatch A must be ledger-replayed, while dispatch B is admitted once"
+        );
     }
 
     #[tokio::test]

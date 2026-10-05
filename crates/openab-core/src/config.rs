@@ -448,14 +448,23 @@ pub struct AutonomousIngressConfig {
     #[serde(default)]
     pub aap_agents: Vec<String>,
 
-    /// Optional canonical workflow PRIMARY identity supplied to AAP Runtime
-    /// after this front-door daemon is admitted by `aap_agents`.
+    /// Optional explicit canonical workflow PRIMARY identity supplied to
+    /// AAP Runtime after this front-door daemon is admitted by `aap_agents`.
     ///
-    /// For legacy deployments where the daemon itself is one of the
-    /// canonical workflow agents this may be omitted; the admitted daemon
-    /// identity is then preserved as the workflow PRIMARY.
+    /// Workflow topology is a three-field authority tuple. When all three
+    /// identities are omitted, AAP Runtime owns topology selection and applies
+    /// its canonical default. OpenAB never promotes the admitted front-door
+    /// daemon identity into workflow PRIMARY authority.
     #[serde(default)]
     pub primary_agent: Option<String>,
+
+    /// Optional explicit canonical workflow VERIFIER identity.
+    #[serde(default)]
+    pub verifier_agent: Option<String>,
+
+    /// Optional explicit canonical workflow FINAL_REVIEWER identity.
+    #[serde(default)]
+    pub final_reviewer_agent: Option<String>,
 
     /// HTTP base URL for the AAP Runtime autonomous ingress endpoint,
     /// e.g. `http://127.0.0.1:8000`. The gate calls
@@ -4536,11 +4545,13 @@ cancel_strategy = "noop"
     // ---- Phase 4 production config-wiring tests (Section 19) ----
 
     #[test]
-    fn autonomous_ingress_parses_front_door_and_primary_identities_separately() {
+    fn autonomous_ingress_parses_front_door_and_workflow_topology_separately() {
         let raw = r#"
 [autonomous_ingress]
 aap_agents = ["Arthuraap"]
 primary_agent = "ArthurClaude"
+verifier_agent = "ArthurCodex"
+final_reviewer_agent = "ArthurGemini"
 aap_runtime_url = "http://127.0.0.1:8000"
 project_id = "arthur-ai-platform"
 aap_universal_humans = false
@@ -4553,6 +4564,11 @@ aap_universal_humans = false
 
         assert_eq!(autonomous.aap_agents, vec!["Arthuraap".to_string()]);
         assert_eq!(autonomous.primary_agent.as_deref(), Some("ArthurClaude"));
+        assert_eq!(autonomous.verifier_agent.as_deref(), Some("ArthurCodex"));
+        assert_eq!(
+            autonomous.final_reviewer_agent.as_deref(),
+            Some("ArthurGemini")
+        );
         assert!(autonomous.declares_agent("Arthuraap"));
         assert!(!autonomous.declares_agent("ArthurClaude"));
     }
