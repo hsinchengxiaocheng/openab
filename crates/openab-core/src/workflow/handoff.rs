@@ -106,9 +106,9 @@ pub fn render_role_completion_contract(ctx: &WorkflowContext) -> String {
         WorkflowRole::FinalReviewer => "PASS",
     };
     let result_hint = match ctx.assigned_role {
-        WorkflowRole::Primary => "<COMPLETE>",
-        WorkflowRole::Verifier => "<PASS or FAIL>",
-        WorkflowRole::FinalReviewer => "<PASS>",
+        WorkflowRole::Primary => "COMPLETE",
+        WorkflowRole::Verifier => "PASS",
+        WorkflowRole::FinalReviewer => "PASS",
     };
     let mut out = String::new();
     out.push_str("<role_completion_contract>\n");
@@ -480,6 +480,26 @@ mod tests {
         let body = render_role_completion_contract(&ctx);
         assert!(body.contains("allowed_results: COMPLETE"));
         assert!(!body.contains("PASS"));
+    }
+
+    #[test]
+    fn concrete_result_templates_use_parser_valid_canonical_values() {
+        let primary = render_role_completion_contract(&sample_context_for(WorkflowRole::Primary));
+        assert!(primary.contains("allowed_results: COMPLETE"));
+        assert!(primary.contains("result: COMPLETE"));
+        assert!(!primary.contains("result: <COMPLETE>"));
+
+        let verifier = render_role_completion_contract(&sample_context_for(WorkflowRole::Verifier));
+        assert!(verifier.contains("allowed_results: PASS | FAIL"));
+        assert!(verifier.contains("result: PASS"));
+        assert!(!verifier.contains("result: PASS | FAIL"));
+        assert!(!verifier.contains("result: <PASS or FAIL>"));
+
+        let final_reviewer =
+            render_role_completion_contract(&sample_context_for(WorkflowRole::FinalReviewer));
+        assert!(final_reviewer.contains("allowed_results: PASS"));
+        assert!(final_reviewer.contains("result: PASS"));
+        assert!(!final_reviewer.contains("result: <PASS>"));
     }
 
     /// D. Contract binds trusted workflow_id / project_id /
