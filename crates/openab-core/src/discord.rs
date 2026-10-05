@@ -14,6 +14,10 @@ use crate::terminal_delivery_worker::{
     DiscordTerminalMessage, TerminalDeliveryReconciliationManager, TerminalDeliveryWorker,
 };
 use crate::trust::l3_gate_applies;
+use crate::workflow_command::{
+    WorkflowCommandAdapter, WorkflowCommandAdapterResult, WorkflowCommandOptions,
+    WorkflowSubcommand,
+};
 use async_trait::async_trait;
 use serenity::builder::{
     CreateActionRow, CreateAttachment, CreateButton, CreateCommand, CreateCommandOption,
@@ -551,14 +555,23 @@ impl ChatAdapter for DiscordAdapter {
             content_lines = content.lines().count(),
             "Discord targeted send entered"
         );
-        // Restricted ``allowed_mentions`` so Discord's REST API tags the
-        // message with ``mentions: [{user_id: <X>}]`` and the receiving
-        // bot's MultibotMentions check accepts the dispatch without the
-        // LLM authoring a raw Discord ID.
-        let mut builder = serenity::builder::CreateMessage::new().content(content);
+        // SINGLE-SOURCE-OF-TRUTH mention normalization. When a
+        // ``target_user_id`` is declared, the wire form MUST carry
+        // exactly one canonical recipient mention token (``<@{id}>``):
+        //   * Discord's REST pipeline populates the recipient's inbound
+        //     ``Message.mentions`` array based on the literal token in
+        //     content (NOT from ``allowed_mentions`` alone).
+        //   * The recipient's inbound ``is_mentioned`` predicate
+        //     (``msg.content.contains("<@{bot_id}>")``) requires the
+        //     token to fire under ``allow_bot_messages = "mentions"``.
+        //   * ``allowed_mentions`` (pinned to the same user ID below)
+        //     restricts Discord's surface to that single mention.
+        // Callers MUST pass logical content (the canonical HANDOFF
+        // envelope body) and let this adapter ensure the wire form.
+        let mut builder = serenity::builder::CreateMessage::new();
         if let Some(user_id_str) = target_user_id {
             let target_id = match user_id_str.parse::<u64>() {
-                Ok(id) => serenity::model::id::UserId::new(id),
+                Ok(id) => id,
                 Err(e) => {
                     tracing::warn!(
                         event = "openab.discord.targeted_send_result",
@@ -575,8 +588,39 @@ impl ChatAdapter for DiscordAdapter {
                     ));
                 }
             };
-            let allowed = serenity::builder::CreateAllowedMentions::new().users([target_id]);
-            builder = builder.allowed_mentions(allowed);
+            let wire_content = match normalize_targeted_mention(content, target_id) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        event = "openab.discord.targeted_send_result",
+                        request_id = ?request_id,
+                        adapter_instance_id = %self.adapter_instance_id,
+                        thread_id = %ch_id,
+                        target_user_id = %user_id_str,
+                        status = "FAIL",
+                        normalization_error = %e,
+                        "Discord targeted send rejected by mention normalization"
+                    );
+                    return Err(anyhow::Error::new(e));
+                }
+            };
+            tracing::info!(
+                event = "openab.discord.targeted_send_normalized",
+                request_id = ?request_id,
+                adapter_instance_id = %self.adapter_instance_id,
+                thread_id = %ch_id,
+                target_user_id = %user_id_str,
+                wire_content_bytes = wire_content.len(),
+                wire_content_chars = wire_content.chars().count(),
+                wire_content_lines = wire_content.lines().count(),
+                wire_content_sha256 = %control_plane::sha256_hex(&wire_content),
+                "Discord targeted send wire content normalized"
+            );
+            let target_uid = serenity::model::id::UserId::new(target_id);
+            let allowed = serenity::builder::CreateAllowedMentions::new().users([target_uid]);
+            builder = builder.content(wire_content).allowed_mentions(allowed);
+        } else {
+            builder = builder.content(content);
         }
         let msg = match ChannelId::new(ch_id)
             .send_message(&self.http, builder)
@@ -770,6 +814,19 @@ pub struct Handler {
     pub terminal_delivery_worker: Option<Arc<TerminalDeliveryWorker>>,
     pub terminal_delivery_shutdown: tokio::sync::watch::Receiver<bool>,
     pub terminal_delivery_manager: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Optional Phase 1.7.1 native Discord ``/workflow`` adapter.
+    ///
+    /// ``None`` (the default) means the bounded Tech Lead control
+    /// surface is unwired; the ``/workflow`` Interaction::Command is
+    /// rejected with a typed ephemeral reply so an operator cannot
+    /// silently lose input to a misconfigured deployment. The
+    /// adapter is the **single** OpenAB-side entry point for native
+    /// Discord ``/workflow`` dispatches; it forwards the synthesized
+    /// textual slash command to AAP Runtime's existing
+    /// ``/v1/integrations/openclaw/turn`` endpoint and never
+    /// re-implements authorization, CAS, reason validation, binding
+    /// checks, or self-verification rules.
+    pub workflow_command_adapter: Option<Arc<WorkflowCommandAdapter>>,
 }
 
 impl Handler {
@@ -2205,6 +2262,25 @@ impl EventHandler for Handler {
             CreateCommand::new("auth").description("Authenticate the backend agent (device flow)"),
             CreateCommand::new("usage")
                 .description("Show backend account usage and billing information"),
+            // Phase 1.7.1 — native Discord ``/workflow`` Application Command.
+            //
+            // The bounded Tech Lead control surface is dispatched
+            // through a thin OpenAB adapter (see
+            // ``crate::workflow_command::WorkflowCommandAdapter``) into
+            // AAP Runtime's existing ``/workflow`` slash-command path
+            // so Runtime remains the sole mutation authority. Every
+            // subcommand requires ``workflow_run_id``; mutations
+            // additionally require ``expected_revision`` and a
+            // ``reason`` (plus ``correction_spec`` for
+            // ``reopen-primary``, and the three canonical agent
+            // identities for ``reconfigure``). Runtime owns the
+            // CAS, the canonical reason vocabulary, and the
+            // self-verification refusal — OpenAB only registers the
+            // command shape and parses options.
+            //
+            // Subcommand option grammar mirrors Runtime's
+            // ``parse_workflow_slash_command`` closed vocabulary.
+            workflow_command_discord_registration(),
             CreateCommand::new("export-thread")
                 .description("Download this thread as a text file")
                 .add_option(CreateCommandOption::new(
@@ -2330,6 +2406,9 @@ impl EventHandler for Handler {
             Interaction::Command(cmd) if cmd.data.name == "usage" => {
                 self.handle_usage_command(&ctx, &cmd).await;
             }
+            Interaction::Command(cmd) if cmd.data.name == "workflow" => {
+                self.handle_workflow_command(&ctx, &cmd).await;
+            }
             Interaction::Component(comp) if comp.data.custom_id.starts_with("acp_config_") => {
                 self.handle_config_select(&ctx, &comp).await;
             }
@@ -2342,6 +2421,489 @@ impl EventHandler for Handler {
 }
 
 // --- Slash command & interaction handlers ---
+
+/// Parsed subcommand + options for a Discord ``/workflow`` command.
+///
+/// Returned by :func:`extract_workflow_subcommand_options` so
+/// :func:`Handler::handle_workflow_command` can pass a typed bundle
+/// to the dispatcher.
+struct ParsedWorkflowCommand {
+    subcommand: WorkflowSubcommand,
+    /// Pre-flight validation surface only. The Runtime seam owns the
+    /// canonical option parsing; OpenAB only performs the bounded
+    /// shape / presence checks needed to render a typed ephemeral
+    /// reply when the option block itself is malformed. The captured
+    /// options are therefore intentionally not re-read after the
+    /// structural validation pass — `serialize_workflow_command_interaction`
+    /// re-serializes the original Serenity `CommandInteraction` so
+    /// Runtime can apply its own closed-vocabulary parser.
+    #[allow(dead_code)]
+    options: WorkflowCommandOptions,
+}
+
+/// Pull the subcommand name and option map out of a Discord
+/// ``CommandInteraction``.
+///
+/// The Discord command tree is modeled as
+/// ``/workflow <subcommand> [--option value]...``. The options
+/// live on the subcommand's :class:`CommandDataOption`, NOT on the
+/// outer :class:`CommandData`. Per Discord API, an interaction for
+/// ``/workflow status --workflow_run_id wfr-1`` arrives as::
+///     CommandInteraction {
+///         data: CommandData { name: "workflow", options: [
+///             CommandDataOption { name: "status", kind: SubCommand,
+///                                options: [
+///                                    CommandDataOption { name: "workflow_run_id", value: Resolved("wfr-1") },
+///                                ] },
+///         ] }
+///     }
+///
+/// Returns :class:`crate::workflow_command::AdapterRejectionReason`
+/// on any parse failure (missing subcommand, unknown subcommand,
+/// missing ``workflow_run_id``) so the handler can render a typed
+/// ephemeral reply without falling through to ACP / chat.
+fn extract_workflow_subcommand_options(
+    cmd: &serenity::model::application::CommandInteraction,
+) -> Result<ParsedWorkflowCommand, crate::workflow_command::AdapterRejectionReason> {
+    use crate::workflow_command::{
+        AdapterRejectionReason, OPTION_BINDING, OPTION_CORRECTION_SPEC, OPTION_EXPECTED_REVISION,
+        OPTION_FINAL_REVIEWER, OPTION_PRIMARY, OPTION_REASON, OPTION_VERIFIER,
+        OPTION_WORKFLOW_RUN_ID,
+    };
+
+    // serenity 0.12.5 — find the ``SubCommand`` option on the parent
+    // command. The subcommand value carries the nested option list.
+    let sub_opt = cmd
+        .data
+        .options
+        .iter()
+        .find(|opt| opt.value.kind() == CommandOptionType::SubCommand)
+        .ok_or(AdapterRejectionReason::UnknownSubcommand)?;
+
+    let subcommand = WorkflowSubcommand::parse(&sub_opt.name)
+        .ok_or(AdapterRejectionReason::UnknownSubcommand)?;
+
+    // Pull the nested option slice out of ``CommandDataOptionValue::SubCommand``.
+    let sub_options: &[serenity::model::application::CommandDataOption] = match &sub_opt.value {
+        serenity::model::application::CommandDataOptionValue::SubCommand(opts) => opts,
+        _ => return Err(AdapterRejectionReason::UnknownSubcommand),
+    };
+
+    let mut options = WorkflowCommandOptions::new();
+
+    for opt in sub_options.iter() {
+        let name = opt.name.as_str();
+        match &opt.value {
+            serenity::model::application::CommandDataOptionValue::String(s) => match name {
+                OPTION_WORKFLOW_RUN_ID => options.workflow_run_id = Some(s.clone()),
+                OPTION_REASON => options.reason = Some(s.clone()),
+                OPTION_CORRECTION_SPEC => options.correction_spec = Some(s.clone()),
+                OPTION_PRIMARY => options.primary = Some(s.clone()),
+                OPTION_VERIFIER => options.verifier = Some(s.clone()),
+                OPTION_FINAL_REVIEWER => options.final_reviewer = Some(s.clone()),
+                OPTION_BINDING => options.binding = Some(s.clone()),
+                _ => {
+                    // Unknown option — Runtime will reject the
+                    // synthesized slash command with its own typed
+                    // rejection token.
+                }
+            },
+            serenity::model::application::CommandDataOptionValue::Integer(v)
+                if name == OPTION_EXPECTED_REVISION =>
+            {
+                options.expected_revision = Some(*v);
+            }
+            _ => {
+                // Boolean / Number / Channel / Role / User /
+                // Attachment / Autocomplete / Unknown — none of these
+                // appear on the bounded /workflow surface; the
+                // Runtime parser would also reject them.
+            }
+        }
+    }
+
+    // Structural pre-flight checks that the Runtime parser also
+    // performs; we surface them here so the Discord reply carries
+    // the same canonical ``reason`` token even when Runtime is
+    // unreachable. The Runtime seam remains the sole mutation
+    // authority — this guard only ensures the operator gets a
+    // deterministic ephemeral reply when the option shape itself
+    // is malformed.
+    if options
+        .workflow_run_id
+        .as_ref()
+        .map(|s| s.trim().is_empty())
+        .unwrap_or(true)
+    {
+        return Err(AdapterRejectionReason::MissingWorkflowRunId);
+    }
+    match subcommand {
+        WorkflowSubcommand::Status | WorkflowSubcommand::Agents => {}
+        WorkflowSubcommand::ReopenPrimary => {
+            if options.expected_revision.is_none() {
+                return Err(AdapterRejectionReason::MissingRequiredOption(
+                    OPTION_EXPECTED_REVISION,
+                ));
+            }
+            if options
+                .reason
+                .as_ref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+            {
+                return Err(AdapterRejectionReason::MissingRequiredOption(OPTION_REASON));
+            }
+            if options
+                .correction_spec
+                .as_ref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+            {
+                return Err(AdapterRejectionReason::MissingRequiredOption(
+                    OPTION_CORRECTION_SPEC,
+                ));
+            }
+        }
+        WorkflowSubcommand::ReopenWork => {
+            if options.expected_revision.is_none() {
+                return Err(AdapterRejectionReason::MissingRequiredOption(
+                    OPTION_EXPECTED_REVISION,
+                ));
+            }
+            if options
+                .reason
+                .as_ref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+            {
+                return Err(AdapterRejectionReason::MissingRequiredOption(OPTION_REASON));
+            }
+        }
+        WorkflowSubcommand::Reconfigure => {
+            if options.expected_revision.is_none() {
+                return Err(AdapterRejectionReason::MissingRequiredOption(
+                    OPTION_EXPECTED_REVISION,
+                ));
+            }
+            if options
+                .reason
+                .as_ref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+            {
+                return Err(AdapterRejectionReason::MissingRequiredOption(OPTION_REASON));
+            }
+            if options
+                .primary
+                .as_ref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+            {
+                return Err(AdapterRejectionReason::MissingRequiredOption(
+                    OPTION_PRIMARY,
+                ));
+            }
+            if options
+                .verifier
+                .as_ref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+            {
+                return Err(AdapterRejectionReason::MissingRequiredOption(
+                    OPTION_VERIFIER,
+                ));
+            }
+            if options
+                .final_reviewer
+                .as_ref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+            {
+                return Err(AdapterRejectionReason::MissingRequiredOption(
+                    OPTION_FINAL_REVIEWER,
+                ));
+            }
+        }
+    }
+
+    Ok(ParsedWorkflowCommand {
+        subcommand,
+        options,
+    })
+}
+
+/// Serialize Serenity's CommandInteraction back into the Discord
+/// APPLICATION_COMMAND wire shape expected by AAP Runtime.
+///
+/// Serenity consumes the root Discord interaction ``type`` discriminator
+/// when it maps the gateway payload into ``Interaction::Command``.
+/// ``CommandInteraction`` itself therefore does not retain that root field.
+/// Reinsert ONLY the canonical APPLICATION_COMMAND discriminator (2);
+/// every other field remains Serenity's serialization of the received
+/// interaction.
+fn serialize_workflow_command_interaction(
+    cmd: &serenity::model::application::CommandInteraction,
+) -> Result<String, crate::workflow_command::AdapterRejectionReason> {
+    let mut payload = serde_json::to_value(cmd).map_err(|error| {
+        crate::workflow_command::AdapterRejectionReason::RuntimeMalformed(format!(
+            "failed to serialize Discord CommandInteraction: {error}"
+        ))
+    })?;
+
+    let object = payload.as_object_mut().ok_or_else(|| {
+        crate::workflow_command::AdapterRejectionReason::RuntimeMalformed(
+            "serialized Discord CommandInteraction was not a JSON object".to_string(),
+        )
+    })?;
+
+    object.insert("type".to_string(), serde_json::json!(2));
+
+    serde_json::to_string(&payload).map_err(|error| {
+        crate::workflow_command::AdapterRejectionReason::RuntimeMalformed(format!(
+            "failed to encode Discord CommandInteraction payload: {error}"
+        ))
+    })
+}
+
+/// Render the adapter result onto a Discord ``ephemeral`` followup.
+///
+/// Always ephemeral — the bounded Tech Lead surface is not a
+/// public broadcast. The visible content carries:
+///   * ``✅`` for a delivered dispatch (Runtime succeeded).
+///   * ``⛔`` for a typed Runtime rejection (canonical
+///     ``WorkflowCommandRejectionReason`` token echoed back).
+///   * ``⚠️`` for an adapter-side failure (transport / auth / parse
+///     before Runtime could classify the inbound).
+fn build_workflow_followup(
+    result: &WorkflowCommandAdapterResult,
+) -> CreateInteractionResponseFollowup {
+    match result {
+        WorkflowCommandAdapterResult::Delivered {
+            message,
+            runtime_response,
+        } => {
+            let mut content = format!("✅ {message}");
+            if let Some(payload) = runtime_response {
+                if let Some(rendered) = render_runtime_response(payload) {
+                    content.push('\n');
+                    content.push_str(&rendered);
+                }
+            }
+            CreateInteractionResponseFollowup::new()
+                .content(content)
+                .ephemeral(true)
+        }
+        WorkflowCommandAdapterResult::RuntimeRejection { reason, detail } => {
+            let mut content = format!("⛔ Workflow command rejected: `{reason}`");
+            if let Some(detail) = detail {
+                content.push('\n');
+                content.push_str(detail);
+            }
+            CreateInteractionResponseFollowup::new()
+                .content(content)
+                .ephemeral(true)
+        }
+        WorkflowCommandAdapterResult::AdapterRejection { reason, detail } => {
+            let mut content = format!("⚠️ /workflow adapter failure: `{}`", reason.token());
+            if let Some(detail) = detail {
+                content.push('\n');
+                content.push_str(detail);
+            }
+            CreateInteractionResponseFollowup::new()
+                .content(content)
+                .ephemeral(true)
+        }
+    }
+}
+
+/// Render the optional Runtime response payload as a deterministic
+/// Discord-friendly summary. Discord caps message bodies at 2000
+/// characters; the renderer trims aggressively to leave room for
+/// the canonical prefix.
+fn render_runtime_response(payload: &serde_json::Value) -> Option<String> {
+    let obj = payload.as_object()?;
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(v) = obj.get("workflow_run_id").and_then(|v| v.as_str()) {
+        lines.push(format!("workflow_run_id: `{v}`"));
+    }
+    if let Some(v) = obj.get("revision").and_then(|v| v.as_u64()) {
+        lines.push(format!("revision: {v}"));
+    } else if let Some(v) = obj.get("new_revision").and_then(|v| v.as_u64()) {
+        lines.push(format!("new_revision: {v}"));
+    }
+    if let Some(v) = obj.get("state").and_then(|v| v.as_str()) {
+        lines.push(format!("state: `{v}`"));
+    }
+    if let Some(v) = obj.get("primary_agent").and_then(|v| v.as_str()) {
+        lines.push(format!("primary: `{v}`"));
+    }
+    if let Some(v) = obj.get("verifier_agent").and_then(|v| v.as_str()) {
+        lines.push(format!("verifier: `{v}`"));
+    }
+    if let Some(v) = obj.get("final_reviewer_agent").and_then(|v| v.as_str()) {
+        lines.push(format!("final_reviewer: `{v}`"));
+    }
+    if let Some(v) = obj.get("defect_loop_count").and_then(|v| v.as_u64()) {
+        lines.push(format!("defect_loop_count: {v}"));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(lines.join("\n"))
+}
+
+/// Build the bounded ``/workflow`` Discord Application Command
+/// registration. Returns a single :class:`serenity::builder::CreateCommand`
+/// carrying five ``SubCommand`` options (`status`, `agents`,
+/// `reopen-primary`, `reopen-work`, `reconfigure`).
+///
+/// The closed option grammar mirrors Runtime's
+/// :func:`runtime.integrations.workflow_command_router.parse_workflow_slash_command`
+/// vocabulary so the canonical Runtime parser remains the single
+/// source of truth for option shape validation. Discord-side we
+/// only declare the option **shape**; per-option value validation
+/// (length / integer format / non-empty / reason membership) is
+/// delegated to the Runtime bridge.
+fn workflow_command_discord_registration() -> CreateCommand {
+    // Reusable per-option builders so each subcommand's option
+    // shape stays one screen tall. The required/optional flags
+    // match Runtime's structural-validation contract:
+    //
+    //   * ``workflow_run_id`` — required on every subcommand.
+    //   * ``expected_revision`` — required only on mutation
+    //     subcommands. Read-only ``status`` / ``agents`` must work
+    //     without a CAS token so the operator can discover the
+    //     authoritative current revision before mutating.
+    //   * ``reason`` — required on every mutation subcommand.
+    //   * ``correction_spec`` — required only on ``reopen-primary``.
+    //   * ``primary``, ``verifier``, ``final_reviewer`` — required
+    //     only on ``reconfigure`` (canonical bot identities).
+    //   * ``binding`` — optional everywhere; Runtime forwards it
+    //     to the B1 binding-identity check.
+
+    let workflow_run_id = || {
+        CreateCommandOption::new(
+            CommandOptionType::String,
+            "workflow_run_id",
+            "Authoritative WorkflowRun.run_id (e.g. wfr...)",
+        )
+        .required(true)
+    };
+    let expected_revision = || {
+        CreateCommandOption::new(
+            CommandOptionType::Integer,
+            "expected_revision",
+            "WorkflowRun.revision CAS token; Runtime rejects stale dispatches",
+        )
+        .required(true)
+    };
+    let reason = || {
+        CreateCommandOption::new(
+            CommandOptionType::String,
+            "reason",
+            "Canonical reason token (see Runtime SUPPORTED_*_REASONS)",
+        )
+        .required(true)
+    };
+    let correction_spec = || {
+        CreateCommandOption::new(
+            CommandOptionType::String,
+            "correction_spec",
+            "Bounded correction directive for /workflow reopen-primary",
+        )
+        .required(true)
+    };
+    let primary = || {
+        CreateCommandOption::new(
+            CommandOptionType::String,
+            "primary",
+            "Canonical primary agent identity (ArthurClaude|ArthurCodex|ArthurGemini)",
+        )
+        .required(true)
+    };
+    let verifier = || {
+        CreateCommandOption::new(
+            CommandOptionType::String,
+            "verifier",
+            "Canonical verifier agent identity (ArthurClaude|ArthurCodex|ArthurGemini)",
+        )
+        .required(true)
+    };
+    let final_reviewer = || {
+        CreateCommandOption::new(
+            CommandOptionType::String,
+            "final_reviewer",
+            "Canonical final_reviewer agent identity (ArthurClaude|ArthurCodex|ArthurGemini)",
+        )
+        .required(true)
+    };
+    let binding = || {
+        CreateCommandOption::new(
+            CommandOptionType::String,
+            "binding",
+            "Optional conversation_binding_id forwarded to the B1 binding check",
+        )
+        .required(false)
+    };
+
+    let status_subcommand = CreateCommandOption::new(
+        CommandOptionType::SubCommand,
+        "status",
+        "Read the canonical Runtime snapshot for a WorkflowRun",
+    )
+    .add_sub_option(workflow_run_id())
+    .add_sub_option(binding());
+
+    let agents_subcommand = CreateCommandOption::new(
+        CommandOptionType::SubCommand,
+        "agents",
+        "List the canonical primary/verifier/final_reviewer tuple",
+    )
+    .add_sub_option(workflow_run_id())
+    .add_sub_option(binding());
+
+    let reopen_primary_subcommand = CreateCommandOption::new(
+        CommandOptionType::SubCommand,
+        "reopen-primary",
+        "Bounded-defect correction (VERIFIER_ACTIVE → PRIMARY_ACTIVE)",
+    )
+    .add_sub_option(workflow_run_id())
+    .add_sub_option(expected_revision())
+    .add_sub_option(reason())
+    .add_sub_option(correction_spec())
+    .add_sub_option(binding());
+
+    let reopen_work_subcommand = CreateCommandOption::new(
+        CommandOptionType::SubCommand,
+        "reopen-work",
+        "Tech Lead reopen of a TECH_LEAD_WAIT workflow run",
+    )
+    .add_sub_option(workflow_run_id())
+    .add_sub_option(expected_revision())
+    .add_sub_option(reason())
+    .add_sub_option(binding());
+
+    let reconfigure_subcommand = CreateCommandOption::new(
+        CommandOptionType::SubCommand,
+        "reconfigure",
+        "Reassign the canonical primary/verifier/final_reviewer tuple",
+    )
+    .add_sub_option(workflow_run_id())
+    .add_sub_option(expected_revision())
+    .add_sub_option(reason())
+    .add_sub_option(primary())
+    .add_sub_option(verifier())
+    .add_sub_option(final_reviewer())
+    .add_sub_option(binding());
+
+    CreateCommand::new("workflow")
+        .description("M24 Phase 1.7 workflow control surface (Tech Lead only)")
+        .add_option(status_subcommand)
+        .add_option(agents_subcommand)
+        .add_option(reopen_primary_subcommand)
+        .add_option(reopen_work_subcommand)
+        .add_option(reconfigure_subcommand)
+}
 
 impl Handler {
     /// Build a Discord select menu from ACP configOptions with the given category.
@@ -2596,6 +3158,121 @@ impl Handler {
                 error = %e,
                 decision,
                 "failed to send approval command followup"
+            );
+        }
+    }
+
+    /// Phase 1.7.1 — handle the native ``/workflow`` Discord
+    /// Application Command.
+    ///
+    /// The handler is a **thin** adapter: it translates the Discord
+    /// subcommand + options into the canonical textual
+    /// ``/workflow <sub> <id> [--flag value]`` form and forwards the
+    /// request to AAP Runtime via the dispatcher. Runtime remains
+    /// the sole mutation authority; the handler only renders the
+    /// Runtime response as an ephemeral Discord reply.
+    ///
+    /// The "" ack-then-followup"" pattern is used because the
+    /// Runtime round-trip can exceed Discord's 3-second interaction
+    /// deadline (the same pattern
+    /// ``handle_usage_command`` / ``handle_approval_command`` use).
+    async fn handle_workflow_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) {
+        // Fast-fail with a typed ephemeral reply when the bounded
+        // Tech Lead control surface is unwired. We MUST NOT fall
+        // through to ACP / chat — the bounded surface refuses on
+        // every misconfiguration.
+        let adapter = match self.workflow_command_adapter.as_ref() {
+            Some(adapter) => adapter.clone(),
+            None => {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(
+                            "⚠️ The ``/workflow`` command surface is not wired in this deployment. \
+                             Set the AAP control-plane credential env var (default \
+                             ``ARTHUR_AGENT_KEY_OPENAB``) and restart the bot.",
+                        )
+                        .ephemeral(true),
+                );
+                if let Err(e) = cmd.create_response(&ctx.http, response).await {
+                    tracing::error!(error = %e, "failed to reject unwired /workflow command");
+                }
+                return;
+            }
+        };
+
+        // Reject bot users — same posture as the existing
+        // ``/export-thread`` / ``/remind`` slash command handlers.
+        if is_denied_user(
+            false,
+            self.allow_all_users,
+            &self.allowed_users,
+            cmd.user.id.get(),
+        ) {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🚫 You are not allowed to use this bot.")
+                    .ephemeral(true),
+            );
+            if let Err(e) = cmd.create_response(&ctx.http, response).await {
+                tracing::error!(error = %e, "failed to deny /workflow command");
+            }
+            return;
+        }
+
+        // Acknowledge the interaction first so Discord's 3-second
+        // deadline always succeeds; the real Runtime round-trip
+        // happens in the followup phase.
+        let defer = CreateInteractionResponse::Defer(
+            CreateInteractionResponseMessage::new().ephemeral(true),
+        );
+        if let Err(e) = cmd.create_response(&ctx.http, defer).await {
+            tracing::error!(
+                error = %e,
+                "failed to defer /workflow command response"
+            );
+            return;
+        }
+
+        // Parse the Discord subcommand + options into the bounded
+        // ``WorkflowCommandOptions`` shape. An unrecognized or
+        // malformed subcommand fails closed with a typed ephemeral
+        // reply (no fallback to ACP / chat).
+        let sub_options = match extract_workflow_subcommand_options(cmd) {
+            Ok(parsed) => parsed,
+            Err(reason) => {
+                let followup = CreateInteractionResponseFollowup::new()
+                    .content(format!(
+                        "⚠️ Invalid ``/workflow`` command: reason={}.",
+                        reason.token()
+                    ))
+                    .ephemeral(true);
+                let _ = cmd.create_followup(&ctx.http, followup).await;
+                return;
+            }
+        };
+
+        let result = match serialize_workflow_command_interaction(cmd) {
+            Ok(serialized_interaction) => {
+                adapter
+                    .dispatch_native_interaction(serialized_interaction)
+                    .await
+            }
+            Err(reason) => WorkflowCommandAdapterResult::AdapterRejection {
+                reason,
+                detail: None,
+            },
+        };
+
+        let followup = build_workflow_followup(&result);
+        if let Err(e) = cmd.create_followup(&ctx.http, followup).await {
+            tracing::error!(
+                error = %e,
+                subcommand = sub_options.subcommand.as_str(),
+                "failed to send /workflow command followup"
             );
         }
     }
@@ -3907,6 +4584,128 @@ fn is_thread_already_exists_error(err: &anyhow::Error) -> bool {
 static ROLE_MENTION_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"<@&\d+>").unwrap());
 
+/// Failure modes for [`normalize_targeted_mention`].
+///
+/// Exposed so the public `send_message_targeted` seam can translate
+/// normalization errors into deterministic `anyhow::Error` reasons and
+/// log them under the same `openab.discord.targeted_send_result`
+/// structured event the existing adapter emits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetedMentionError {
+    /// Content already carries a `<@USER_ID>` token for a DIFFERENT user
+    /// than the declared `target_user_id`. The wired mention would point
+    /// at one bot while the `allowed_mentions` pin would pin to the other,
+    /// which is undefined behavior at the recipient. Fail-closed.
+    ConflictingRecipient {
+        declared_target: u64,
+        conflicting_recipient: u64,
+    },
+}
+
+impl std::fmt::Display for TargetedMentionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TargetedMentionError::ConflictingRecipient {
+                declared_target,
+                conflicting_recipient,
+            } => write!(
+                f,
+                "send_message_targeted: content carries mention of <@{}> \
+                 but declared target is <@{}>; refusing to send",
+                conflicting_recipient, declared_target
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TargetedMentionError {}
+
+/// Pure helper: ensure the wire content carries EXACTLY ONE canonical
+/// recipient mention token (`<@{id}>`) for the declared target_user_id.
+///
+/// This is the SINGLE source-of-truth normalization point at the OpenAB
+/// targeted Discord send boundary. The wire form must carry a literal
+/// `<@USER_ID>` token (not just `allowed_mentions`) because:
+///
+/// 1. Discord's REST pipeline populates the recipient's inbound
+///    `Message.mentions` array based on the literal `<@USER_ID>` token in
+///    `content` (it does NOT do this when only `allowed_mentions` is set
+///    without a literal token in `content`).
+///
+/// 2. The recipient's inbound admission predicate
+///    `is_mentioned = msg.mentions_user_id(bot_id) ||
+///    msg.content.contains("<@{bot_id}>") || role mention` (see
+///    `is_mentioned` in this file) requires the token to fire under
+///    `allow_bot_messages = "mentions"`.
+///
+/// Rules:
+/// - If content has zero `<@USER_ID>` tokens → prepend `<@{id}>\n` so the
+///   wire form carries exactly one canonical mention for the recipient.
+/// - If content has exactly one matching `<@{id}>` token → preserve
+///   unchanged (no duplicate prepend; an already-rendered canonical
+///   handoff envelope that already includes the token is left alone).
+/// - If content has a `<@OTHER_USER>` token for a DIFFERENT user →
+///   reject with [`TargetedMentionError::ConflictingRecipient`]
+///   (deterministic fail-closed: a handoff cannot safely target two bots
+///   at once).
+///
+/// Callers (Python AAP, ctl callers, etc.) MUST pass the LOGICAL content
+/// (the canonical HANDOFF envelope body) and let this adapter ensure
+/// the wire form. Prepending the mention token manually from a caller is
+/// forbidden by the same contract — that would either duplicate the
+/// token (creating two `<@{id}>` lines on the wire) or conflict with a
+/// pre-rendered mention of another user (failing closed here).
+pub(crate) fn normalize_targeted_mention(
+    content: &str,
+    target_user_id: u64,
+) -> Result<String, TargetedMentionError> {
+    // Find all `<@DIGITS>` tokens in content. We deliberately only
+    // recognize the canonical user-mention form (`<@` + digits + `>`);
+    // role mentions (`<@&...>`) and legacy nick mentions (`<@!...>`)
+    // are NOT user mentions by Discord's representation and are left
+    // untouched so role-based handoffs and operator-rendered envelopes
+    // are preserved.
+    let mut conflicting: Option<u64> = None;
+    let mut seen_target = false;
+    let bytes = content.as_bytes();
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'<' && bytes[i + 1] == b'@' {
+            let after_at = i + 2;
+            let mut end = after_at;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > after_at && end < bytes.len() && bytes[end] == b'>' {
+                if let Ok(id) = content[after_at..end].parse::<u64>() {
+                    if id == target_user_id {
+                        seen_target = true;
+                    } else if conflicting.is_none() {
+                        conflicting = Some(id);
+                    }
+                }
+                i = end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if let Some(conflicting_id) = conflicting {
+        return Err(TargetedMentionError::ConflictingRecipient {
+            declared_target: target_user_id,
+            conflicting_recipient: conflicting_id,
+        });
+    }
+    if seen_target {
+        // Content already has exactly one or more matching <@{id}> tokens;
+        // preserve unchanged so we don't duplicate the wire mention.
+        Ok(content.to_string())
+    } else {
+        // Prepend the canonical token on its own line.
+        Ok(format!("<@{}>\n{}", target_user_id, content))
+    }
+}
+
 fn resolve_mentions(content: &str, bot_id: UserId, allowed_role_ids: &HashSet<u64>) -> String {
     // 1. Strip the bot's own trigger mention
     let out = content
@@ -4301,6 +5100,183 @@ mod tests {
     use crate::admission::{WorkAdmissionAck, WorkAdmissionError};
     use crate::bot_turns::{TurnResult, BOT_TURN_LIMIT_WARNING_PREFIX, HARD_BOT_TURN_LIMIT};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // -----------------------------------------------------------------
+    // Targeted mention normalization — bounded fix regression.
+    //
+    // The DIRECT_DISCORD_ARTHURCLAUDE_EXECUTION defect (workflow
+    // openab-direct-rout-20261004) was rooted in the OpenAB targeted
+    // Discord send boundary only pinning ``allowed_mentions`` without
+    // inserting a literal ``<@USER_ID>`` token into the message content.
+    // The recipient's inbound ``is_mentioned`` predicate then fired
+    // false under ``allow_bot_messages = "mentions"`` and the bot was
+    // rejected as ``BOT_MESSAGE_NOT_MENTIONING_SELF``.
+    //
+    // ``normalize_targeted_mention`` is the SINGLE source-of-truth
+    // normalization point at the OpenAB targeted Discord send boundary
+    // (``DiscordAdapter::send_message_targeted``); these tests pin:
+    //
+    //   * POSITIVE — content has no mention token → prepend exactly one.
+    //   * IDEMPOTENT — content already has the matching token → unchanged.
+    //   * NEGATIVE-CONFLICT — content mentions a different user → reject
+    //     with ``TargetedMentionError::ConflictingRecipient`` so the
+    //     wire form cannot accidentally target two bots.
+    //   * ROLE-MENTION IGNORE — ``<@&ROLE_ID>`` is a role mention, not
+    //     a user mention, so it does NOT count toward the conflict
+    //     check; the canonical user token is still prepended.
+    //   * LEGACY-NICK IGNORE — ``<@!USER_ID>`` is a legacy nick
+    //     mention; the helper still treats it as a user mention and
+    //     rejects conflicts (Discord resolves nick mentions to the
+    //     same user ID).
+    // -----------------------------------------------------------------
+
+    const NORM_ARTHUR_CLAUDE: u64 = 1_536_733_602_304_499_852;
+    const NORM_ARTHUR_CODEX: u64 = 1_536_734_779_607_879_700;
+    const NORM_ARTHUR_GEMINI: u64 = 1_536_737_891_231_866_971;
+
+    #[test]
+    fn normalize_targeted_mention_prepends_when_no_token_present() {
+        // Content is the canonical HANDOFF envelope body with NO
+        // mention token for ANY user; the helper must prepend exactly
+        // one canonical token for the declared target.
+        let body = "HANDOFF\nfrom: ArthurCodex\nto: ArthurClaude\n";
+        let normalized = normalize_targeted_mention(body, NORM_ARTHUR_CLAUDE).expect("prepend OK");
+        assert_eq!(
+            normalized,
+            format!("<@{}>\n{}", NORM_ARTHUR_CLAUDE, body),
+            "wire form must lead with exactly one canonical recipient mention"
+        );
+        // Exactly one mention token — the bounded fix's invariant.
+        assert_eq!(
+            normalized
+                .matches(&format!("<@{}>", NORM_ARTHUR_CLAUDE))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn normalize_targeted_mention_idempotent_when_already_present() {
+        // The renderer (CanonicalHandoffCompletionEmitter) already
+        // inserts the canonical token; the helper MUST NOT
+        // double-prepend.
+        let body = format!(
+            "<@{}>\nHANDOFF\nfrom: ArthurClaude\nto: ArthurCodex\n",
+            NORM_ARTHUR_CODEX
+        );
+        let normalized =
+            normalize_targeted_mention(&body, NORM_ARTHUR_CODEX).expect("idempotent re-entry OK");
+        assert_eq!(
+            normalized, body,
+            "wire form must NOT be duplicated when an already-matching \
+             token is present"
+        );
+        assert_eq!(
+            normalized
+                .matches(&format!("<@{}>", NORM_ARTHUR_CODEX))
+                .count(),
+            1,
+            "exactly one mention, no double-prepend"
+        );
+    }
+
+    #[test]
+    fn normalize_targeted_mention_rejects_conflicting_recipient() {
+        // Content carries a token for Gemini; the declared target is
+        // Claude. A handoff cannot safely target two bots at once
+        // (allowed_mentions would pin Claude while the literal token would
+        // fire Gemini's is_mentioned predicate); fail-closed.
+        let body = format!(
+            "<@{}>\nHANDOFF\nfrom: ArthurGemini\nto: ArthurClaude\n",
+            NORM_ARTHUR_GEMINI
+        );
+        let err = normalize_targeted_mention(&body, NORM_ARTHUR_CLAUDE)
+            .expect_err("conflicting recipient must reject");
+        assert_eq!(
+            err,
+            TargetedMentionError::ConflictingRecipient {
+                declared_target: NORM_ARTHUR_CLAUDE,
+                conflicting_recipient: NORM_ARTHUR_GEMINI,
+            }
+        );
+    }
+
+    #[test]
+    fn normalize_targeted_mention_treats_role_mentions_as_non_user() {
+        // ``<@&ROLE_ID>`` is a Discord role mention, not a user mention.
+        // The helper MUST NOT count it toward the conflict check; the
+        // canonical user token is still prepended on its own line so
+        // role-based handoffs are preserved.
+        let body = "<@&1536737647253266445>\nHANDOFF\nfrom: ArthurCodex\n";
+        let normalized =
+            normalize_targeted_mention(body, NORM_ARTHUR_CLAUDE).expect("role-only OK");
+        assert_eq!(
+            normalized,
+            format!("<@{}>\n{}", NORM_ARTHUR_CLAUDE, body),
+            "role mention must NOT conflict with the declared target"
+        );
+        // The user mention for Claude is present; the role mention is
+        // preserved verbatim.
+        assert!(normalized.contains(&format!("<@{}>", NORM_ARTHUR_CLAUDE)));
+        assert!(normalized.contains("<@&1536737647253266445>"));
+    }
+
+    #[test]
+    fn normalize_targeted_mention_ignores_legacy_nick_form() {
+        // ``<@!USER_ID>`` is the legacy nick-mention form; the receiver's
+        // inbound ``is_mentioned`` predicate
+        // (``msg.content.contains("<@{bot_id}>")``) checks the canonical
+        // ``<@USER_ID>`` form, not the nick form. The bounded fix
+        // recognizes only the canonical form so a payload pre-rendered
+        // with a nick mention of Gemini still gets the canonical
+        // Claude token prepended — the wire form is representable to
+        // Claude's inbound predicate.
+        let body = format!(
+            "<@!{}>\nHANDOFF\nfrom: ArthurGemini\nto: ArthurClaude\n",
+            NORM_ARTHUR_GEMINI
+        );
+        let normalized = normalize_targeted_mention(&body, NORM_ARTHUR_CLAUDE)
+            .expect("legacy nick is not a conflict; canonical token is prepended");
+        assert_eq!(
+            normalized,
+            format!("<@{}>\n{}", NORM_ARTHUR_CLAUDE, body),
+            "legacy nick form does not conflict with the declared target"
+        );
+        // The canonical Claude token is prepended.
+        assert!(normalized.starts_with(&format!("<@{}>\n", NORM_ARTHUR_CLAUDE)));
+        // The original nick form is preserved verbatim (no
+        // double-handling).
+        assert!(normalized.contains(&format!("<@!{}>", NORM_ARTHUR_GEMINI)));
+    }
+
+    #[test]
+    fn normalize_targeted_mention_dedupes_two_matching_tokens() {
+        // Caller accidentally rendered the canonical token twice
+        // (defensive: renderers may be re-run on retry). The helper
+        // MUST leave matching duplicates alone — the receiver's
+        // ``is_mentioned`` predicate only needs ONE match; adding
+        // anything more would be over-engineering. We pin current
+        // behavior: duplicates preserved (the conflict check only
+        // fires for non-matching recipients).
+        let body = format!(
+            "<@{}>\n<@{}>\nHANDOFF\nfrom: ArthurCodex\nto: ArthurClaude\n",
+            NORM_ARTHUR_CLAUDE, NORM_ARTHUR_CLAUDE
+        );
+        let normalized =
+            normalize_targeted_mention(&body, NORM_ARTHUR_CLAUDE).expect("duplicates preserved");
+        assert_eq!(normalized, body);
+    }
+
+    #[test]
+    fn normalize_targeted_mention_handles_empty_content() {
+        // Empty content still gets the mention prepended so the wire
+        // form is representable to the receiving bot as an actual
+        // mention. (Practically ctl rejects empty values, but the
+        // helper is total over ``&str``.)
+        let normalized =
+            normalize_targeted_mention("", NORM_ARTHUR_CLAUDE).expect("empty content OK");
+        assert_eq!(normalized, format!("<@{}>\n", NORM_ARTHUR_CLAUDE));
+    }
     use std::sync::Mutex;
     use std::time::Instant;
 
@@ -6353,6 +7329,171 @@ mod tests {
         )
         .await;
         assert_eq!(recorder.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn workflow_mutation_missing_expected_revision_is_rejected() {
+        let json = serde_json::json!({
+            "id": "1234567890",
+            "application_id": "1234567890",
+            "type": 2,
+            "data": {
+                "id": "1234567890",
+                "name": "workflow",
+                "type": 1,
+                "options": [
+                    {
+                        "name": "reopen-work",
+                        "type": 1,
+                        "options": [
+                            {
+                                "name": "workflow_run_id",
+                                "type": 3,
+                                "value": "wfr-123"
+                            },
+                            {
+                                "name": "reason",
+                                "type": 3,
+                                "value": "TECH_LEAD_POST_REVIEW_REOPEN"
+                            }
+                        ]
+                    }
+                ]
+            },
+            "guild_id": "1234567890",
+            "channel_id": "1234567890",
+            "user": {
+                "id": "1234567890",
+                "username": "tech_lead",
+                "discriminator": "0001",
+                "avatar": null
+            },
+            "token": "interaction_token",
+            "version": 1,
+            "locale": "en-US",
+            "entitlements": [],
+            "attachment_size_limit": 26214400
+        });
+
+        let cmd: serenity::model::application::CommandInteraction =
+            serde_json::from_value(json).expect("deserialize CommandInteraction");
+
+        match extract_workflow_subcommand_options(&cmd) {
+            Err(err) => {
+                assert_eq!(
+                    err,
+                    crate::workflow_command::AdapterRejectionReason::MissingRequiredOption(
+                        crate::workflow_command::OPTION_EXPECTED_REVISION
+                    )
+                );
+            }
+            Ok(_) => panic!("mutation without expected_revision must fail closed"),
+        }
+    }
+
+    #[test]
+    fn workflow_command_native_serialization_restores_root_interaction_type() {
+        let json = serde_json::json!({
+            "id": "1234567890",
+            "application_id": "1234567890",
+            "type": 2,
+            "data": {
+                "id": "1234567890",
+                "name": "workflow",
+                "type": 1,
+                "options": [
+                    {
+                        "name": "status",
+                        "type": 1,
+                        "options": [
+                            {
+                                "name": "workflow_run_id",
+                                "type": 3,
+                                "value": "wfr-123"
+                            }
+                        ]
+                    }
+                ]
+            },
+            "guild_id": "1234567890",
+            "channel_id": "1234567890",
+            "user": {
+                "id": "1234567890",
+                "username": "tech_lead",
+                "discriminator": "0001",
+                "avatar": null
+            },
+            "token": "interaction_token",
+            "version": 1,
+            "locale": "en-US",
+            "entitlements": [],
+            "attachment_size_limit": 26214400
+        });
+
+        let cmd: serenity::model::application::CommandInteraction =
+            serde_json::from_value(json).expect("deserialize CommandInteraction");
+
+        let serialized = serialize_workflow_command_interaction(&cmd)
+            .expect("serialize native workflow interaction");
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&serialized).expect("serialized payload is JSON");
+
+        assert_eq!(payload["type"], 2);
+        assert_eq!(payload["data"]["name"], "workflow");
+        assert_eq!(payload["channel_id"], "1234567890");
+        assert_eq!(payload["user"]["id"], "1234567890");
+        assert_eq!(payload["data"]["options"][0]["name"], "status");
+        assert_eq!(
+            payload["data"]["options"][0]["options"][0]["value"],
+            "wfr-123"
+        );
+    }
+
+    #[test]
+    fn test_workflow_command_interaction_deserialization() {
+        let json = serde_json::json!({
+            "id": "1234567890",
+            "application_id": "1234567890",
+            "type": 2,
+            "data": {
+                "id": "1234567890",
+                "name": "workflow",
+                "type": 1,
+                "options": [
+                    {
+                        "name": "status",
+                        "type": 1,
+                        "options": [
+                            {
+                                "name": "workflow_run_id",
+                                "type": 3,
+                                "value": "wfr-123"
+                            },
+                        ]
+                    }
+                ]
+            },
+            "guild_id": "1234567890",
+            "channel_id": "1234567890",
+            "user": {
+                "id": "1234567890",
+                "username": "tech_lead",
+                "discriminator": "0001",
+                "avatar": null
+            },
+            "token": "interaction_token",
+            "version": 1,
+            "locale": "en-US",
+            "entitlements": [],
+            "attachment_size_limit": 26214400
+        });
+        let cmd: serenity::model::application::CommandInteraction =
+            serde_json::from_value(json).expect("deserialize CommandInteraction");
+        let parsed = extract_workflow_subcommand_options(&cmd).expect("extract options");
+        assert_eq!(parsed.subcommand, WorkflowSubcommand::Status);
+        assert_eq!(parsed.options.workflow_run_id.as_deref(), Some("wfr-123"));
+        assert_eq!(parsed.options.expected_revision, None);
     }
 }
 #[test]

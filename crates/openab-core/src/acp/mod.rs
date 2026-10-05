@@ -16,6 +16,6 @@ pub use protocol::{classify_notification, parse_turn_result, AcpEvent, TurnResul
 // so admission + integration tests can drive it through the canonical
 // `acp::` namespace without depending on the inner `connection` module.
 pub use connection::{
-    build_permission_response_with_policy, tool_title_denied_for_read_only, WritePolicyGuard,
-    WRITE_POLICY_MODIFY_ALLOWED, WRITE_POLICY_READ_ONLY,
+    build_permission_response_with_policy, tool_title_denied_for_read_only, AcpPromptIdentity,
+    WritePolicyGuard, WRITE_POLICY_MODIFY_ALLOWED, WRITE_POLICY_READ_ONLY,
 };

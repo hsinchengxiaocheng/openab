@@ -53,7 +53,8 @@ keys are tolerated for forward compatibility.
 Provider selection and value precedence are separate but related:
 
 1. `OPENAB_AGENT_PROVIDER` explicitly selects `anthropic`, `openai`, `codex`,
-   `xai`, or `grok`.
+   `xai`, `grok`, `openai-compatible`, or `ollama`. `ollama` is an alias for
+   the generic OpenAI-compatible Chat Completions provider.
 2. Otherwise, a provider prefix in `OPENAB_AGENT_MODEL` wins (for example,
    `xai/grok-4.5`).
 3. Otherwise, a provider prefix in `config.json`'s `model` is used.
@@ -65,16 +66,32 @@ values, so environment variables injected into a pod remain authoritative.
 `OPENAB_AGENT_XAI_MODEL` controls the xAI model after xAI has been selected; it
 does not by itself enable xAI auto-detection.
 
+For local Ollama, select the alias and provide the installed model name (no API
+key is required by default):
+
+```bash
+OPENAB_AGENT_PROVIDER=ollama \
+OPENAB_AGENT_MODEL=qwen3.8:27b-q4_K_M \
+openab-agent
+```
+
+This sends standard OpenAI Chat Completions requests to
+`http://127.0.0.1:11434/v1/chat/completions`. Set
+`OPENAB_AGENT_COMPAT_BASE_URL` for another compatible endpoint and set
+`OPENAB_AGENT_COMPAT_API_KEY` only when that endpoint requires Bearer auth.
+
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OPENAB_AGENT_MODEL` | — (required for Anthropic) | Model to use, optionally `provider/`-qualified (for example, `anthropic/claude-opus-4-8` or `xai/grok-4.5`). Anthropic has no hardcoded default and fails loud if unset; xAI falls back to `grok-4.5`. Overrides `model` in [config.json](#configuration-file-configjson). |
+| `OPENAB_AGENT_MODEL` | — (required for Anthropic and generic OpenAI-compatible providers) | Model to use, optionally `provider/`-qualified (for example, `anthropic/claude-opus-4-8`, `xai/grok-4.5`, or `ollama/qwen3.8:27b-q4_K_M`). Anthropic and generic providers fail loud if unset; xAI falls back to `grok-4.5`. Overrides `model` in [config.json](#configuration-file-configjson). |
 | `OPENAB_AGENT_OPENAI_MODEL` | `gpt-5.4-mini` | Model to use (must be supported by your ChatGPT plan — see [Supported Models](#supported-models-chatgpt-subscription)) |
 | `OPENAB_AGENT_OPENAI_BASE_URL` | `https://chatgpt.com/backend-api` | API base URL |
 | `OPENAB_AGENT_XAI_MODEL` | `grok-4.5` | xAI model to use (see [xAI credentials](#xai-credentials-supergrok--x-premium)) |
 | `OPENAB_AGENT_XAI_BASE_URL` | `https://api.x.ai/v1` | xAI API base URL. Must be an `https://` URL on an `x.ai` host — the OAuth bearer is never sent elsewhere. |
-| `OPENAB_AGENT_PROVIDER` | auto-detect | Force provider (`anthropic`, `openai`, `codex`, `xai`, `grok`) |
+| `OPENAB_AGENT_COMPAT_BASE_URL` | `http://127.0.0.1:11434/v1` | Base URL for `openai-compatible` / `ollama`; requests use `{base_url}/chat/completions`. |
+| `OPENAB_AGENT_COMPAT_API_KEY` | — | Optional Bearer API key for `openai-compatible` / `ollama`. Empty means no `Authorization` header is sent. |
+| `OPENAB_AGENT_PROVIDER` | auto-detect | Force provider (`anthropic`, `openai`, `codex`, `xai`, `grok`, `openai-compatible`, `ollama`) |
 | `OPENAB_AGENT_MAX_TOKENS` | `8192` | Max output tokens. Overrides `max_tokens` in config.json. |
 | `OPENAB_AGENT_OAUTH_CLIENT_ID` | Pi's client | Custom Codex OAuth client ID |
 | `OPENAB_AGENT_ANTHROPIC_CLIENT_ID` | Claude Code's client | Custom Anthropic OAuth client ID |

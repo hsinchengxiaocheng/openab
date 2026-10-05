@@ -267,10 +267,7 @@ impl<'a> CreationReservation<'a> {
     /// `CreationReservation::Drop` has run after a creator is
     /// cancelled at the eviction branch barrier.
     #[cfg(test)]
-    fn new_with_drop_notify(
-        pool: &'a SessionPool,
-        notify: Arc<tokio::sync::Notify>,
-    ) -> Self {
+    fn new_with_drop_notify(pool: &'a SessionPool, notify: Arc<tokio::sync::Notify>) -> Self {
         Self {
             pool,
             committed: false,
@@ -1099,9 +1096,7 @@ impl SessionPool {
     /// creator once they have asserted that no concurrent creator can
     /// reserve the same slot. Production code never calls this method.
     #[cfg(test)]
-    fn install_eviction_reservation_barrier_for_test(
-        &mut self,
-    ) -> Arc<tokio::sync::Notify> {
+    fn install_eviction_reservation_barrier_for_test(&mut self) -> Arc<tokio::sync::Notify> {
         let notify = Arc::new(tokio::sync::Notify::new());
         self.eviction_reservation_barrier = Some(Arc::clone(&notify));
         notify
@@ -1115,9 +1110,8 @@ impl SessionPool {
     /// contention boundary" signal in K/L/Q/R. Production code never
     /// calls this method.
     #[cfg(test)]
-    fn install_ensure_capacity_attempt_notify_for_test(
-        &mut self,
-    ) -> Arc<tokio::sync::Notify> {
+    #[allow(dead_code)]
+    fn install_ensure_capacity_attempt_notify_for_test(&mut self) -> Arc<tokio::sync::Notify> {
         let notify = Arc::new(tokio::sync::Notify::new());
         self.ensure_capacity_attempt_notify = Some(Arc::clone(&notify));
         notify
@@ -1130,9 +1124,7 @@ impl SessionPool {
     /// observe that the parked creator has its reservation in
     /// place. Production code never calls this method.
     #[cfg(test)]
-    fn install_eviction_reserved_notify_for_test(
-        &mut self,
-    ) -> Arc<tokio::sync::Notify> {
+    fn install_eviction_reserved_notify_for_test(&mut self) -> Arc<tokio::sync::Notify> {
         let notify = Arc::new(tokio::sync::Notify::new());
         self.eviction_reserved_notify = Some(Arc::clone(&notify));
         notify
@@ -1149,9 +1141,7 @@ impl SessionPool {
     /// `for _ in 0..16 { yield_now().await; }` heuristic. Production
     /// code never calls this method.
     #[cfg(test)]
-    fn install_reservation_drop_notify_for_test(
-        &mut self,
-    ) -> Arc<tokio::sync::Notify> {
+    fn install_reservation_drop_notify_for_test(&mut self) -> Arc<tokio::sync::Notify> {
         let notify = Arc::new(tokio::sync::Notify::new());
         self.reservation_drop_notify = Some(Arc::clone(&notify));
         notify
@@ -1175,9 +1165,7 @@ impl SessionPool {
     /// arrival" sequence structurally impossible to coalesce against
     /// a stale seed permit. Compiled out of release builds.
     #[cfg(test)]
-    fn install_creator_arrival_notify_for_test(
-        &mut self,
-    ) -> Arc<tokio::sync::Notify> {
+    fn install_creator_arrival_notify_for_test(&mut self) -> Arc<tokio::sync::Notify> {
         let notify = Arc::new(tokio::sync::Notify::new());
         self.creator_arrival_notify = Some(Arc::clone(&notify));
         notify
@@ -1189,9 +1177,7 @@ impl SessionPool {
     /// tests can await Drop. Otherwise returns the production
     /// constructor's output. Compiled out of release builds.
     #[cfg(test)]
-    fn create_reservation_for_test<'a>(
-        &'a self,
-    ) -> crate::acp::pool::CreationReservation<'a> {
+    fn create_reservation_for_test<'a>(&'a self) -> crate::acp::pool::CreationReservation<'a> {
         if let Some(n) = self.reservation_drop_notify.as_ref() {
             CreationReservation::new_with_drop_notify(self, Arc::clone(n))
         } else {
@@ -2398,7 +2384,9 @@ impl SessionPool {
         let mut conn_guard_lock = conn.lock().await;
         let activity = Arc::clone(&conn_guard_lock.activity);
         let _busy_guard = BusyGuard::arm(activity);
-        let _phase_guard = PhaseGuard { conn: Arc::clone(&conn) };
+        let _phase_guard = PhaseGuard {
+            conn: Arc::clone(&conn),
+        };
         let result = f(&mut conn_guard_lock).await;
         // Drop order matters:
         //   1. `_busy_guard` clears activity.in_flight (atomic, no lock).
@@ -2465,6 +2453,7 @@ impl SessionPool {
     }
 
     /// Resume one approval decision on the active ACP session for this thread.
+    #[allow(clippy::too_many_arguments)]
     pub async fn resume_approval(
         &self,
         thread_id: &str,
@@ -2846,8 +2835,7 @@ mod tests {
     use super::{
         better_candidate, classify_hung, classify_idle, entry_phase, format_native_dispatch_key,
         get_or_insert_gate, is_native_dispatch_key, phase_force_set, phase_load,
-        purge_session_entries, remove_if_same_handle, PoolState, SessionPool,
-        SessionPoolTestState,
+        purge_session_entries, remove_if_same_handle, PoolState, SessionPool, SessionPoolTestState,
     };
     use crate::acp::connection::SessionActivity;
     use crate::acp::project::ProjectContext;
@@ -5588,7 +5576,7 @@ done
     /// Helper: clear the entry's phase back to IDLE via the atomic.
     #[cfg(unix)]
     #[allow(dead_code)] // Reserved for future tests; the D/E/F tests
-    // exercise the clear path via the BusyGuard/PhaseGuard Drop impls.
+                        // exercise the clear path via the BusyGuard/PhaseGuard Drop impls.
     async fn mark_idle(pool: &SessionPool, key: &str) {
         let state = pool.state.read().await;
         let conn = state
@@ -5675,7 +5663,7 @@ done
             assert!(created, "key {key} must be a fresh spawn");
             // After spawn the connection is IDLE (no prompt has run).
             assert!(!pool.state.read().await.activity[&key].in_flight());
-        assert_phase(&pool, &key, entry_phase::IDLE, "post-spawn").await;
+            assert_phase(&pool, &key, entry_phase::IDLE, "post-spawn").await;
         }
         // The pool must never have grown past the ceiling.
         assert!(
@@ -5698,8 +5686,12 @@ done
         let temp = tempfile::tempdir().unwrap();
         let (pool, _wd) = pool_with_max_sessions(&temp, 2).await;
         // Fill to capacity with two distinct keys.
-        pool.get_or_create("busy-1", None).await.expect("spawn busy-1");
-        pool.get_or_create("busy-2", None).await.expect("spawn busy-2");
+        pool.get_or_create("busy-1", None)
+            .await
+            .expect("spawn busy-1");
+        pool.get_or_create("busy-2", None)
+            .await
+            .expect("spawn busy-2");
         // Mark both busy.
         mark_busy(&pool, "busy-1").await;
         mark_busy(&pool, "busy-2").await;
@@ -5737,13 +5729,19 @@ done
         let temp = tempfile::tempdir().unwrap();
         let (pool, _wd) = pool_with_max_sessions(&temp, 2).await;
         // Three distinct keys; cap is 2 → third spawn MUST evict.
-        pool.get_or_create("idle-A", None).await.expect("spawn idle-A");
+        pool.get_or_create("idle-A", None)
+            .await
+            .expect("spawn idle-A");
         // Touch idle-A, then add small wait so its last_active is older.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        pool.get_or_create("busy-X", None).await.expect("spawn busy-X");
+        pool.get_or_create("busy-X", None)
+            .await
+            .expect("spawn busy-X");
         mark_busy(&pool, "busy-X").await;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        pool.get_or_create("idle-B", None).await.expect("spawn idle-B");
+        pool.get_or_create("idle-B", None)
+            .await
+            .expect("spawn idle-B");
         // At this point `state.active.len() == 2`, idle-B was just
         // created and triggered eviction of the oldest IDLE entry
         // (which was idle-A). idle-B itself is now in the pool.
@@ -5769,7 +5767,9 @@ done
     async fn d_same_key_reuse_after_prompt_completion() {
         let temp = tempfile::tempdir().unwrap();
         let (pool, _wd) = pool_with_max_sessions(&temp, 4).await;
-        pool.get_or_create("reuse", None).await.expect("spawn reuse");
+        pool.get_or_create("reuse", None)
+            .await
+            .expect("spawn reuse");
         // First prompt: arm the BusyGuard via `with_connection`, then
         // return Ok. On Drop the guard must clear the busy flag.
         let first_prompt: anyhow::Result<()> = pool
@@ -5812,7 +5812,9 @@ done
     async fn e_prompt_error_clears_busy_via_raii() {
         let temp = tempfile::tempdir().unwrap();
         let (pool, _wd) = pool_with_max_sessions(&temp, 4).await;
-        pool.get_or_create("errkey", None).await.expect("spawn errkey");
+        pool.get_or_create("errkey", None)
+            .await
+            .expect("spawn errkey");
         let result: anyhow::Result<()> = pool
             .with_connection("errkey", |_conn| {
                 Box::pin(async move { Err(anyhow::anyhow!("synthetic prompt failure")) })
@@ -5846,7 +5848,9 @@ done
     async fn f_dropped_prompt_clears_busy() {
         let temp = tempfile::tempdir().unwrap();
         let (pool, _wd) = pool_with_max_sessions(&temp, 4).await;
-        pool.get_or_create("dropkey", None).await.expect("spawn dropkey");
+        pool.get_or_create("dropkey", None)
+            .await
+            .expect("spawn dropkey");
         // The closure is one that the test harness cancels by
         // dropping the future. We use tokio::time::timeout to race
         // the closure: the timeout fires first, the future is
@@ -5893,10 +5897,14 @@ done
         // the older `last_active` — under the old heuristic it would
         // be the eviction target. Under the new rule, the eviction
         // must skip it and evict the idle-new entry instead.
-        pool.get_or_create("busy-old", None).await.expect("spawn busy-old");
+        pool.get_or_create("busy-old", None)
+            .await
+            .expect("spawn busy-old");
         // Force an older last_active by sleeping.
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        pool.get_or_create("idle-new", None).await.expect("spawn idle-new");
+        pool.get_or_create("idle-new", None)
+            .await
+            .expect("spawn idle-new");
         mark_busy(&pool, "busy-old").await;
         // Third spawn at capacity must evict idle-new (the only IDLE
         // entry) — NOT busy-old.
@@ -5928,11 +5936,17 @@ done
     async fn h_oldest_idle_eviction_is_deterministic_and_skips_busy() {
         let temp = tempfile::tempdir().unwrap();
         let (pool, _wd) = pool_with_max_sessions(&temp, 3).await;
-        pool.get_or_create("first", None).await.expect("spawn first");
+        pool.get_or_create("first", None)
+            .await
+            .expect("spawn first");
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        pool.get_or_create("second", None).await.expect("spawn second");
+        pool.get_or_create("second", None)
+            .await
+            .expect("spawn second");
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        pool.get_or_create("third", None).await.expect("spawn third");
+        pool.get_or_create("third", None)
+            .await
+            .expect("spawn third");
         // Mark `second` busy so it is excluded from the candidate
         // scan. Now the only IDLE candidates are `first` and
         // `third`. `first` is older; `find_oldest_idle_eviction_
@@ -6141,8 +6155,7 @@ done
 
         // Step 2: arm hooks AFTER seed.
         let barrier = pool.install_eviction_reservation_barrier_for_test();
-        let creator_arrival =
-            pool.install_creator_arrival_notify_for_test();
+        let creator_arrival = pool.install_creator_arrival_notify_for_test();
         let reserved_notify = pool.install_eviction_reserved_notify_for_test();
         let pool = Arc::new(pool);
 
@@ -6179,8 +6192,14 @@ done
         barrier.notify_one();
         let res_b = b_task.await.expect("b join");
         let res_c = c_task.await.expect("c join");
-        let oks = [res_b.is_ok(), res_c.is_ok()].iter().filter(|r| **r).count();
-        let errs = [res_b.is_ok(), res_c.is_ok()].iter().filter(|r| !**r).count();
+        let oks = [res_b.is_ok(), res_c.is_ok()]
+            .iter()
+            .filter(|r| **r)
+            .count();
+        let errs = [res_b.is_ok(), res_c.is_ok()]
+            .iter()
+            .filter(|r| !**r)
+            .count();
         assert_eq!(oks, 1, "exactly one of B/C must succeed");
         assert_eq!(errs, 1, "the other must be rejected");
         let c_err = res_c.expect_err("loser must be Err");
@@ -6236,8 +6255,7 @@ done
 
         // Step 2: arm hooks AFTER seed.
         let barrier = pool.install_eviction_reservation_barrier_for_test();
-        let creator_arrival =
-            pool.install_creator_arrival_notify_for_test();
+        let creator_arrival = pool.install_creator_arrival_notify_for_test();
         let reserved_notify = pool.install_eviction_reserved_notify_for_test();
         let pool = Arc::new(pool);
 
@@ -6247,9 +6265,7 @@ done
         // Step 3: spawn only t1 (the "B" creator) first.
         let pool_a = Arc::clone(&pool);
         let k1c = k1.clone();
-        let t1 = tokio::spawn(async move {
-            pool_a.create_fresh_session_only(&k1c, None).await
-        });
+        let t1 = tokio::spawn(async move { pool_a.create_fresh_session_only(&k1c, None).await });
 
         // Step 4: consume t1's arrival permit.
         creator_arrival.notified().await;
@@ -6265,9 +6281,7 @@ done
         // Step 6: spawn t2 ONLY AFTER t1 is parked.
         let pool_b = Arc::clone(&pool);
         let k2c = k2.clone();
-        let t2 = tokio::spawn(async move {
-            pool_b.create_fresh_session_only(&k2c, None).await
-        });
+        let t2 = tokio::spawn(async move { pool_b.create_fresh_session_only(&k2c, None).await });
 
         // Step 7: consume t2's fresh arrival permit.
         creator_arrival.notified().await;
@@ -6363,9 +6377,7 @@ done
 
         // Task 2: get_or_create "B". Reaches eviction branch, parks.
         let pool_e = Arc::clone(&pool);
-        let evict_task = tokio::spawn(async move {
-            pool_e.get_or_create("B", None).await
-        });
+        let evict_task = tokio::spawn(async move { pool_e.get_or_create("B", None).await });
 
         // Wait deterministically for the reservation to land: the
         // reserved_notify fires AFTER fetch_add(1) and BEFORE the
@@ -6401,11 +6413,14 @@ done
 
         barrier.notify_one();
         let evict_res = evict_task.await.expect("evict join");
-        assert!(evict_res.is_ok(), "evictor must succeed (got {:?})", evict_res);
-        let reuse_res = reuse_task.await.expect("reuse join");
-        let reuse_err = reuse_res.expect_err(
-            "reuse must fail because A was evicted while reuse was queued",
+        assert!(
+            evict_res.is_ok(),
+            "evictor must succeed (got {:?})",
+            evict_res
         );
+        let reuse_res = reuse_task.await.expect("reuse join");
+        let reuse_err =
+            reuse_res.expect_err("reuse must fail because A was evicted while reuse was queued");
         assert!(
             reuse_err.to_string().contains("no connection")
                 || reuse_err.to_string().contains("evicted")
@@ -6492,9 +6507,7 @@ done
         // has CAS'd A2 to BUSY.
         busy_claimed_notify.notified().await;
         assert_eq!(
-            phase_load(
-                &pool2.state.read().await.active.get("A2").cloned().unwrap()
-            ),
+            phase_load(&pool2.state.read().await.active.get("A2").cloned().unwrap()),
             entry_phase::BUSY,
             "A2 must be BUSY before evictor runs"
         );
@@ -6504,8 +6517,7 @@ done
         // IDLE candidate, finds A2 is BUSY (skip), no other
         // candidates, returns Err("pool exhausted").
         let evict_attempt = pool2.get_or_create("C2", None).await;
-        let evict_err =
-            evict_attempt.expect_err("evictor must fail when only candidate is BUSY");
+        let evict_err = evict_attempt.expect_err("evictor must fail when only candidate is BUSY");
         assert!(
             evict_err.to_string().contains("pool exhausted"),
             "evictor must report pool exhausted: {evict_err}"
@@ -6617,8 +6629,14 @@ done
         );
         pool2.set_max_sessions_for_test(2);
         let pool2 = Arc::new(pool2);
-        pool2.get_or_create("good-1", None).await.expect("good-1 spawn");
-        pool2.get_or_create("good-2", None).await.expect("good-2 spawn");
+        pool2
+            .get_or_create("good-1", None)
+            .await
+            .expect("good-1 spawn");
+        pool2
+            .get_or_create("good-2", None)
+            .await
+            .expect("good-2 spawn");
         assert_eq!(active_len(&pool2).await, 2);
     }
 
@@ -6685,9 +6703,7 @@ done
         // will reach the eviction branch, evict A, fetch_add
         // outstanding_creations to 1, then park on the barrier.
         let pool_for_b = Arc::clone(&pool);
-        let b_task = tokio::spawn(async move {
-            pool_for_b.get_or_create("B", None).await
-        });
+        let b_task = tokio::spawn(async move { pool_for_b.get_or_create("B", None).await });
 
         // Wait deterministically for B's reservation to be acquired:
         // the reserved_notify fires AFTER fetch_add(1) and BEFORE
@@ -6708,10 +6724,7 @@ done
         // once.
         b_task.abort();
         let join_result = b_task.await;
-        assert!(
-            join_result.is_err(),
-            "aborted task should report JoinError"
-        );
+        assert!(join_result.is_err(), "aborted task should report JoinError");
 
         // Wait deterministically for the RAII guard's Drop to run.
         // The drop_notify fires from inside `Drop for
@@ -6805,16 +6818,13 @@ done
 
         // Step 2: arm hooks AFTER seed.
         let barrier = pool.install_eviction_reservation_barrier_for_test();
-        let creator_arrival =
-            pool.install_creator_arrival_notify_for_test();
+        let creator_arrival = pool.install_creator_arrival_notify_for_test();
         let reserved_notify = pool.install_eviction_reserved_notify_for_test();
         let pool = Arc::new(pool);
 
         // Step 3: spawn B alone.
         let pool_for_b = Arc::clone(&pool);
-        let b_task = tokio::spawn(async move {
-            pool_for_b.get_or_create("B", None).await
-        });
+        let b_task = tokio::spawn(async move { pool_for_b.get_or_create("B", None).await });
 
         // Step 4: consume B's arrival permit.
         creator_arrival.notified().await;
@@ -6829,9 +6839,7 @@ done
 
         // Step 6: spawn C only after B is parked.
         let pool_for_c = Arc::clone(&pool);
-        let c_task = tokio::spawn(async move {
-            pool_for_c.get_or_create("C", None).await
-        });
+        let c_task = tokio::spawn(async move { pool_for_c.get_or_create("C", None).await });
 
         // Step 7: consume C's fresh arrival permit. Unambiguously
         // C's because step 4 cleared B's. C is queued on the
@@ -6866,7 +6874,6 @@ done
         assert!(is_active(&pool, "B").await);
         assert!(!is_active(&pool, "A").await);
     }
-
 
     #[cfg(unix)]
     #[tokio::test]
@@ -6948,8 +6955,7 @@ done
 
         // Step 2: arm hooks AFTER seed.
         let barrier = pool.install_eviction_reservation_barrier_for_test();
-        let creator_arrival =
-            pool.install_creator_arrival_notify_for_test();
+        let creator_arrival = pool.install_creator_arrival_notify_for_test();
         let reserved_notify = pool.install_eviction_reserved_notify_for_test();
         let pool = Arc::new(pool);
 
@@ -6959,9 +6965,8 @@ done
         // Step 3: spawn only t1 (the "B" creator) first.
         let pool_for_1 = Arc::clone(&pool);
         let k1c = k1.clone();
-        let t1 = tokio::spawn(async move {
-            pool_for_1.create_fresh_session_only(&k1c, None).await
-        });
+        let t1 =
+            tokio::spawn(async move { pool_for_1.create_fresh_session_only(&k1c, None).await });
 
         // Step 4: consume t1's arrival permit.
         creator_arrival.notified().await;
@@ -6977,9 +6982,8 @@ done
         // Step 6: spawn t2 only after t1 is parked.
         let pool_for_2 = Arc::clone(&pool);
         let k2c = k2.clone();
-        let t2 = tokio::spawn(async move {
-            pool_for_2.create_fresh_session_only(&k2c, None).await
-        });
+        let t2 =
+            tokio::spawn(async move { pool_for_2.create_fresh_session_only(&k2c, None).await });
 
         // Step 7: consume t2's fresh arrival permit.
         creator_arrival.notified().await;

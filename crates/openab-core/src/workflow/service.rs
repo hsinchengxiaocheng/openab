@@ -162,6 +162,22 @@ pub struct WorkflowTurnHookInputs {
     /// completed and before this hook is invoked. No outbound callback is
     /// wired in this slice; the completion boundary now has the typed carrier.
     pub native_workflow: Option<crate::admission::NativeWorkflowMetadata>,
+    /// Phase 6.4.1F terminal-finalization durability: `true` iff one or
+    /// more Discord presentation / stream-finalization steps failed for
+    /// this turn. The native completion capture path (`invoke_workflow_hook_after_dispatch`)
+    /// MUST still run on `delivery_failed` so that a valid canonical
+    /// `<role_completion>` block already emitted by the agent is durably
+    /// captured into the native completion outbox and reconciled to AAP
+    /// Runtime, even when the user's Discord view is incomplete. Without
+    /// this flag the previous `Err(...)` short-circuit at the streaming
+    /// boundary lost the entire completion event and left the AAP
+    /// WorkflowRun stuck in the same `PRIMARY_ACTIVE` revision, which
+    /// the scheduler interpreted as "still running" and redispatched
+    /// the same work.
+    ///
+    /// `false` is the legacy default so the new field is invisible to
+    /// existing test doubles that build `WorkflowTurnHookInputs` directly.
+    pub delivery_failed: bool,
 }
 
 impl WorkflowService {
