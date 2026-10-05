@@ -606,7 +606,18 @@ pub struct AutonomousIngressRequest {
     /// never populates this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_workflow_id: Option<String>,
-    pub primary_agent: String,
+    /// Optional explicit canonical workflow topology.
+    ///
+    /// These three fields are a single authority tuple. When all are
+    /// omitted, AAP Runtime owns topology selection and applies its
+    /// canonical default. OpenAB must never promote the front-door
+    /// daemon identity (for example `Arthuraap`) into workflow authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verifier_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_reviewer_agent: Option<String>,
     /// Phase 6.4.4 / 6.4.5 — language is the AAP canonical ingress
     /// boundary's authority, NOT the OpenAB dispatcher. The OpenAB
     /// transport never reads the project-local
@@ -1177,12 +1188,52 @@ mod tests {
         AutonomousIngressConfig {
             aap_agents: agents.iter().map(|s| s.to_string()).collect(),
             primary_agent: None,
+            verifier_agent: None,
+            final_reviewer_agent: None,
             aap_runtime_url: "http://127.0.0.1:8000".into(),
             aap_credential_env: "TEST_TOKEN_ENV".into(),
             project_id: "arthur-ai-platform".into(),
             request_timeout_seconds: 5,
             aap_universal_humans: universal,
         }
+    }
+
+    #[test]
+    fn implicit_topology_omits_all_workflow_agent_fields_from_wire() {
+        let req = AutonomousIngressRequest {
+            protocol: "openab",
+            project_id: "arthur-ai-platform".into(),
+            transport: "DISCORD",
+            conversation_key: "discord:thread-1".into(),
+            original_human_prompt: "do the work".into(),
+            user_objective: "do the work".into(),
+            title: None,
+            trace_id: "trace-topology-default".into(),
+            task_id: None,
+            target_workflow_id: None,
+            primary_agent: None,
+            verifier_agent: None,
+            final_reviewer_agent: None,
+            language: None,
+            metadata: AutonomousIngressMetadata::default(),
+            delivery_destination: None,
+        };
+
+        let value = serde_json::to_value(&req).expect("serialize");
+        let obj = value.as_object().expect("object payload");
+
+        assert!(
+            !obj.contains_key("primary_agent"),
+            "implicit topology must omit primary_agent"
+        );
+        assert!(
+            !obj.contains_key("verifier_agent"),
+            "implicit topology must omit verifier_agent"
+        );
+        assert!(
+            !obj.contains_key("final_reviewer_agent"),
+            "implicit topology must omit final_reviewer_agent"
+        );
     }
 
     #[test]
@@ -1349,7 +1400,9 @@ mod tests {
             trace_id: "trace-1".into(),
             task_id: None,
             target_workflow_id: None,
-            primary_agent: "ArthurClaude".into(),
+            primary_agent: Some("ArthurClaude".into()),
+            verifier_agent: Some("ArthurCodex".into()),
+            final_reviewer_agent: Some("ArthurGemini".into()),
             language: None,
             metadata: AutonomousIngressMetadata::default(),
             delivery_destination: None,
@@ -1373,7 +1426,9 @@ mod tests {
             trace_id: "trace-1".into(),
             task_id: None,
             target_workflow_id: None,
-            primary_agent: "ArthurClaude".into(),
+            primary_agent: Some("ArthurClaude".into()),
+            verifier_agent: Some("ArthurCodex".into()),
+            final_reviewer_agent: Some("ArthurGemini".into()),
             language: None,
             metadata: AutonomousIngressMetadata::default(),
             delivery_destination: None,
@@ -1496,7 +1551,9 @@ mod tests {
             trace_id: "trace-1".into(),
             task_id: None,
             target_workflow_id: None,
-            primary_agent: "ArthurClaude".into(),
+            primary_agent: Some("ArthurClaude".into()),
+            verifier_agent: Some("ArthurCodex".into()),
+            final_reviewer_agent: Some("ArthurGemini".into()),
             language: None,
             metadata: AutonomousIngressMetadata::default(),
             delivery_destination: None,
@@ -1528,7 +1585,9 @@ mod tests {
             trace_id: "trace-1".into(),
             task_id: None,
             target_workflow_id: None,
-            primary_agent: "ArthurClaude".into(),
+            primary_agent: Some("ArthurClaude".into()),
+            verifier_agent: Some("ArthurCodex".into()),
+            final_reviewer_agent: Some("ArthurGemini".into()),
             language: None,
             metadata: AutonomousIngressMetadata::default(),
             delivery_destination: None,
@@ -1595,7 +1654,9 @@ mod tests {
             trace_id: "trace-1".into(),
             task_id: None,
             target_workflow_id: None,
-            primary_agent: "ArthurClaude".into(),
+            primary_agent: Some("ArthurClaude".into()),
+            verifier_agent: Some("ArthurCodex".into()),
+            final_reviewer_agent: Some("ArthurGemini".into()),
             language: None,
             metadata: AutonomousIngressMetadata::default(),
             delivery_destination: None,
@@ -1658,6 +1719,8 @@ mod tests {
         let cfg = AutonomousIngressConfig {
             aap_agents: vec!["ArthurClaude".into()],
             primary_agent: None,
+            verifier_agent: None,
+            final_reviewer_agent: None,
             aap_runtime_url: "http://127.0.0.1:8000".into(),
             // Use a credential env var name that is NOT set in the
             // test process. Production startup-time check is
@@ -1875,7 +1938,9 @@ mod tests {
             trace_id: "trace-1".into(),
             task_id: None,
             target_workflow_id: None,
-            primary_agent: "ArthurClaude".into(),
+            primary_agent: Some("ArthurClaude".into()),
+            verifier_agent: Some("ArthurCodex".into()),
+            final_reviewer_agent: Some("ArthurGemini".into()),
             language: None,
             metadata: AutonomousIngressMetadata::default(),
             delivery_destination: None,
@@ -1927,7 +1992,9 @@ mod tests {
             trace_id: "trace-1".into(),
             task_id: None,
             target_workflow_id: None,
-            primary_agent: "ArthurClaude".into(),
+            primary_agent: Some("ArthurClaude".into()),
+            verifier_agent: Some("ArthurCodex".into()),
+            final_reviewer_agent: Some("ArthurGemini".into()),
             language: None,
             metadata: AutonomousIngressMetadata::default(),
             delivery_destination: None,
@@ -2277,7 +2344,9 @@ mod phase8_continuation_identity_tests {
             trace_id: "trace-1".into(),
             task_id: None,
             target_workflow_id: Some("wfr629e138f1defa7e9".into()),
-            primary_agent: "ArthurClaude".into(),
+            primary_agent: Some("ArthurClaude".into()),
+            verifier_agent: Some("ArthurCodex".into()),
+            final_reviewer_agent: Some("ArthurGemini".into()),
             language: None,
             metadata: AutonomousIngressMetadata::default(),
             delivery_destination: None,
@@ -2306,7 +2375,9 @@ mod phase8_continuation_identity_tests {
             trace_id: "trace-1".into(),
             task_id: None,
             target_workflow_id: None,
-            primary_agent: "ArthurClaude".into(),
+            primary_agent: Some("ArthurClaude".into()),
+            verifier_agent: Some("ArthurCodex".into()),
+            final_reviewer_agent: Some("ArthurGemini".into()),
             language: None,
             metadata: AutonomousIngressMetadata::default(),
             delivery_destination: None,

@@ -1658,10 +1658,16 @@ async fn dispatch_batch(
                     trace_id: session_key.to_string(),
                     task_id: None,
                     target_workflow_id,
-                    primary_agent: aap_cfg
-                        .and_then(|cfg| cfg.primary_agent.as_deref())
-                        .unwrap_or_else(|| agent_name.unwrap_or(""))
-                        .to_string(),
+                    // Workflow topology authority belongs to AAP Runtime.
+                    // `agent_name` is front-door routing identity only and
+                    // must never be promoted into workflow PRIMARY authority.
+                    //
+                    // All three omitted => AAP canonical default topology.
+                    // All three configured => explicit run-scoped topology.
+                    primary_agent: aap_cfg.and_then(|cfg| cfg.primary_agent.clone()),
+                    verifier_agent: aap_cfg.and_then(|cfg| cfg.verifier_agent.clone()),
+                    final_reviewer_agent: aap_cfg
+                        .and_then(|cfg| cfg.final_reviewer_agent.clone()),
                     language,
                     metadata: crate::autonomous_ingress::AutonomousIngressMetadata {
                         discord_message_id: Some(trigger_msg.message_id.clone()),
@@ -4815,6 +4821,8 @@ mod tests {
         crate::config::AutonomousIngressConfig {
             aap_agents: agents.iter().map(|s| s.to_string()).collect(),
             primary_agent: None,
+            verifier_agent: None,
+            final_reviewer_agent: None,
             aap_runtime_url: "http://127.0.0.1:8000".into(),
             aap_credential_env: "TEST_TOKEN_ENV".into(),
             project_id: "arthur-ai-platform".into(),
@@ -5744,10 +5752,15 @@ mod tests {
     #[tokio::test]
     async fn phase64_human_autonomous_request_routes_to_aap_before_acp() {
         // Spec scenario 1: a Tech-Lead-authorized human message arrives,
-        // no workflow_assignment.json exists, the daemon is declared
-        // AAP-autonomous. AAP MUST be consulted and ordinary ACP MUST
-        // NOT receive the dispatch.
-        std::env::set_var("ARTHUR_AGENT_NAME", "ArthurClaude");
+        // no workflow_assignment.json exists, the front-door daemon is
+        // declared AAP-autonomous. AAP MUST be consulted and ordinary ACP
+        // MUST NOT receive the dispatch.
+        //
+        // Regression: the admitted front-door identity (`Arthuraap`) must
+        // never be promoted into workflow PRIMARY authority. With implicit
+        // topology, all three workflow agent fields remain None so AAP
+        // Runtime selects the canonical topology.
+        std::env::set_var("ARTHUR_AGENT_NAME", "Arthuraap");
         let tech_lead_id: u64 = 645496545805991947;
         let mut tech_lead_ids = std::collections::HashSet::new();
         tech_lead_ids.insert(tech_lead_id);
@@ -5761,8 +5774,8 @@ mod tests {
         let calls = run_phase64(
             msg,
             client,
-            phase64_config(&["ArthurClaude"], false),
-            "ArthurClaude",
+            phase64_config(&["Arthuraap"], false),
+            "Arthuraap",
             tech_lead_ids,
         )
         .await;
@@ -5774,6 +5787,21 @@ mod tests {
             fake.call_count(),
             1,
             "AAP client must be invoked exactly once"
+        );
+
+        let recorded = &fake.calls.lock().unwrap()[0];
+
+        assert_eq!(
+            recorded.primary_agent, None,
+            "front-door Arthuraap must not become workflow PRIMARY"
+        );
+        assert_eq!(
+            recorded.verifier_agent, None,
+            "implicit topology must leave VERIFIER authority to AAP Runtime"
+        );
+        assert_eq!(
+            recorded.final_reviewer_agent, None,
+            "implicit topology must leave FINAL_REVIEWER authority to AAP Runtime"
         );
     }
 
@@ -6394,7 +6422,9 @@ mod tests {
             trace_id: "trace-stale".into(),
             task_id: None,
             target_workflow_id: None,
-            primary_agent: "ArthurClaude".into(),
+            primary_agent: Some("ArthurClaude".into()),
+            verifier_agent: Some("ArthurCodex".into()),
+            final_reviewer_agent: Some("ArthurGemini".into()),
             language: None,
             metadata: crate::autonomous_ingress::AutonomousIngressMetadata::default(),
             delivery_destination: None,
@@ -6435,7 +6465,9 @@ mod tests {
             trace_id: "trace-no-asgn".into(),
             task_id: None,
             target_workflow_id: None,
-            primary_agent: "ArthurClaude".into(),
+            primary_agent: Some("ArthurClaude".into()),
+            verifier_agent: Some("ArthurCodex".into()),
+            final_reviewer_agent: Some("ArthurGemini".into()),
             language: None,
             metadata: crate::autonomous_ingress::AutonomousIngressMetadata::default(),
             delivery_destination: None,
@@ -6518,7 +6550,9 @@ mod tests {
             trace_id: "trace-legacy".into(),
             task_id: None,
             target_workflow_id: None,
-            primary_agent: "ArthurClaude".into(),
+            primary_agent: Some("ArthurClaude".into()),
+            verifier_agent: Some("ArthurCodex".into()),
+            final_reviewer_agent: Some("ArthurGemini".into()),
             language: Some("en".into()),
             metadata: crate::autonomous_ingress::AutonomousIngressMetadata::default(),
             delivery_destination: None,
@@ -6905,7 +6939,9 @@ mod tests {
             trace_id: "trace-stale-46".into(),
             task_id: None,
             target_workflow_id: None,
-            primary_agent: "ArthurClaude".into(),
+            primary_agent: Some("ArthurClaude".into()),
+            verifier_agent: Some("ArthurCodex".into()),
+            final_reviewer_agent: Some("ArthurGemini".into()),
             language: None,
             metadata: crate::autonomous_ingress::AutonomousIngressMetadata::default(),
             delivery_destination: None,
