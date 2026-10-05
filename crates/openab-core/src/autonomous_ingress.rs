@@ -162,6 +162,14 @@ pub fn extract_canonical_workflow_target(prompt: &str) -> Option<String> {
 pub enum CanonicalWorkflowActionAuthority {
     Absent,
     ReopenWork,
+    /// Phase 8.x — bounded-defect correction action.
+    ///
+    /// Authorizes flipping a `VERIFIER_ACTIVE` WorkflowRun with
+    /// `defect_loop_count == 1` back to `PRIMARY_ACTIVE` via
+    /// `POST /v1/workflows/{workflow_run_id}/intervention/reopen-primary`.
+    /// The mutation authority is the same Tech Lead identity gate as
+    /// `ReopenWork`; only the bounded mutation target is different.
+    ReopenPrimary,
     Invalid,
 }
 
@@ -172,7 +180,11 @@ pub enum CanonicalWorkflowActionAuthority {
 /// * `Absent` — no exact authoritative `Canonical action:` header was
 ///   present in the leading canonical-header block. Existing ordinary
 ///   continuation / ingress behavior may proceed.
-/// * `ReopenWork` — exact bounded mutation authority.
+/// * `ReopenWork` — exact bounded mutation authority for terminal-work
+///   reopen (`TECH_LEAD_WAIT -> fresh successor workflow lifecycle`).
+/// * `ReopenPrimary` — exact bounded mutation authority for
+///   bounded-defect correction
+///   (`VERIFIER_ACTIVE + defect_loop_count == 1 -> PRIMARY_ACTIVE`).
 /// * `Invalid` — an exact authoritative `Canonical action:` header was
 ///   present, but its value was empty or unsupported. The dispatcher
 ///   MUST consume the turn fail-closed and MUST NOT reinterpret it as
@@ -190,9 +202,7 @@ pub enum CanonicalWorkflowActionAuthority {
 /// * an exact `Canonical action:` appearing after ordinary prose is `Invalid`,
 ///   not `Absent`, so mutation-shaped input cannot fall through to ordinary
 ///   autonomous ingress or ACP.
-pub fn classify_canonical_workflow_action(
-    prompt: &str,
-) -> CanonicalWorkflowActionAuthority {
+pub fn classify_canonical_workflow_action(prompt: &str) -> CanonicalWorkflowActionAuthority {
     let mut leading_canonical_block = true;
     let mut action: Option<CanonicalWorkflowActionAuthority> = None;
 
@@ -216,10 +226,10 @@ pub fn classify_canonical_workflow_action(
                 return CanonicalWorkflowActionAuthority::Invalid;
             }
 
-            action = Some(if rest.trim() == "reopen-work" {
-                CanonicalWorkflowActionAuthority::ReopenWork
-            } else {
-                CanonicalWorkflowActionAuthority::Invalid
+            action = Some(match rest.trim() {
+                "reopen-work" => CanonicalWorkflowActionAuthority::ReopenWork,
+                "reopen-primary" => CanonicalWorkflowActionAuthority::ReopenPrimary,
+                _ => CanonicalWorkflowActionAuthority::Invalid,
             });
 
             continue;
@@ -248,7 +258,9 @@ pub fn classify_canonical_workflow_action(
 ///
 /// * Only the exact, case-sensitive `Canonical action:` token is
 ///   recognized.
-/// * The only currently authorized action is `reopen-work`.
+/// * The currently authorized actions are `reopen-work` and
+///   `reopen-primary`. Both delegate to existing AAP Runtime mutation
+///   capabilities; adding a new action is a bounded source change.
 /// * Leading blank lines are ignored.
 /// * `Canonical title:` and `Canonical workflow:` may precede the
 ///   action header.
@@ -266,7 +278,7 @@ pub fn extract_canonical_workflow_action(prompt: &str) -> Option<String> {
         if let Some(rest) = line.strip_prefix(CANONICAL_ACTION_HEADER) {
             let trimmed = rest.trim();
 
-            if trimmed == "reopen-work" {
+            if trimmed == "reopen-work" || trimmed == "reopen-primary" {
                 return Some(trimmed.to_string());
             }
 
@@ -362,9 +374,9 @@ pub fn assemble_user_objective(
 /// 3. Otherwise (bot sender, multiple attachments, non-``message.txt``
 ///    filename, empty body, etc.)
 ///    → no attachment promotion;
-///      ``resolve_current_human_prompt_authority`` returns ``""`` and
-///      the existing ``HTTP 422`` fail-closed surface remains intact
-///      at AAP.
+///    ``resolve_current_human_prompt_authority`` returns ``""`` and
+///    the existing ``HTTP 422`` fail-closed surface remains intact
+///    at AAP.
 ///
 /// Important semantic statement
 /// ─────────────────────────────
@@ -1538,6 +1550,36 @@ mod tests {
     }
 
     #[test]
+    fn autonomous_ingress_request_omits_empty_primary_agent() {
+        let req = AutonomousIngressRequest {
+            protocol: "openab",
+            project_id: "arthur-ai-platform".into(),
+            transport: "DISCORD",
+            conversation_key: "discord:c:1".into(),
+            original_human_prompt: "do the work".into(),
+            user_objective: "do the work".into(),
+            title: None,
+            trace_id: "trace-primary-absent".into(),
+            task_id: None,
+            target_workflow_id: None,
+            primary_agent: None,
+            verifier_agent: None,
+            final_reviewer_agent: None,
+            language: None,
+            metadata: AutonomousIngressMetadata::default(),
+            delivery_destination: None,
+        };
+
+        let value: serde_json::Value =
+            serde_json::to_value(&req).expect("serialize autonomous ingress request");
+
+        assert!(
+            value.get("primary_agent").is_none(),
+            "empty primary_agent must be absent from the wire so AAP Runtime owns default topology: {value}",
+        );
+    }
+
+    #[test]
     fn autonomous_ingress_request_serializes_title_when_some() {
         let req = AutonomousIngressRequest {
             protocol: "openab",
@@ -2519,6 +2561,188 @@ mod phase8_workflow_reopen_action_tests {
             );
         }
     }
+}
 
+#[cfg(test)]
+mod phase8_reopen_primary_action_tests {
+    use super::*;
 
+    // ---- Test 1: exact reopen-primary parsing ----
+
+    #[test]
+    fn exact_reopen_primary_action_is_authoritative() {
+        let prompt = "Canonical workflow: wfr938bda206fa7d21d\n\
+             Canonical action: reopen-primary\n\n\
+             Apply the bounded-defect correction.";
+
+        assert_eq!(
+            classify_canonical_workflow_action(prompt),
+            CanonicalWorkflowActionAuthority::ReopenPrimary,
+        );
+        assert_eq!(
+            extract_canonical_workflow_action(prompt).as_deref(),
+            Some("reopen-primary"),
+        );
+    }
+
+    #[test]
+    fn canonical_title_may_precede_reopen_primary_headers() {
+        let prompt = "Canonical title: Bounded-defect correction\n\
+             Canonical workflow: wfr938bda206fa7d21d\n\
+             Canonical action: reopen-primary\n\n\
+             Continue.";
+
+        assert_eq!(
+            extract_canonical_workflow_target(prompt).as_deref(),
+            Some("wfr938bda206fa7d21d"),
+        );
+        assert_eq!(
+            classify_canonical_workflow_action(prompt),
+            CanonicalWorkflowActionAuthority::ReopenPrimary,
+        );
+    }
+
+    // ---- Test 2: case normalization (rejected) ----
+
+    #[test]
+    fn case_variant_reopen_primary_is_not_canonical() {
+        for prompt in [
+            "Canonical workflow: wfr938bda206fa7d21d\ncanonical action: reopen-primary",
+            "Canonical workflow: wfr938bda206fa7d21d\nCanonical Action: reopen-primary",
+            "Canonical workflow: wfr938bda206fa7d21d\nCanonical ACTION: reopen-primary",
+        ] {
+            // Legacy extractor returns None so mutation-shaped input does
+            // not acquire authority.
+            assert_eq!(
+                extract_canonical_workflow_action(prompt),
+                None,
+                "case variants must never acquire authority: {prompt:?}",
+            );
+            // Typed classifier sees no exact canonical header — returns
+            // Absent (ordinary ingress remains available, but no
+            // mutation occurs).
+            assert_eq!(
+                classify_canonical_workflow_action(prompt),
+                CanonicalWorkflowActionAuthority::Absent,
+            );
+        }
+    }
+
+    // ---- Test 3: duplicate/ambiguous canonical actions fail closed ----
+
+    #[test]
+    fn duplicate_reopen_primary_action_headers_are_invalid() {
+        for prompt in [
+            "Canonical workflow: wfr938bda206fa7d21d\nCanonical action: reopen-primary\nCanonical action: reopen-primary",
+            "Canonical action: reopen-primary\nCanonical workflow: wfr938bda206fa7d21d\nCanonical action: reopen-primary",
+            "Canonical action: reopen-primary\nPlease continue.\nCanonical action: reopen-primary",
+        ] {
+            assert_eq!(
+                classify_canonical_workflow_action(prompt),
+                CanonicalWorkflowActionAuthority::Invalid,
+                "duplicate exact reopen-primary action must fail closed: {prompt:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn reopen_work_then_reopen_primary_is_ambiguous_invalid() {
+        let prompt = "Canonical workflow: wfr938bda206fa7d21d\n\
+             Canonical action: reopen-work\n\
+             Canonical action: reopen-primary";
+
+        assert_eq!(
+            classify_canonical_workflow_action(prompt),
+            CanonicalWorkflowActionAuthority::Invalid,
+            "any two canonical actions, even if different, must fail closed",
+        );
+    }
+
+    #[test]
+    fn late_exact_reopen_primary_is_invalid_fail_closed() {
+        let prompt = "Canonical workflow: wfr938bda206fa7d21d\n\
+             Please continue.\n\
+             Canonical action: reopen-primary";
+
+        // Legacy extractor grants no mutation authority outside the
+        // leading canonical-header block.
+        assert_eq!(extract_canonical_workflow_action(prompt), None);
+
+        // Typed classifier must consume exact mutation-shaped input
+        // appearing after prose — it must never fall through as
+        // ordinary autonomous ingress or ACP.
+        assert_eq!(
+            classify_canonical_workflow_action(prompt),
+            CanonicalWorkflowActionAuthority::Invalid,
+        );
+    }
+
+    // ---- Test 4: malformed action values are not ReopenPrimary ----
+
+    #[test]
+    fn malformed_reopen_primary_values_are_invalid() {
+        for prompt in [
+            "Canonical workflow: wfr938bda206fa7d21d\nCanonical action: reopen primary", // space
+            "Canonical workflow: wfr938bda206fa7d21d\nCanonical action: reopenprimary",  // no dash
+            "Canonical workflow: wfr938bda206fa7d21d\nCanonical action: Reopen-Primary", // mixed case
+            "Canonical workflow: wfr938bda206fa7d21d\nCanonical action:",                // empty
+            "Canonical workflow: wfr938bda206fa7d21d\nCanonical action: primary", // too short
+        ] {
+            assert_eq!(
+                classify_canonical_workflow_action(prompt),
+                CanonicalWorkflowActionAuthority::Invalid,
+                "malformed action must not become ReopenPrimary: {prompt:?}",
+            );
+            assert_eq!(extract_canonical_workflow_action(prompt), None,);
+        }
+    }
+
+    // ---- Natural-language prevention ----
+
+    #[test]
+    fn natural_language_reopen_primary_has_no_mutation_authority() {
+        for prompt in [
+            "Canonical workflow: wfr938bda206fa7d21d\n\nReopen the primary workflow",
+            "Canonical workflow: wfr938bda206fa7d21d\n\nPlease reopen primary",
+            "Canonical workflow: wfr938bda206fa7d21d\n\n請重新打開 primary",
+            "Canonical workflow: wfr938bda206fa7d21d\n\nreopen-primary please",
+            "Canonical workflow: wfr938bda206fa7d21d\n\nresume",
+        ] {
+            // No exact canonical action header → extractor returns None,
+            // classifier returns Absent. Ordinary ingress path remains
+            // available; no mutation occurs.
+            assert_eq!(
+                extract_canonical_workflow_action(prompt),
+                None,
+                "natural-language text must not acquire reopen-primary authority: {prompt:?}",
+            );
+            assert_eq!(
+                classify_canonical_workflow_action(prompt),
+                CanonicalWorkflowActionAuthority::Absent,
+            );
+        }
+    }
+
+    #[test]
+    fn reopen_work_and_reopen_primary_are_independent_actions() {
+        // A pure reopen-work message MUST still classify as ReopenWork
+        // — backwards-compatible with the existing Phase 8.x surface.
+        let reopen_work_prompt = "Canonical workflow: wfr938bda206fa7d21d\n\
+             Canonical action: reopen-work";
+
+        assert_eq!(
+            classify_canonical_workflow_action(reopen_work_prompt),
+            CanonicalWorkflowActionAuthority::ReopenWork,
+            "reopen-work classification must remain authoritative",
+        );
+
+        // A pure reopen-primary message MUST classify as ReopenPrimary.
+        let reopen_primary_prompt = "Canonical workflow: wfr938bda206fa7d21d\n\
+             Canonical action: reopen-primary";
+
+        assert_eq!(
+            classify_canonical_workflow_action(reopen_primary_prompt),
+            CanonicalWorkflowActionAuthority::ReopenPrimary,
+        );
+    }
 }

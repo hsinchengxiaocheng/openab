@@ -253,6 +253,16 @@ impl AcpServer {
                         Err(e) => return self.error_response(id, -32000, &e),
                     }
                 }
+                "openai-compatible" | "ollama" => {
+                    let res = match model_override {
+                        Some(m) => crate::llm::OpenAiCompatibleProvider::from_env_with_model(m),
+                        None => crate::llm::OpenAiCompatibleProvider::from_env(),
+                    };
+                    match res {
+                        Ok(p) => (Box::new(p), "openai-compatible"),
+                        Err(e) => return self.error_response(id, -32000, &e),
+                    }
+                }
                 _ => {
                     // Auto-detect: Anthropic (API key or OAuth) first, then codex.
                     let anthropic_res = match model_override {
@@ -542,6 +552,10 @@ impl AcpServer {
                 "anthropic" => AnthropicProvider::auto_with_model(value).map(|p| Box::new(p) as _),
                 "xai" => crate::llm::XaiProvider::from_auth_store_with_model(value)
                     .map(|p| Box::new(p) as _),
+                "openai-compatible" | "ollama" => {
+                    crate::llm::OpenAiCompatibleProvider::from_env_with_model(value)
+                        .map(|p| Box::new(p) as _)
+                }
                 _ => crate::llm::OpenAiProvider::from_auth_store_with_model(value)
                     .map(|p| Box::new(p) as _),
             };
@@ -769,6 +783,28 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("no model configured"));
+    }
+
+    #[tokio::test]
+    async fn session_new_ollama_uses_generic_provider_without_oauth() {
+        let home = tempfile::tempdir().unwrap();
+        temp_env::async_with_vars(
+            [
+                ("HOME", Some(home.path().to_str().unwrap())),
+                ("OPENAB_AGENT_PROVIDER", Some("ollama")),
+                ("OPENAB_AGENT_MODEL", Some("qwen3.8:27b-q4_K_M")),
+                ("OPENAB_AGENT_COMPAT_API_KEY", None),
+            ],
+            async {
+                let mut server = AcpServer::new();
+                let response: Value =
+                    serde_json::from_str(&server.handle_session_new(8).await).unwrap();
+                assert!(response["error"].is_null(), "{response}");
+                assert_eq!(server.active_provider.as_deref(), Some("openai-compatible"));
+                assert_eq!(server.active_model.as_deref(), Some("qwen3.8:27b-q4_K_M"));
+            },
+        )
+        .await;
     }
 
     #[test]

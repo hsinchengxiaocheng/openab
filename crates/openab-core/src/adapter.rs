@@ -643,11 +643,8 @@ pub struct PendingApprovalRecord {
 /// streaming edits, and controlling reactions. Platform-independent.
 pub struct AdapterRouter {
     pool: Arc<SessionPool>,
-    pending_approvals: Arc<
-        tokio::sync::Mutex<
-            std::collections::HashMap<String, PendingApprovalRecord>
-        >
-    >,
+    pending_approvals:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, PendingApprovalRecord>>>,
     reactions_config: ReactionsConfig,
     table_mode: TableMode,
     prompt_hard_timeout: std::time::Duration,
@@ -696,8 +693,7 @@ pub struct AdapterRouter {
     ///
     /// This is deliberately separate from autonomous ingress because
     /// reopen is a bounded mutation authority, not ordinary workflow ingress.
-    workflow_reopen_client:
-        Option<Arc<dyn crate::workflow_reopen::WorkflowReopenClient>>,
+    workflow_reopen_client: Option<Arc<dyn crate::workflow_reopen::WorkflowReopenClient>>,
     /// Optional durable final-response authority.  It is deliberately absent
     /// for legacy ACP-only deployments.
     terminal_delivery_worker: Option<Arc<dyn TerminalDeliveryPort>>,
@@ -724,9 +720,7 @@ impl AdapterRouter {
         }
         Self {
             pool,
-            pending_approvals: Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            pending_approvals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             reactions_config,
             table_mode,
             prompt_hard_timeout: std::time::Duration::from_secs(prompt_hard_timeout_secs),
@@ -929,22 +923,14 @@ impl AdapterRouter {
         &self.pool
     }
 
-
-    pub async fn capture_pending_approval(
-        &self,
-        session_key: &str,
-        record: PendingApprovalRecord,
-    ) {
+    pub async fn capture_pending_approval(&self, session_key: &str, record: PendingApprovalRecord) {
         self.pending_approvals
             .lock()
             .await
             .insert(session_key.to_string(), record);
     }
 
-    pub async fn pending_approval(
-        &self,
-        session_key: &str,
-    ) -> Option<PendingApprovalRecord> {
+    pub async fn pending_approval(&self, session_key: &str) -> Option<PendingApprovalRecord> {
         self.pending_approvals
             .lock()
             .await
@@ -952,16 +938,9 @@ impl AdapterRouter {
             .cloned()
     }
 
-    pub async fn clear_pending_approval(
-        &self,
-        session_key: &str,
-    ) -> Option<PendingApprovalRecord> {
-        self.pending_approvals
-            .lock()
-            .await
-            .remove(session_key)
+    pub async fn clear_pending_approval(&self, session_key: &str) -> Option<PendingApprovalRecord> {
+        self.pending_approvals.lock().await.remove(session_key)
     }
-
 
     pub async fn resume_pending_approval(
         &self,
@@ -1121,15 +1100,29 @@ impl AdapterRouter {
             .await;
 
         if !assistant_status {
-            match &result {
-                Ok(((), _)) => reactions.set_done().await,
-                Err(_) => reactions.set_error().await,
+            // Phase 6.4.1F — terminal-finalization durability. The
+            // reaction decision now reads `hook.delivery_failed`
+            // rather than `result.is_err()`. The legacy `Err` was
+            // emitted by the streaming boundary on any Discord
+            // presentation failure; with the fix the boundary returns
+            // `Ok(((), Some(hook)))` carrying `delivery_failed = true`
+            // so a delivery failure still flips the reaction to ❌
+            // without erasing a previously captured completion.
+            let reaction_failed = match &result {
+                Ok(((), Some(hook))) => hook.delivery_failed,
+                Err(_) => true,
+                _ => false,
+            };
+            if reaction_failed {
+                reactions.set_error().await;
+            } else {
+                reactions.set_done().await;
             }
 
-            let hold_ms = if result.is_ok() {
-                self.reactions_config.timing.done_hold_ms
-            } else {
+            let hold_ms = if reaction_failed {
                 self.reactions_config.timing.error_hold_ms
+            } else {
+                self.reactions_config.timing.done_hold_ms
             };
             if self.reactions_config.remove_after_reply {
                 let reactions = reactions;
@@ -1149,6 +1142,25 @@ impl AdapterRouter {
             let _ = adapter
                 .send_message(&thread_channel, &format!("⚠️ {e}"))
                 .await;
+        } else if let Ok(((), Some(hook))) = &result {
+            // Phase 6.4.1F — terminal-finalization durability. When
+            // the closure surfaces a terminal turn with
+            // `delivery_failed = true` (Discord presentation failed
+            // partway through) we still want the user to see the
+            // legacy delivery-failure message — the existing
+            // `Err(...)` short-circuit is gone, so emit the message
+            // here. The hook's `delivery_failed` flag is the
+            // durable signal the WorkflowRun advance relies on; this
+            // message is purely a UX hint and does not touch the
+            // completion capture.
+            if hook.delivery_failed {
+                let _ = adapter
+                    .send_message(
+                        &thread_channel,
+                        "⚠️ streaming finalization had delivery failures; user view is incomplete",
+                    )
+                    .await;
+            }
         }
 
         // handle_message: workflow hook integration is owned by
@@ -1660,6 +1672,17 @@ impl AdapterRouter {
                             channel: channel.clone(),
                             agent_identity,
                             native_workflow: None,
+                            // The dedicated durable terminal delivery worker
+                            // path is independent of the streaming
+                            // presentation pipeline; its success/failure
+                            // does not propagate into the legacy
+                            // `delivery_failed` flag. Set false to make the
+                            // hook semantics uniform with the post-edit
+                            // path: WorkflowRun advances regardless of
+                            // streaming-finalization status because the
+                            // completion capture / reconciliation flow does
+                            // not depend on it.
+                            delivery_failed: false,
                         })));
                     }
                     // Stop the cosmetic edit loop before the finalize write path
@@ -1962,23 +1985,55 @@ impl AdapterRouter {
                     // closure can still surface `Err` from the
                     // streaming pipeline without constructing a
                     // half-built hook-input record.
-                    let hook_inputs = crate::workflow::service::WorkflowTurnHookInputs {
-                        terminal: is_terminal_stop_reason(&turn_result),
-                        stop_reason: turn_result.stop_reason.clone(),
-                        raw_assistant_text: text_buf.clone(),
-                        pinned_project_root: pinned_root.clone(),
-                        session_key: session_key.clone(),
-                        channel: channel.clone(),
-                        agent_identity,
-                        native_workflow: None,
+                    //
+                    // Phase 6.4.1F — terminal-finalization durability.
+                    // The hook is returned on EVERY terminal turn, even
+                    // when `delivery_failed` is true. The pre-fix code
+                    // surfaced an `Err(...)` here so a Discord
+                    // presentation / stream-finalization failure
+                    // short-circuited `dispatch.rs::invoke_workflow_hook_after_dispatch`,
+                    // which never fired, leaving the agent's valid
+                    // `<role_completion>` block in the durable native
+                    // completion outbox unfilled. AAP Runtime kept the
+                    // WorkflowRun in the same `PRIMARY_ACTIVE` revision
+                    // and the scheduler redispatched the same work
+                    // forever. We now always surface the hook with the
+                    // `delivery_failed` flag set so the workflow hook
+                    // can still capture the completion; the dispatch
+                    // layer decides whether to send the user-facing
+                    // error / set the error reaction, but the WorkflowRun
+                    // advances exactly once because the completion is
+                    // durably captured.
+                    let hook_terminal = is_terminal_stop_reason(&turn_result);
+                    let hook_inputs = if hook_terminal {
+                        Some(crate::workflow::service::WorkflowTurnHookInputs {
+                            terminal: true,
+                            stop_reason: turn_result.stop_reason.clone(),
+                            raw_assistant_text: text_buf.clone(),
+                            pinned_project_root: pinned_root.clone(),
+                            session_key: session_key.clone(),
+                            channel: channel.clone(),
+                            agent_identity,
+                            native_workflow: None,
+                            delivery_failed,
+                        })
+                    } else {
+                        None
                     };
 
-                    if delivery_failed {
+                    if hook_terminal {
+                        Ok(((), hook_inputs))
+                    } else if delivery_failed {
+                        // Non-terminal turns cannot produce a workflow
+                        // hook, so a delivery failure here is the
+                        // legacy `Err` path (e.g. a partial
+                        // streaming reply that was abandoned before
+                        // reaching `end_turn`).
                         Err(anyhow::anyhow!(
                             "streaming finalization had delivery failures; user view is incomplete"
                         ))
                     } else {
-                        Ok(((), Some(hook_inputs)))
+                        Ok(((), None))
                     }
                 })
             })
@@ -1994,11 +2049,7 @@ fn pending_approval_from_result(
 ) -> Option<PendingApprovalRecord> {
     let metadata = result.get("metadata")?.as_object()?;
 
-    if metadata
-        .get("status")
-        .and_then(serde_json::Value::as_str)
-        != Some("confirmation_required")
-    {
+    if metadata.get("status").and_then(serde_json::Value::as_str) != Some("confirmation_required") {
         return None;
     }
 
@@ -2010,22 +2061,11 @@ fn pending_approval_from_result(
         return None;
     }
 
-    let approval_id = metadata
-        .get("approval_id")?
-        .as_str()?
-        .trim();
-    let conversation_id = metadata
-        .get("conversation_id")?
-        .as_str()?
-        .trim();
-    let expected_revision = metadata
-        .get("expected_revision")?
-        .as_u64()?;
+    let approval_id = metadata.get("approval_id")?.as_str()?.trim();
+    let conversation_id = metadata.get("conversation_id")?.as_str()?.trim();
+    let expected_revision = metadata.get("expected_revision")?.as_u64()?;
 
-    if approval_id.is_empty()
-        || conversation_id.is_empty()
-        || session_id.trim().is_empty()
-    {
+    if approval_id.is_empty() || conversation_id.is_empty() || session_id.trim().is_empty() {
         return None;
     }
 
@@ -3390,7 +3430,7 @@ mod tests {
 #[cfg(test)]
 mod directive_tests {
     use super::{
-        classify_empty_turn, pending_approval_from_result, parse_output_directives,
+        classify_empty_turn, parse_output_directives, pending_approval_from_result,
         AcpPromptIdentity, SILENT_FAILURE_MSG,
     };
     use crate::acp::TurnResult;
@@ -3622,9 +3662,8 @@ mod directive_tests {
             openab_message_id: Some("msg-789".into()),
         };
 
-        let record =
-            pending_approval_from_result(&result, "acp-session-1", &identity)
-                .expect("complete approval metadata should parse");
+        let record = pending_approval_from_result(&result, "acp-session-1", &identity)
+            .expect("complete approval metadata should parse");
 
         assert_eq!(record.approval_id, "apr-123");
         assert_eq!(record.conversation_id, "wfc-456");
@@ -3644,14 +3683,12 @@ mod directive_tests {
             }
         });
 
-        assert!(
-            pending_approval_from_result(
-                &base,
-                "acp-session-1",
-                &AcpPromptIdentity::default(),
-            )
-            .is_none()
-        );
+        assert!(pending_approval_from_result(
+            &base,
+            "acp-session-1",
+            &AcpPromptIdentity::default(),
+        )
+        .is_none());
     }
 
     #[test]
@@ -3666,14 +3703,12 @@ mod directive_tests {
             }
         });
 
-        assert!(
-            pending_approval_from_result(
-                &result,
-                "acp-session-1",
-                &AcpPromptIdentity::default(),
-            )
-            .is_none()
-        );
+        assert!(pending_approval_from_result(
+            &result,
+            "acp-session-1",
+            &AcpPromptIdentity::default(),
+        )
+        .is_none());
     }
 
     #[test]

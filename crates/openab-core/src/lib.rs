@@ -23,6 +23,7 @@ pub mod markdown;
 pub mod media;
 pub mod multibot_cache;
 pub mod native_completion;
+pub mod native_work_acceptance;
 #[cfg(feature = "pre-seed")]
 pub mod pre_seed;
 pub mod reactions;
@@ -38,6 +39,7 @@ pub mod terminal_delivery_worker;
 pub mod timestamp;
 pub mod trust;
 pub mod workflow;
+pub mod workflow_command;
 pub mod workflow_reopen;
 
 #[cfg(feature = "discord")]

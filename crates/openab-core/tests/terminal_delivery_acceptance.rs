@@ -334,7 +334,6 @@ async fn durable_terminal_port_failure_has_no_legacy_discord_fallback() {
     assert_eq!(seen.edits, 0);
 }
 
-
 #[tokio::test]
 async fn failed_approval_resume_preserves_pending_approval() {
     let _lock = ENV_LOCK.lock().await;
@@ -411,7 +410,6 @@ async fn awaiting_approval_end_turn_does_not_enter_durable_terminal_delivery() {
         "awaiting approval must not query Runtime terminal-result"
     );
 
-
     let pending = router
         .pending_approval("discord:1")
         .await
@@ -421,7 +419,6 @@ async fn awaiting_approval_end_turn_does_not_enter_durable_terminal_delivery() {
     assert_eq!(pending.conversation_id, "CONVERSATION-C");
     assert_eq!(pending.expected_revision, 2);
     assert_eq!(pending.identity.user_id.as_deref(), Some("user-1"));
-
 
     let error = router
         .resume_pending_approval("discord:1", "different-user", "approve")
@@ -437,7 +434,6 @@ async fn awaiting_approval_end_turn_does_not_enter_durable_terminal_delivery() {
         router.pending_approval("discord:1").await.is_some(),
         "identity mismatch must not consume pending approval"
     );
-
 
     let error = router
         .resume_pending_approval("discord:1", "user-1", "maybe")

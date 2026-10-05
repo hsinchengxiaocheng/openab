@@ -1,0 +1,32 @@
+{
+  "schema_version": "v1",
+  "project_id": "openab",
+  "project_root": "/home/arthur/openab/source",
+  "validation_commands": {
+    "PRIMARY": [
+      "cargo fmt --check",
+      "cargo clippy --all-targets -- -D warnings",
+      "cargo clippy -- -D warnings",
+      "cargo clippy",
+      "cargo test",
+      "cargo check"
+    ],
+    "VERIFIER": [
+      "cargo fmt --check",
+      "cargo clippy --all-targets -- -D warnings",
+      "cargo clippy -- -D warnings",
+      "cargo clippy"
+    ],
+    "FINAL_REVIEWER": [
+      "cargo fmt --check",
+      "cargo clippy --all-targets -- -D warnings",
+      "cargo clippy -- -D warnings",
+      "cargo clippy"
+    ]
+  },
+  "protected_paths": [
+    ".env",
+    ".git/",
+    "target/"
+  ]
+}

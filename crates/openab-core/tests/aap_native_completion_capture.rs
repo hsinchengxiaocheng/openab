@@ -117,6 +117,7 @@ fn seal_event(
         project_root: metadata.project_root.clone().unwrap_or_default(),
         timestamp: "2026-09-04T00:00:00Z".into(),
         transport: metadata.transport.clone(),
+        verifier_defect: None,
     };
     event.seal()
 }
@@ -127,6 +128,52 @@ fn seal_event(
 // event, the recording port sees exactly one canonical event
 // reaching the AAP-Runtime-facing boundary.
 // ---------------------------------------------------------------------------
+#[test]
+fn integration_verifier_structured_fail_carries_nested_defect() {
+    let metadata = aap_native_metadata("VERIFIER", "oad-verifier-fail");
+    let raw = r#"<verifier_defect>
+{"summary":"blocking defect","correction_spec":"fix the broken authority seam","evidence":["dispatch.rs:2116","regression:test"]}
+</verifier_defect>
+<role_completion>
+role: VERIFIER
+result: FAIL
+workflow_id: wfr-prod-integration
+project_id: openab
+project_root: /home/arthur/openab/source
+</role_completion>"#;
+
+    let defect = match openab_core::role_completion_block::parse_verifier_defect_block(raw) {
+        openab_core::role_completion_block::VerifierDefectParse::Claim(claim) => claim,
+        other => panic!("expected verifier defect claim, got {other:?}"),
+    };
+
+    let mut event = seal_event(&metadata, "FAIL".into(), raw);
+    event.verifier_defect = Some(defect.clone());
+
+    let value = serde_json::to_value(&event).expect("serialize native completion event");
+    let nested = value
+        .get("verifier_defect")
+        .expect("verifier_defect must be present");
+
+    assert_eq!(
+        nested.get("summary").and_then(|v| v.as_str()),
+        Some("blocking defect")
+    );
+    assert_eq!(
+        nested.get("correction_spec").and_then(|v| v.as_str()),
+        Some("fix the broken authority seam")
+    );
+    assert_eq!(
+        nested
+            .get("evidence")
+            .and_then(|v| v.as_array())
+            .map(|items| items.len()),
+        Some(2)
+    );
+
+    assert_eq!(event.verifier_defect, Some(defect));
+}
+
 #[test]
 fn integration_verifier_structured_pass_reaches_runtime_port() {
     let metadata = aap_native_metadata("VERIFIER", "oad-verifier-pass");
@@ -170,12 +217,11 @@ fn integration_verifier_structured_pass_reaches_runtime_port() {
     // record regardless of status.
     let raw = std::fs::read_to_string(&path).expect("read outbox");
     let parsed: serde_json::Value = serde_json::from_str(&raw).expect("parse outbox");
-    assert_eq!(
+    assert!(
         parsed
             .as_object()
             .expect("outbox is object")
             .contains_key(&captured.completion_id),
-        true,
         "outbox must persist the sealed completion"
     );
 

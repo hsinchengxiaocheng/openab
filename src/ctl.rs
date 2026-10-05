@@ -31,6 +31,10 @@ use openab_core::admission::{NativeWorkflowMetadata, WorkAdmissionPort, WorkAdmi
 use openab_core::control_plane::{self, ControlRequestContext};
 #[cfg(unix)]
 use openab_core::dispatch::BufferedMessage;
+#[cfg(unix)]
+use openab_core::native_work_acceptance::{
+    NativeWorkAcceptanceError, NativeWorkAcceptanceRepository,
+};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::collections::{HashMap, VecDeque};
@@ -785,6 +789,12 @@ pub struct RuntimeHandler {
     /// Ordinary ACP admission is unaffected by this field — only
     /// the lease-bound `agent.work` path consults it.
     heartbeat_availability: Arc<HeartbeatAvailability>,
+    /// Durable OpenAB-owned `dispatch_id` acceptance fence.  This is the
+    /// first execution-responsibility seam, so it survives daemon restarts;
+    /// the older `AgentWorkLedger` remains only an in-process waiter aid.
+    native_work_acceptance: Option<Arc<NativeWorkAcceptanceRepository>>,
+    #[cfg(test)]
+    native_work_acceptance_temp_dir: Option<tempfile::TempDir>,
 }
 
 #[cfg(unix)]
@@ -806,6 +816,9 @@ impl RuntimeHandler {
             })),
             trust_configs: Arc::new(openab_core::trust::PlatformTrustConfigs::new()),
             heartbeat_availability: Arc::new(HeartbeatAvailability::default()),
+            native_work_acceptance: None,
+            #[cfg(test)]
+            native_work_acceptance_temp_dir: None,
         }
     }
 
@@ -857,6 +870,25 @@ impl RuntimeHandler {
         producer: Option<Arc<openab_core::agent_lease_heartbeat::HeartbeatProducer>>,
     ) -> Self {
         self.heartbeat_availability = Arc::new(HeartbeatAvailability::new(producer));
+        self
+    }
+
+    pub fn with_native_work_acceptance(
+        mut self,
+        repository: Arc<NativeWorkAcceptanceRepository>,
+    ) -> Self {
+        self.native_work_acceptance = Some(repository);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_test_native_work_acceptance(mut self) -> Self {
+        let directory = tempfile::tempdir().expect("test acceptance directory");
+        let repository =
+            NativeWorkAcceptanceRepository::open_path(directory.path().join("native-work.sqlite"))
+                .expect("test acceptance repository");
+        self.native_work_acceptance = Some(Arc::new(repository));
+        self.native_work_acceptance_temp_dir = Some(directory);
         self
     }
 
@@ -1408,7 +1440,44 @@ impl CtlHandler for RuntimeHandler {
             "{}:{}:{}",
             request.agent, request.conversation_key, request.dispatch_id
         );
+        // Lease ownership is intentionally excluded from the durable identity:
+        // an AgentLease can expire and be re-claimed while Runtime re-delivers
+        // the same canonical dispatch. That replay must reuse J, not become
+        // a payload conflict or a new execution.
+        let acceptance_fingerprint = durable_acceptance_fingerprint(request);
         let fingerprint = agent_work_fingerprint(request);
+        let Some(acceptance_repository) = self.native_work_acceptance.as_ref() else {
+            return agent_work_error(
+                "DURABLE_ACCEPTANCE_UNAVAILABLE",
+                "native agent.work rejected: durable OpenAB acceptance store is unavailable",
+            );
+        };
+        let acceptance = match acceptance_repository
+            .claim_or_reuse(&request.dispatch_id, &acceptance_fingerprint)
+        {
+            Ok(acceptance) => acceptance,
+            Err(NativeWorkAcceptanceError::Conflict) => {
+                return agent_work_error(
+                    "DUPLICATE_DISPATCH_CONFLICT",
+                    "dispatch_id payload differs",
+                );
+            }
+            Err(error) => {
+                return agent_work_error("DURABLE_ACCEPTANCE_FAILED", &error.to_string());
+            }
+        };
+        // A durable row proves that J was reserved, not that admission
+        // completed. Only a stored real acknowledgement is safe to replay.
+        // An empty acknowledgement continues into the ledger below: a live
+        // holder is awaited, while a restarted daemon re-enters admission.
+        if let Some(ack_json) = acceptance.acknowledgement {
+            return Response {
+                ok: true,
+                message: "WORK_ACCEPTED".into(),
+                value: Some(ack_json),
+                message_id: None,
+            };
+        }
 
         // Phase 6.2.9 (VERIFIER fix round 2): atomic in-flight reservation.
         //
@@ -1712,24 +1781,26 @@ impl CtlHandler for RuntimeHandler {
                 return agent_work_error(error.code(), &error.to_string());
             }
         };
-        // AAP Runtime requires a stable, non-empty OpenAB execution identity
-        // in every successful native admission acknowledgement. Keep this
-        // identity domain separate from the ACP SessionPool key
-        // (`native-dispatch:<agent>:<dispatch_id>`): this value identifies the
-        // accepted OpenAB execution durably across retries of the same
-        // scheduler dispatch.
-        let openab_execution_id = format!("openab-native:{}", request.dispatch_id);
-
+        // Use the durable native-acceptance execution identity as the
+        // OpenAB execution identity returned to AAP Runtime. The same identity
+        // is persisted with the acknowledgement so retries of the scheduler
+        // dispatch remain correlated with the durable acceptance record.
         let ack_json = serde_json::json!({
             "acknowledgement": "WORK_ACCEPTED",
             "dispatch_id": request.dispatch_id,
             "admission_id": ack.admission_id,
-            "openab_execution_id": openab_execution_id,
+            "openab_execution_id": acceptance.execution_id,
             "workflow_run_id": request.workflow_run_id,
             "role": request.role,
             "conversation_key": request.conversation_key,
         })
         .to_string();
+
+        if let Err(error) =
+            acceptance_repository.record_acknowledgement(&request.dispatch_id, &ack_json)
+        {
+            return agent_work_error("DURABLE_ACCEPTANCE_FAILED", &error.to_string());
+        }
         // Promote the InFlight reservation to Done. After this point the
         // guard is disarmed so its Drop will not also release the slot.
         self.ledger.lock().await.complete_with_done(
@@ -1837,6 +1908,28 @@ fn validate_scope_policy(p: &AgentWorkScopePolicy) -> Option<&'static str> {
 #[cfg(unix)]
 fn agent_work_fingerprint(r: &AgentWorkRequest) -> String {
     control_plane::sha256_hex(&serde_json::to_string(r).expect("AgentWorkRequest serializes"))
+}
+
+#[cfg(unix)]
+fn durable_acceptance_fingerprint(r: &AgentWorkRequest) -> String {
+    control_plane::sha256_hex(
+        &serde_json::json!({
+            "workflow_run_id": r.workflow_run_id,
+            "project_id": r.project_id,
+            "project_root": r.project_root,
+            "task_id": r.task_id,
+            "role": r.role,
+            "agent": r.agent,
+            "expected_revision": r.expected_revision,
+            "conversation_key": r.conversation_key,
+            "assignment": r.assignment,
+            "language": r.language,
+            "transport": r.transport,
+            "delivery_destination": r.delivery_destination,
+            "scope_policy": r.scope_policy,
+        })
+        .to_string(),
+    )
 }
 
 /// Phase 6.4.1D — trust check on a structured delivery destination
@@ -2129,13 +2222,28 @@ mod tests {
         if let Some(tc) = trust_configs {
             handler = handler.with_trust_configs(tc);
         }
-        handler
+        handler.with_test_native_work_acceptance()
     }
 
     fn accepted_ack(response: &Response) -> serde_json::Value {
         assert!(response.ok, "{}", response.message);
         assert_eq!(response.message, "WORK_ACCEPTED");
         serde_json::from_str(response.value.as_deref().expect("WORK_ACCEPTED ack")).unwrap()
+    }
+
+    fn preclaim_empty_acknowledgement(
+        repository: &NativeWorkAcceptanceRepository,
+        request: &AgentWorkRequest,
+    ) -> String {
+        let acceptance = repository
+            .claim_or_reuse(
+                &request.dispatch_id,
+                &durable_acceptance_fingerprint(request),
+            )
+            .expect("durable pre-claim");
+        assert!(!acceptance.reused);
+        assert!(acceptance.acknowledgement.is_none());
+        acceptance.execution_id
     }
 
     #[tokio::test]
@@ -2434,6 +2542,145 @@ mod tests {
 
         assert_eq!(admission.calls(), 1);
         assert_eq!(accepted_ack(&first), accepted_ack(&second));
+    }
+
+    #[tokio::test]
+    async fn ctl_empty_durable_acknowledgement_reenters_real_admission() {
+        let directory = tempfile::tempdir().expect("acceptance directory");
+        let repository = Arc::new(
+            NativeWorkAcceptanceRepository::open_path(directory.path().join("native-work.sqlite"))
+                .expect("acceptance repository"),
+        );
+        let request = native_work_request();
+        let execution_id = preclaim_empty_acknowledgement(&repository, &request);
+        let admission = Arc::new(RecordingAdmissionPort::new("admission-empty-ack"));
+
+        let response = native_work_handler(admission.clone())
+            .with_native_work_acceptance(repository)
+            .handle_agent_work(Some(&request))
+            .await;
+
+        assert_eq!(
+            admission.calls(),
+            1,
+            "empty durable ack must not short-circuit"
+        );
+        assert_eq!(accepted_ack(&response)["openab_execution_id"], execution_id);
+    }
+
+    #[tokio::test]
+    async fn ctl_empty_durable_acknowledgement_never_synthesizes_success() {
+        let directory = tempfile::tempdir().expect("acceptance directory");
+        let repository = Arc::new(
+            NativeWorkAcceptanceRepository::open_path(directory.path().join("native-work.sqlite"))
+                .expect("acceptance repository"),
+        );
+        let request = native_work_request();
+        preclaim_empty_acknowledgement(&repository, &request);
+        let rejecting = Arc::new(RejectingAdmissionPort(AtomicUsize::new(0)));
+
+        let response = native_work_handler(rejecting.clone())
+            .with_native_work_acceptance(repository)
+            .handle_agent_work(Some(&request))
+            .await;
+
+        assert_eq!(rejecting.calls(), 1);
+        assert!(!response.ok);
+        assert_ne!(response.message, "WORK_ACCEPTED");
+    }
+
+    #[tokio::test]
+    async fn ctl_failed_admission_retries_same_execution_identity() {
+        let directory = tempfile::tempdir().expect("acceptance directory");
+        let repository = Arc::new(
+            NativeWorkAcceptanceRepository::open_path(directory.path().join("native-work.sqlite"))
+                .expect("acceptance repository"),
+        );
+        let request = native_work_request();
+        let rejecting = Arc::new(RejectingAdmissionPort(AtomicUsize::new(0)));
+        let first = native_work_handler(rejecting.clone())
+            .with_native_work_acceptance(repository.clone())
+            .handle_agent_work(Some(&request))
+            .await;
+        assert!(!first.ok);
+
+        let recording = Arc::new(RecordingAdmissionPort::new("admission-retry"));
+        let second = native_work_handler(recording.clone())
+            .with_native_work_acceptance(repository)
+            .handle_agent_work(Some(&request))
+            .await;
+
+        assert_eq!(rejecting.calls(), 1);
+        assert_eq!(recording.calls(), 1);
+        assert_eq!(
+            accepted_ack(&second)["openab_execution_id"],
+            format!("openab-native:{}", request.dispatch_id),
+        );
+    }
+
+    #[tokio::test]
+    async fn ctl_replay_after_lease_expiry_reuses_durable_execution_identity() {
+        let admission = Arc::new(RecordingAdmissionPort::new("admission-lease-replay"));
+        let handler = native_work_handler(admission.clone());
+        let request = native_work_request();
+        let first = handler.handle_agent_work(Some(&request)).await;
+        let mut replay = request.clone();
+        replay.lease_id = "lease-after-expiry".into();
+        replay.lease_generation += 1;
+        let second = handler.handle_agent_work(Some(&replay)).await;
+
+        assert_eq!(admission.calls(), 1);
+        assert_eq!(
+            accepted_ack(&first)["openab_execution_id"],
+            accepted_ack(&second)["openab_execution_id"],
+        );
+    }
+
+    #[tokio::test]
+    async fn ctl_replay_after_openab_restart_reuses_durable_execution_identity() {
+        let directory = tempfile::tempdir().expect("acceptance directory");
+        let repository = Arc::new(
+            NativeWorkAcceptanceRepository::open_path(directory.path().join("native-work.sqlite"))
+                .expect("acceptance repository"),
+        );
+        let admission = Arc::new(RecordingAdmissionPort::new("admission-restart-replay"));
+        let request = native_work_request();
+        let first = native_work_handler(admission.clone())
+            .with_native_work_acceptance(repository.clone())
+            .handle_agent_work(Some(&request))
+            .await;
+
+        // A new RuntimeHandler represents the restarted OpenAB daemon. Its
+        // process-local ledger is empty, so only the SQLite PRIMARY KEY can
+        // prevent a second effective admission.
+        let second = native_work_handler(admission.clone())
+            .with_native_work_acceptance(repository)
+            .handle_agent_work(Some(&request))
+            .await;
+
+        assert_eq!(admission.calls(), 1);
+        assert_eq!(accepted_ack(&first), accepted_ack(&second));
+    }
+
+    #[tokio::test]
+    async fn ctl_restart_replays_empty_acknowledgement_through_admission() {
+        let directory = tempfile::tempdir().expect("acceptance directory");
+        let repository = Arc::new(
+            NativeWorkAcceptanceRepository::open_path(directory.path().join("native-work.sqlite"))
+                .expect("acceptance repository"),
+        );
+        let request = native_work_request();
+        let execution_id = preclaim_empty_acknowledgement(&repository, &request);
+        let admission = Arc::new(RecordingAdmissionPort::new("admission-restart-empty"));
+
+        // The new handler has no in-memory ledger, modelling an OpenAB restart.
+        let response = native_work_handler(admission.clone())
+            .with_native_work_acceptance(repository)
+            .handle_agent_work(Some(&request))
+            .await;
+
+        assert_eq!(admission.calls(), 1);
+        assert_eq!(accepted_ack(&response)["openab_execution_id"], execution_id);
     }
 
     #[tokio::test]
@@ -3200,11 +3447,20 @@ mod tests {
                 async move { h.handle_agent_work(Some(&r)).await },
             ));
         }
+        let mut acknowledgements = Vec::new();
         for join in joins {
             let response = join.await.expect("task did not panic");
             assert!(response.ok, "{}", response.message);
             assert_eq!(response.message, "WORK_ACCEPTED");
+            acknowledgements.push(accepted_ack(&response));
         }
+        assert!(
+            acknowledgements
+                .iter()
+                .skip(1)
+                .all(|acknowledgement| acknowledgement == &acknowledgements[0]),
+            "concurrent duplicates must return the holder's same real acknowledgement",
+        );
         assert_eq!(
             admission.calls.load(AtomicOrdering::SeqCst),
             1,
@@ -4249,6 +4505,141 @@ done
             Some("1536733602304499852")
         );
         assert_eq!(adapter.last_value().as_deref(), Some(body));
+    }
+
+    #[tokio::test]
+    async fn canonical_handler_passes_logical_content_to_targeted_send() {
+        // ── DIRECT_DISCORD_ARTHURCLAUDE_EXECUTION bounded fix ──
+        //
+        // The OpenAB ``thread.message`` ctl handler MUST pass the
+        // LOGICAL content (``value``) through to
+        // ``ChatAdapter::send_message_targeted`` unchanged. The
+        // mention-token prepending is the SINGLE responsibility of
+        // the Discord adapter
+        // (``DiscordAdapter::send_message_targeted`` →
+        // ``normalize_targeted_mention``). A prepended token at the
+        // ctl seam would either be duplicated (canonical envelopes
+        // already include the token) or conflict with a
+        // differently-authored one (fail-closed at the adapter).
+        //
+        // This test pins that contract: ctl → adapter passes logical
+        // content ONLY.
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = std::sync::Arc::new(RecordingAdapter::default());
+        let handler = make_handler(
+            adapter.clone(),
+            pool_with_state(dir.path(), empty_pool_state()),
+        );
+        let body = "HANDOFF\nfrom: ArthurCodex\nto: ArthurClaude\n";
+
+        let response = handler
+            .handle_set(
+                Some("1539923659345502208"),
+                "thread.message",
+                body,
+                Some("1536733602304499852"), // ArthurClaude
+                None,
+            )
+            .await;
+
+        assert!(response.ok, "canonical handler must succeed: {response:?}");
+        assert_eq!(adapter.send_count(), 1, "exactly one targeted send");
+        // The adapter receives the LOGICAL content verbatim — no
+        // mention token has been prepended at the ctl seam.
+        assert_eq!(
+            adapter.last_value().as_deref(),
+            Some(body),
+            "ctl MUST pass logical content unchanged; the Discord \
+             adapter is the SINGLE source of the wire-form prefix"
+        );
+        // No Discord mention token is in the adapter-side content;
+        // the bounded fix moves mention normalization downstream to
+        // ``DiscordAdapter::send_message_targeted``.
+        let last_value = adapter.last_value().unwrap_or_default();
+        assert!(
+            !last_value.contains("<@"),
+            "adapter-side content MUST NOT carry a raw mention token; \
+             ctl passes logical content. found: {last_value:?}"
+        );
+        assert_eq!(
+            adapter.last_target_user_id.lock().unwrap().as_deref(),
+            Some("1536733602304499852")
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_handler_does_not_duplicate_pre_rendered_mention_token() {
+        // The renderer (CanonicalHandoffCompletionEmitter in AAP)
+        // already includes the canonical mention token in the
+        // rendered HANDOFF envelope body. ctl MUST NOT re-prepend it;
+        // the adapter's ``normalize_targeted_mention`` preserves an
+        // already-matching token (idempotent), so the wire form ends
+        // up with exactly one mention line. Re-prepending at the ctl
+        // seam would produce two mention lines on the wire and break
+        // the deterministic "exactly one canonical mention" invariant.
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = std::sync::Arc::new(RecordingAdapter::default());
+        let handler = make_handler(
+            adapter.clone(),
+            pool_with_state(dir.path(), empty_pool_state()),
+        );
+        let body = "<@1536733602304499852>\nHANDOFF\nfrom: ArthurClaude\nto: ArthurCodex\n";
+
+        let response = handler
+            .handle_set(
+                Some("1539923659345502208"),
+                "thread.message",
+                body,
+                Some("1536733602304499852"),
+                None,
+            )
+            .await;
+
+        assert!(response.ok, "canonical handler must succeed: {response:?}");
+        // The adapter receives the rendered body verbatim — ctl
+        // MUST NOT prepend another token.
+        assert_eq!(adapter.last_value().as_deref(), Some(body));
+        assert_eq!(
+            adapter
+                .last_value()
+                .unwrap_or_default()
+                .matches("<@1536733602304499852>")
+                .count(),
+            1,
+            "the bounded fix leaves exactly one mention on the wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_handler_passes_non_target_content_unchanged_when_target_user_id_none() {
+        // Human-targeted notifications (admin logs, status updates)
+        // have NO ``target_user_id``. The ctl seam must pass content
+        // through unchanged; the bounded fix does NOT touch this case.
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = std::sync::Arc::new(RecordingAdapter::default());
+        let handler = make_handler(
+            adapter.clone(),
+            pool_with_state(dir.path(), empty_pool_state()),
+        );
+        let body = "audit log line: no handoff";
+
+        let response = handler
+            .handle_set(
+                Some("1539923659345502208"),
+                "thread.message",
+                body,
+                None,
+                None,
+            )
+            .await;
+
+        assert!(response.ok);
+        assert_eq!(adapter.send_count(), 1);
+        assert_eq!(adapter.last_value().as_deref(), Some(body));
+        assert!(
+            !adapter.last_value().unwrap_or_default().contains("<@"),
+            "non-targeted send MUST NOT carry a raw mention token"
+        );
     }
 
     #[tokio::test]

@@ -1393,9 +1393,8 @@ mod tests {
     use super::{
         build_agent_env, build_permission_response, build_permission_response_with_policy,
         pick_best_option, session_prompt_params, session_resume_params,
-        tool_kind_denied_for_read_only,
-        tool_title_denied_for_read_only, AcpPromptIdentity, WritePolicyGuard,
-        WRITE_POLICY_MODIFY_ALLOWED, WRITE_POLICY_READ_ONLY,
+        tool_kind_denied_for_read_only, tool_title_denied_for_read_only, AcpPromptIdentity,
+        WritePolicyGuard, WRITE_POLICY_MODIFY_ALLOWED, WRITE_POLICY_READ_ONLY,
     };
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde_json::json;

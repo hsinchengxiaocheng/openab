@@ -29,6 +29,8 @@ use openab_core::native_completion::{
     DurableNativeCompletionPort, HttpNativeCompletionPort, NativeCompletionOutbox,
     SharedNativeCompletionPort,
 };
+#[cfg(unix)]
+use openab_core::native_work_acceptance::NativeWorkAcceptanceRepository;
 #[cfg(feature = "discord")]
 use openab_core::remind;
 use openab_core::secrets;
@@ -1081,9 +1083,7 @@ async fn main() -> anyhow::Result<()> {
                     error = %other,
                     "Phase 6.4: failed to build autonomous ingress client"
                 );
-                return Err(anyhow::anyhow!(
-                    "Phase 6.4 startup error: {other}"
-                ));
+                return Err(anyhow::anyhow!("Phase 6.4 startup error: {other}"));
             }
         }
     } else {
@@ -1108,10 +1108,10 @@ async fn main() -> anyhow::Result<()> {
                     .ok()
                     .expect("router has a single strong reference at workflow reopen startup seam");
 
-                Arc::new(inner.with_workflow_reopen_client(
-                    Arc::new(client)
-                        as Arc<dyn openab_core::workflow_reopen::WorkflowReopenClient>,
-                ))
+                Arc::new(
+                    inner.with_workflow_reopen_client(Arc::new(client)
+                        as Arc<dyn openab_core::workflow_reopen::WorkflowReopenClient>),
+                )
             }
             Err(openab_core::workflow_reopen::WorkflowReopenError::AuthMissing) => {
                 error!(
@@ -1128,9 +1128,7 @@ async fn main() -> anyhow::Result<()> {
                     error = %other,
                     "failed to build dedicated workflow reopen client"
                 );
-                return Err(anyhow::anyhow!(
-                    "workflow reopen startup error: {other}"
-                ));
+                return Err(anyhow::anyhow!("workflow reopen startup error: {other}"));
             }
         }
     } else {
@@ -1428,6 +1426,20 @@ async fn main() -> anyhow::Result<()> {
     // Spawn control socket server for `openab set/get` IPC
     #[cfg(unix)]
     let ctl_handle = {
+        let native_work_acceptance = {
+            let home = std::env::var("HOME").expect("native work acceptance requires HOME");
+            let agent = std::env::var("ARTHUR_AGENT_NAME")
+                .expect("native work acceptance requires ARTHUR_AGENT_NAME");
+            let path = std::path::PathBuf::from(home)
+                .join(".openab")
+                .join("agents")
+                .join(agent)
+                .join("native_work_acceptance.sqlite");
+            Arc::new(
+                NativeWorkAcceptanceRepository::open_path(path)
+                    .expect("native work acceptance store must open before control socket starts"),
+            )
+        };
         let mut adapters = std::collections::HashMap::new();
         if let Some(ref a) = shared_discord_adapter {
             adapters.insert("discord".into(), a.clone());
@@ -1456,7 +1468,8 @@ async fn main() -> anyhow::Result<()> {
                     // producer into the ctl RuntimeHandler so the
                     // admission seam can fail-closed on lease-bound
                     // agent.work when no producer is available.
-                    .with_heartbeat_producer(heartbeat_producer.clone()),
+                    .with_heartbeat_producer(heartbeat_producer.clone())
+                    .with_native_work_acceptance(native_work_acceptance),
             )))
         }
     };
@@ -2185,6 +2198,53 @@ async fn main() -> anyhow::Result<()> {
             .join("reminders.json");
         let reminder_store = remind::ReminderStore::load(reminder_path);
 
+        // Initialize Phase 1.7.1 native Discord ``/workflow`` adapter.
+        //
+        // The Runtime URL is derived from the shared
+        // ``[aap_control_plane]`` block, but native Discord authority
+        // is intentionally separate: the adapter accepts ONLY
+        // ``ARTHUR_OPENAB_DISCORD_NATIVE_INTERACTION_KEY``.
+        // The generic AAP control-plane credential must not confer
+        // Discord Tech Lead authority. When the dedicated credential
+        // is missing or empty the adapter fails closed at construction
+        // time and the
+        // ``Handler`` records ``None`` so the bounded Tech Lead
+        // surface gracefully refuses incoming ``/workflow`` dispatches
+        // with a typed ephemeral reply rather than silently dropping
+        // the input.
+        let workflow_command_adapter = match cfg.aap_control_plane.as_ref() {
+            Some(control_plane) => {
+                let transport: Arc<
+                    dyn openab_core::workflow_command::WorkflowCommandAdapterTransport,
+                > = Arc::new(
+                    openab_core::workflow_command::ReqwestWorkflowCommandAdapterTransport::new(),
+                );
+                match openab_core::workflow_command::WorkflowCommandAdapter::from_native_discord_env(
+                    &control_plane.aap_runtime_url,
+                    transport,
+                ) {
+                    Ok(adapter) => {
+                        info!(
+                            runtime_url = %control_plane.aap_runtime_url,
+                            "native /workflow adapter wired"
+                        );
+                        Some(Arc::new(adapter))
+                    }
+                    Err(reason) => {
+                        warn!(
+                            reason = reason.token(),
+                            "native /workflow adapter not wired: dedicated Discord native interaction credential is missing"
+                        );
+                        None
+                    }
+                }
+            }
+            None => {
+                info!("native /workflow adapter not wired: [aap_control_plane] is absent");
+                None
+            }
+        };
+
         // Construct ambient dispatcher if enabled and channels configured.
         let ambient_dispatcher = if cfg.ambient.enabled && !cfg.ambient.discord.channels.is_empty()
         {
@@ -2233,6 +2293,7 @@ async fn main() -> anyhow::Result<()> {
             terminal_delivery_worker: terminal_delivery_worker.clone(),
             terminal_delivery_shutdown: shutdown_rx.clone(),
             terminal_delivery_manager: Mutex::new(None),
+            workflow_command_adapter: workflow_command_adapter.clone(),
         };
 
         let intents = GatewayIntents::GUILD_MESSAGES

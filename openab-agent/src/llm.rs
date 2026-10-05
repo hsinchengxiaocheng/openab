@@ -25,6 +25,8 @@ const KNOWN_PROVIDERS: &[&str] = &[
     "codex",
     "xai",
     "grok",
+    "openai-compatible",
+    "ollama",
 ];
 
 /// A model reference, optionally provider-qualified. Accepts the canonical
@@ -76,7 +78,8 @@ pub fn resolve_provider_choice() -> String {
 }
 
 /// Select an `LlmProvider` from an explicit `choice` (`anthropic` /
-/// `anthropic-oauth` / `openai` / `codex`) or, for any other value, auto-detect
+/// `anthropic-oauth` / `openai` / `codex` / `openai-compatible` / `ollama`) or,
+/// for any other value, auto-detect
 /// (Anthropic API key, then Claude subscription OAuth, then codex OAuth). The
 /// `anthropic` choice itself auto-falls-back from API key to OAuth. Shared by
 /// the ACP session path and MCP sampling so both honor the same
@@ -87,6 +90,7 @@ pub fn select_provider(choice: &str) -> Result<Box<dyn LlmProvider>, String> {
         "anthropic-oauth" | "claude" => Ok(Box::new(AnthropicProvider::from_oauth_auto()?)),
         "openai" | "codex" => Ok(Box::new(OpenAiProvider::from_auth_store()?)),
         "xai" | "grok" => Ok(Box::new(XaiProvider::from_auth_store()?)),
+        "openai-compatible" | "ollama" => Ok(Box::new(OpenAiCompatibleProvider::from_env()?)),
         _ => match AnthropicProvider::auto() {
             Ok(p) => Ok(Box::new(p)),
             // F3 — don't let a *present-but-misconfigured* Anthropic credential
@@ -776,6 +780,105 @@ pub struct XaiProvider {
     client: reqwest::Client,
 }
 
+/// A generic OpenAI Chat Completions provider. Unlike `OpenAiProvider` this
+/// never uses the ChatGPT/Codex OAuth transport or reads `auth.json`; it is
+/// suitable for local Ollama and any separately configured compatible server.
+pub struct OpenAiCompatibleProvider {
+    base_url: String,
+    api_key: Option<String>,
+    model: String,
+    max_tokens: u32,
+    client: reqwest::Client,
+}
+
+fn compatible_model() -> Result<String, String> {
+    if let Ok(model) = std::env::var("OPENAB_AGENT_MODEL") {
+        if !model.is_empty() {
+            return Ok(ModelRef::parse(&model).model);
+        }
+    }
+    if let Some(model) = crate::config::AgentConfig::load_or_default().model {
+        if !model.is_empty() {
+            return Ok(ModelRef::parse(&model).model);
+        }
+    }
+    Err(
+        "no model configured; set OPENAB_AGENT_MODEL for the OpenAI-compatible provider"
+            .to_string(),
+    )
+}
+
+impl OpenAiCompatibleProvider {
+    pub fn from_env() -> Result<Self, String> {
+        let base_url = std::env::var("OPENAB_AGENT_COMPAT_BASE_URL")
+            .ok()
+            .filter(|url| !url.is_empty())
+            .unwrap_or_else(|| "http://127.0.0.1:11434/v1".to_string())
+            .trim_end_matches('/')
+            .to_string();
+        let api_key = std::env::var("OPENAB_AGENT_COMPAT_API_KEY")
+            .ok()
+            .filter(|key| !key.is_empty());
+        Ok(Self {
+            base_url,
+            api_key,
+            model: compatible_model()?,
+            max_tokens: anthropic_max_tokens(),
+            client: reqwest::Client::new(),
+        })
+    }
+
+    pub fn from_env_with_model(model: &str) -> Result<Self, String> {
+        let mut provider = Self::from_env()?;
+        provider.model = ModelRef::parse(model).model;
+        Ok(provider)
+    }
+}
+
+impl LlmProvider for OpenAiCompatibleProvider {
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn provider_name(&self) -> &str {
+        "openai-compatible"
+    }
+
+    fn chat<'a>(
+        &'a self,
+        system: &'a str,
+        messages: &'a [Message],
+        tools: &'a [ToolDef],
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<LlmEvent>>> + Send + 'a>> {
+        Box::pin(async move {
+            let body =
+                openai_chat_request_body(&self.model, self.max_tokens, system, messages, tools);
+            let mut request = self
+                .client
+                .post(format!("{}/chat/completions", self.base_url))
+                .header("Content-Type", "application/json");
+            if let Some(api_key) = &self.api_key {
+                request = request.header("Authorization", format!("Bearer {api_key}"));
+            }
+            let response = request
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| anyhow!("HTTP request failed: {e}"))?;
+            let status = response.status();
+            if !status.is_success() {
+                let text = response.text().await.unwrap_or_default();
+                return Err(anyhow!("OpenAI-compatible API error {status}: {text}"));
+            }
+            let payload: Value = response
+                .json()
+                .await
+                .map_err(|e| anyhow!("Failed to parse OpenAI-compatible response: {e}"))?;
+            parse_openai_response(&payload)
+        })
+    }
+}
+
 /// Resolve the xAI model. Precedence (env-over-config, ADR §5.5):
 /// `OPENAB_AGENT_XAI_MODEL` → `OPENAB_AGENT_MODEL` → `model` in `config.json`
 /// → built-in `grok-4.5`. Each source may be `provider/`-qualified
@@ -855,7 +958,7 @@ impl XaiProvider {
 /// unit-testable. Tool results are emitted *before* any user text from the same
 /// message: Chat Completions requires `tool` messages to directly follow the
 /// assistant message carrying the corresponding `tool_calls`.
-fn xai_chat_messages(system: &str, messages: &[Message]) -> Vec<Value> {
+fn openai_chat_messages(system: &str, messages: &[Message]) -> Vec<Value> {
     let mut out: Vec<Value> = vec![json!({"role": "system", "content": system})];
     for m in messages {
         if m.role == "user" {
@@ -921,7 +1024,7 @@ fn xai_chat_messages(system: &str, messages: &[Message]) -> Vec<Value> {
 /// Build the Chat Completions request body. Pure so the wire shape — including
 /// the documented `OPENAB_AGENT_MAX_TOKENS` output limit (review round-3 F3) —
 /// is unit-testable.
-fn xai_request_body(
+fn openai_chat_request_body(
     model: &str,
     max_tokens: u32,
     system: &str,
@@ -930,7 +1033,7 @@ fn xai_request_body(
 ) -> Value {
     let mut body = json!({
         "model": model,
-        "messages": xai_chat_messages(system, messages),
+        "messages": openai_chat_messages(system, messages),
         "max_tokens": max_tokens,
         "stream": false,
     });
@@ -974,7 +1077,8 @@ impl LlmProvider for XaiProvider {
         tools: &'a [ToolDef],
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<LlmEvent>>> + Send + 'a>> {
         Box::pin(async move {
-            let body = xai_request_body(&self.model, self.max_tokens, system, messages, tools);
+            let body =
+                openai_chat_request_body(&self.model, self.max_tokens, system, messages, tools);
 
             // Retry budgets are independent (round-4 F2): rate-limit retries
             // are capped, while the one-time 401 refresh always gets its own
@@ -1459,7 +1563,7 @@ mod tests {
     }
 
     #[test]
-    fn test_xai_chat_messages_maps_transcript_to_chat_completions() {
+    fn openai_chat_messages_maps_transcript_to_chat_completions() {
         let messages = vec![
             Message {
                 role: "user".to_string(),
@@ -1496,7 +1600,7 @@ mod tests {
                 ],
             },
         ];
-        let out = xai_chat_messages("sys", &messages);
+        let out = openai_chat_messages("sys", &messages);
         assert_eq!(out[0]["role"], "system");
         assert_eq!(out[0]["content"], "sys");
         assert_eq!(out[1]["role"], "user");
@@ -1520,7 +1624,7 @@ mod tests {
     }
 
     #[test]
-    fn test_xai_chat_messages_tool_only_assistant_has_null_content() {
+    fn openai_chat_messages_tool_only_assistant_has_null_content() {
         let messages = vec![Message {
             role: "assistant".to_string(),
             content: vec![ContentBlock::ToolUse {
@@ -1529,7 +1633,7 @@ mod tests {
                 input: json!({"path": "x"}),
             }],
         }];
-        let out = xai_chat_messages("s", &messages);
+        let out = openai_chat_messages("s", &messages);
         assert_eq!(out[1]["role"], "assistant");
         assert!(out[1]["content"].is_null());
         assert_eq!(out[1]["tool_calls"][0]["function"]["name"], "read");
@@ -1602,7 +1706,7 @@ mod tests {
     }
 
     #[test]
-    fn xai_request_body_carries_max_tokens_and_tools() {
+    fn openai_chat_request_body_carries_max_tokens_and_tools() {
         // Review round-3 F3: the documented OPENAB_AGENT_MAX_TOKENS contract
         // must reach the wire.
         let tools = vec![ToolDef {
@@ -1610,14 +1714,14 @@ mod tests {
             description: "run".to_string(),
             input_schema: json!({"type": "object"}),
         }];
-        let body = xai_request_body("grok-4.5", 4096, "sys", &[], &tools);
+        let body = openai_chat_request_body("grok-4.5", 4096, "sys", &[], &tools);
         assert_eq!(body["model"], "grok-4.5");
         assert_eq!(body["max_tokens"], 4096);
         assert_eq!(body["stream"], false);
         assert_eq!(body["tools"][0]["function"]["name"], "bash");
         assert_eq!(body["tool_choice"], "auto");
         // No tools → the tool fields are absent entirely.
-        let body = xai_request_body("grok-4.5", 4096, "sys", &[], &[]);
+        let body = openai_chat_request_body("grok-4.5", 4096, "sys", &[], &[]);
         assert!(body.get("tools").is_none());
         assert!(body.get("tool_choice").is_none());
     }
@@ -1683,6 +1787,131 @@ mod tests {
             seen
         });
         (format!("http://{addr}"), handle)
+    }
+
+    #[test]
+    fn ollama_selects_generic_provider_without_oauth_credentials() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("missing-config.json");
+        temp_env::with_vars(
+            [
+                ("HOME", Some(home.path().to_str().unwrap())),
+                ("OPENAB_CONFIG_PATH", Some(config.to_str().unwrap())),
+                ("OPENAB_AGENT_MODEL", Some("qwen3.8:27b-q4_K_M")),
+                ("OPENAB_AGENT_COMPAT_API_KEY", None),
+            ],
+            || {
+                let provider = select_provider("ollama").unwrap();
+                assert_eq!(provider.provider_name(), "openai-compatible");
+                assert_eq!(provider.model(), "qwen3.8:27b-q4_K_M");
+            },
+        );
+    }
+
+    #[test]
+    fn model_ref_recognizes_openai_compatible_and_ollama_prefixes() {
+        let compat = ModelRef::parse("openai-compatible/qwen3.8:27b-q4_K_M");
+        assert_eq!(compat.provider.as_deref(), Some("openai-compatible"));
+        assert_eq!(compat.model, "qwen3.8:27b-q4_K_M");
+        let ollama = ModelRef::parse("ollama/qwen3.8:27b-q4_K_M");
+        assert_eq!(ollama.provider.as_deref(), Some("ollama"));
+        assert_eq!(ollama.model, "qwen3.8:27b-q4_K_M");
+    }
+
+    #[test]
+    fn compatible_chat_uses_ollama_endpoint_without_authorization_and_round_trips_tools() {
+        let (base_url, server) = spawn_canned_http(vec![http_resp(
+            "200 OK",
+            r#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call_2","type":"function","function":{"name":"read","arguments":"{\"path\":\"result.txt\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+        )]);
+        let provider = OpenAiCompatibleProvider {
+            base_url: format!("{base_url}/v1"),
+            api_key: None,
+            model: "qwen3.8:27b-q4_K_M".to_string(),
+            max_tokens: 1234,
+            client: reqwest::Client::new(),
+        };
+        let messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "read".to_string(),
+                    input: json!({"path": "input.txt"}),
+                }],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: "contents".to_string(),
+                    is_error: None,
+                }],
+            },
+        ];
+        let tools = vec![ToolDef {
+            name: "read".to_string(),
+            description: "Read a file".to_string(),
+            input_schema: json!({"type": "object"}),
+        }];
+        let events = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(provider.chat("sys", &messages, &tools))
+            .unwrap();
+        assert!(matches!(&events[0], LlmEvent::ToolUse { id, name, input }
+            if id == "call_2" && name == "read" && input["path"] == "result.txt"));
+
+        let request = server.join().unwrap().remove(0);
+        assert!(request.contains("/v1/chat/completions"));
+        assert!(!request.to_ascii_lowercase().contains("authorization:"));
+        assert!(request.contains("qwen3.8:27b-q4_K_M"));
+        assert!(request.contains("\"max_tokens\":1234"));
+        assert!(request.contains("\"tool_choice\":\"auto\""));
+        assert!(request.contains("\"tool_call_id\":\"call_1\""));
+        assert!(request.contains("\"tool_calls\""));
+    }
+
+    #[test]
+    fn compatible_chat_sends_bearer_api_key_when_configured() {
+        let (base_url, server) = spawn_canned_http(vec![http_resp(
+            "200 OK",
+            r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#,
+        )]);
+        let provider = OpenAiCompatibleProvider {
+            base_url,
+            api_key: Some("compat-key".to_string()),
+            model: "qwen3.8:27b-q4_K_M".to_string(),
+            max_tokens: 8192,
+            client: reqwest::Client::new(),
+        };
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(provider.chat("sys", &[], &[]))
+            .unwrap();
+        assert!(server.join().unwrap()[0]
+            .to_ascii_lowercase()
+            .contains("authorization: bearer compat-key"));
+    }
+
+    #[test]
+    fn compatible_chat_fails_loud_on_non_success_response() {
+        let (base_url, server) = spawn_canned_http(vec![http_resp(
+            "503 Service Unavailable",
+            r#"{"error":"offline"}"#,
+        )]);
+        let provider = OpenAiCompatibleProvider {
+            base_url,
+            api_key: None,
+            model: "qwen3.8:27b-q4_K_M".to_string(),
+            max_tokens: 8192,
+            client: reqwest::Client::new(),
+        };
+        let error = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(provider.chat("sys", &[], &[]))
+            .unwrap_err();
+        assert!(error.to_string().contains("503 Service Unavailable"));
+        server.join().unwrap();
     }
 
     /// Write a temp-HOME auth.json holding one unexpired xai-oauth tenant whose

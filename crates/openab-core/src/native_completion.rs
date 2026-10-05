@@ -191,6 +191,13 @@ pub struct NativeCompletionEvent {
     /// `event_digest` are still empty.
     #[serde(default)]
     pub transport: Option<String>,
+
+    /// M24 Phase 1.8 transport-compatibility correction.
+    /// Present only for VERIFIER + FAIL. Intentionally excluded
+    /// from the v1 completion_id / event_digest contract so old
+    /// durable outbox records remain readable and byte-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verifier_defect: Option<crate::role_completion_block::VerifierDefectClaim>,
 }
 
 impl NativeCompletionEvent {
@@ -684,7 +691,45 @@ mod tests {
             project_root: "/project-1".into(),
             timestamp: "2026-08-21T00:00:00Z".into(),
             transport: Some("OPENAB".into()),
+            verifier_defect: None,
         }
+    }
+
+    #[test]
+    fn verifier_defect_does_not_mutate_v1_completion_or_record_digest() {
+        let mut base = event();
+        base.captured_at = "2026-09-24T00:00:00Z".into();
+
+        let mut first = base.clone();
+        first.role = "VERIFIER".into();
+        first.outcome = "FAIL".into();
+        first.verifier_defect = Some(crate::role_completion_block::VerifierDefectClaim {
+            summary: "first defect".into(),
+            correction_spec: "first correction".into(),
+            evidence: vec!["evidence-a".into()],
+        });
+
+        let mut second = base;
+        second.role = "VERIFIER".into();
+        second.outcome = "FAIL".into();
+        second.verifier_defect = Some(crate::role_completion_block::VerifierDefectClaim {
+            summary: "different defect".into(),
+            correction_spec: "different correction".into(),
+            evidence: vec!["evidence-b".into(), "evidence-c".into()],
+        });
+
+        let first = first.seal();
+        let second = second.seal();
+
+        assert_eq!(
+            first.completion_id, second.completion_id,
+            "verifier_defect must not mutate the v1 completion identity"
+        );
+        assert_eq!(
+            first.record_digest, second.record_digest,
+            "verifier_defect must not mutate the v1 record digest"
+        );
+        assert_ne!(first.verifier_defect, second.verifier_defect);
     }
 
     #[test]
