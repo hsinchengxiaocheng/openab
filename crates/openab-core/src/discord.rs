@@ -7377,6 +7377,67 @@ mod tests {
     }
 
     #[test]
+    fn workflow_runtime_rejection_followup_prefers_canonical_runtime_message() {
+        let result = WorkflowCommandAdapterResult::RuntimeRejection {
+            reason: "reconfigure_rejected".to_string(),
+            message: Some(
+                "Runtime rejected `/workflow reconfigure`. \
+Run `/workflow status` to refresh the authoritative state and revision before retrying. \
+Detail: authoritative Runtime detail."
+                    .to_string(),
+            ),
+            detail: Some(
+                "SHOULD_NOT_APPEAR: renderer must not duplicate Runtime detail.".to_string(),
+            ),
+        };
+
+        let payload = serde_json::to_value(build_workflow_followup(&result))
+            .expect("serialize workflow Runtime rejection followup");
+
+        let content = payload["content"]
+            .as_str()
+            .expect("workflow followup content");
+
+        assert_eq!(
+            content,
+            "⛔ Runtime rejected `/workflow reconfigure`. \
+Run `/workflow status` to refresh the authoritative state and revision before retrying. \
+Detail: authoritative Runtime detail."
+        );
+        assert!(
+            !content.contains("SHOULD_NOT_APPEAR"),
+            "canonical Runtime message must suppress separately-rendered detail"
+        );
+    }
+
+    #[test]
+    fn workflow_runtime_rejection_followup_falls_back_when_message_missing_or_blank() {
+        for message in [None, Some("   \t  ".to_string())] {
+            let result = WorkflowCommandAdapterResult::RuntimeRejection {
+                reason: "reconfigure_rejected".to_string(),
+                message,
+                detail: Some(
+                    "WorkflowRun 'wfr-test' is terminal; topology reconfiguration refused."
+                        .to_string(),
+                ),
+            };
+
+            let payload = serde_json::to_value(build_workflow_followup(&result))
+                .expect("serialize workflow Runtime rejection fallback followup");
+
+            let content = payload["content"]
+                .as_str()
+                .expect("workflow fallback followup content");
+
+            assert_eq!(
+                content,
+                "⛔ Workflow command rejected: `reconfigure_rejected`\n\
+WorkflowRun 'wfr-test' is terminal; topology reconfiguration refused."
+            );
+        }
+    }
+
+    #[test]
     fn workflow_mutation_missing_expected_revision_is_rejected() {
         let json = serde_json::json!({
             "id": "1234567890",
