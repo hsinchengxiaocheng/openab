@@ -2849,6 +2849,19 @@ fn workflow_command_discord_registration() -> CreateCommand {
         )
         .required(true)
     };
+    let reconfigure_reason = || {
+        CreateCommandOption::new(
+            CommandOptionType::String,
+            "reason",
+            "Canonical topology reconfigure reason token",
+        )
+        .required(true)
+        .add_string_choice(
+            "TECH_LEAD_TOPOLOGY_RECONFIGURE",
+            "TECH_LEAD_TOPOLOGY_RECONFIGURE",
+        )
+        .add_string_choice("PROVIDER_UNAVAILABLE", "PROVIDER_UNAVAILABLE")
+    };
     let correction_spec = || {
         CreateCommandOption::new(
             CommandOptionType::String,
@@ -2864,6 +2877,9 @@ fn workflow_command_discord_registration() -> CreateCommand {
             "Canonical primary agent identity (ArthurClaude|ArthurCodex|ArthurGemini)",
         )
         .required(true)
+        .add_string_choice("ArthurClaude", "ArthurClaude")
+        .add_string_choice("ArthurCodex", "ArthurCodex")
+        .add_string_choice("ArthurGemini", "ArthurGemini")
     };
     let verifier = || {
         CreateCommandOption::new(
@@ -2872,6 +2888,9 @@ fn workflow_command_discord_registration() -> CreateCommand {
             "Canonical verifier agent identity (ArthurClaude|ArthurCodex|ArthurGemini)",
         )
         .required(true)
+        .add_string_choice("ArthurClaude", "ArthurClaude")
+        .add_string_choice("ArthurCodex", "ArthurCodex")
+        .add_string_choice("ArthurGemini", "ArthurGemini")
     };
     let final_reviewer = || {
         CreateCommandOption::new(
@@ -2880,6 +2899,9 @@ fn workflow_command_discord_registration() -> CreateCommand {
             "Canonical final_reviewer agent identity (ArthurClaude|ArthurCodex|ArthurGemini)",
         )
         .required(true)
+        .add_string_choice("ArthurClaude", "ArthurClaude")
+        .add_string_choice("ArthurCodex", "ArthurCodex")
+        .add_string_choice("ArthurGemini", "ArthurGemini")
     };
     let binding = || {
         CreateCommandOption::new(
@@ -2935,7 +2957,7 @@ fn workflow_command_discord_registration() -> CreateCommand {
     )
     .add_sub_option(workflow_run_id_required())
     .add_sub_option(expected_revision_required())
-    .add_sub_option(reason())
+    .add_sub_option(reconfigure_reason())
     .add_sub_option(primary())
     .add_sub_option(verifier())
     .add_sub_option(final_reviewer())
@@ -7612,6 +7634,53 @@ WorkflowRun 'wfr-test' is terminal; topology reconfiguration refused."
         }
         assert_eq!(reconfigure["binding"]["required"].as_bool(), Some(false));
         assert_eq!(reconfigure.len(), 7);
+
+        let choice_values = |option: &serde_json::Value| {
+            option["choices"]
+                .as_array()
+                .expect("static Discord choices")
+                .iter()
+                .map(|choice| choice["value"].as_str().expect("choice value").to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let expected_agents = vec![
+            "ArthurClaude".to_string(),
+            "ArthurCodex".to_string(),
+            "ArthurGemini".to_string(),
+        ];
+
+        for agent_option in ["primary", "verifier", "final_reviewer"] {
+            assert_eq!(
+                choice_values(&reconfigure[agent_option]),
+                expected_agents,
+                "{agent_option} must expose canonical agent choices"
+            );
+        }
+
+        assert_eq!(
+            choice_values(&reconfigure["reason"]),
+            vec![
+                "TECH_LEAD_TOPOLOGY_RECONFIGURE".to_string(),
+                "PROVIDER_UNAVAILABLE".to_string(),
+            ]
+        );
+
+        let has_static_choices = |option: &serde_json::Value| {
+            option
+                .get("choices")
+                .and_then(|choices| choices.as_array())
+                .is_some_and(|choices| !choices.is_empty())
+        };
+
+        assert!(
+            !has_static_choices(&reopen_primary["reason"]),
+            "reopen-primary reason vocabulary must remain Runtime-owned"
+        );
+        assert!(
+            !has_static_choices(&reopen_work["reason"]),
+            "reopen-work reason vocabulary must remain Runtime-owned"
+        );
 
         let names = subcommands
             .iter()
