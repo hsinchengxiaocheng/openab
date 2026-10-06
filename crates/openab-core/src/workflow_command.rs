@@ -254,10 +254,12 @@ pub enum WorkflowCommandAdapterResult {
     },
     /// Runtime rejected the command. ``reason`` is the canonical
     /// ``WorkflowCommandRejectionReason`` token projected from the
-    /// OpenClaw envelope; ``detail`` is the optional
+    /// Runtime envelope; ``message`` preserves Runtime's canonical
+    /// human-readable operator guidance; ``detail`` is the optional
     /// ``metadata.workflow_command_detail`` payload.
     RuntimeRejection {
         reason: String,
+        message: Option<String>,
         detail: Option<String>,
     },
     /// Adapter-side failure BEFORE Runtime could classify the
@@ -639,7 +641,11 @@ impl WorkflowCommandAdapter {
             .get("workflow_command_detail")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        WorkflowCommandAdapterResult::RuntimeRejection { reason, detail }
+        WorkflowCommandAdapterResult::RuntimeRejection {
+            reason,
+            message: Some(parsed.message),
+            detail,
+        }
     }
 
     /// Forward an already-serialized Discord CommandInteraction payload
@@ -735,6 +741,7 @@ impl WorkflowCommandAdapter {
 
         WorkflowCommandAdapterResult::RuntimeRejection {
             reason: parsed.reason,
+            message: parsed.message,
             detail: parsed.detail,
         }
     }
@@ -1355,8 +1362,16 @@ mod tests {
             "discord:1",
         ));
         match result {
-            WorkflowCommandAdapterResult::RuntimeRejection { reason, detail } => {
+            WorkflowCommandAdapterResult::RuntimeRejection {
+                reason,
+                message,
+                detail,
+            } => {
                 assert_eq!(reason, "unauthorized_sender");
+                assert_eq!(
+                    message.as_deref(),
+                    Some("Workflow command rejected: 'unauthorized_sender'")
+                );
                 assert!(detail.unwrap().contains("discord-user-99"));
             }
             other => panic!("expected RuntimeRejection, got {other:?}"),
@@ -1705,8 +1720,13 @@ mod native_discord_transport_tests {
         let result = block_on(adapter.dispatch_native_interaction("{}".to_string()));
 
         match result {
-            WorkflowCommandAdapterResult::RuntimeRejection { reason, detail } => {
+            WorkflowCommandAdapterResult::RuntimeRejection {
+                reason,
+                message,
+                detail,
+            } => {
                 assert_eq!(reason, "unauthorized_sender");
+                assert_eq!(message.as_deref(), Some("Workflow command rejected."));
                 assert_eq!(detail.as_deref(), Some("sender is not authorised"));
             }
             other => panic!("expected RuntimeRejection, got {other:?}"),

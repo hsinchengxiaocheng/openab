@@ -2705,12 +2705,28 @@ fn build_workflow_followup(
                 .content(content)
                 .ephemeral(true)
         }
-        WorkflowCommandAdapterResult::RuntimeRejection { reason, detail } => {
-            let mut content = format!("⛔ Workflow command rejected: `{reason}`");
-            if let Some(detail) = detail {
-                content.push('\n');
-                content.push_str(detail);
+        WorkflowCommandAdapterResult::RuntimeRejection {
+            reason,
+            message,
+            detail,
+        } => {
+            let canonical_message = message
+                .as_deref()
+                .map(str::trim)
+                .filter(|message| !message.is_empty());
+
+            let mut content = match canonical_message {
+                Some(message) => format!("⛔ {message}"),
+                None => format!("⛔ Workflow command rejected: `{reason}`"),
+            };
+
+            if canonical_message.is_none() {
+                if let Some(detail) = detail {
+                    content.push('\n');
+                    content.push_str(detail);
+                }
             }
+
             CreateInteractionResponseFollowup::new()
                 .content(content)
                 .ephemeral(true)
