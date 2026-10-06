@@ -2461,7 +2461,7 @@ struct ParsedWorkflowCommand {
 ///
 /// Returns :class:`crate::workflow_command::AdapterRejectionReason`
 /// on any parse failure (missing subcommand, unknown subcommand,
-/// missing ``workflow_run_id``) so the handler can render a typed
+/// missing required mutation ``workflow_run_id``) so the handler can render a typed
 /// ephemeral reply without falling through to ACP / chat.
 fn extract_workflow_subcommand_options(
     cmd: &serenity::model::application::CommandInteraction,
@@ -2530,17 +2530,22 @@ fn extract_workflow_subcommand_options(
     // authority — this guard only ensures the operator gets a
     // deterministic ephemeral reply when the option shape itself
     // is malformed.
-    if options
+    let workflow_run_id_missing = options
         .workflow_run_id
         .as_ref()
         .map(|s| s.trim().is_empty())
-        .unwrap_or(true)
-    {
-        return Err(AdapterRejectionReason::MissingWorkflowRunId);
-    }
+        .unwrap_or(true);
+
     match subcommand {
+        // Read-only commands may omit workflow_run_id. AAP Runtime
+        // resolves the authoritative WorkflowRun from the canonical
+        // Discord conversation/thread binding.
         WorkflowSubcommand::Status | WorkflowSubcommand::Agents => {}
+
         WorkflowSubcommand::ReopenPrimary => {
+            if workflow_run_id_missing {
+                return Err(AdapterRejectionReason::MissingWorkflowRunId);
+            }
             if options.expected_revision.is_none() {
                 return Err(AdapterRejectionReason::MissingRequiredOption(
                     OPTION_EXPECTED_REVISION,
@@ -2566,6 +2571,9 @@ fn extract_workflow_subcommand_options(
             }
         }
         WorkflowSubcommand::ReopenWork => {
+            if workflow_run_id_missing {
+                return Err(AdapterRejectionReason::MissingWorkflowRunId);
+            }
             if options.expected_revision.is_none() {
                 return Err(AdapterRejectionReason::MissingRequiredOption(
                     OPTION_EXPECTED_REVISION,
@@ -2581,6 +2589,9 @@ fn extract_workflow_subcommand_options(
             }
         }
         WorkflowSubcommand::Reconfigure => {
+            if workflow_run_id_missing {
+                return Err(AdapterRejectionReason::MissingWorkflowRunId);
+            }
             if options.expected_revision.is_none() {
                 return Err(AdapterRejectionReason::MissingRequiredOption(
                     OPTION_EXPECTED_REVISION,
@@ -7540,6 +7551,152 @@ mod tests {
                 "reconfigure",
             ])
         );
+    }
+
+    #[test]
+    fn workflow_status_without_workflow_run_id_is_accepted_for_runtime_resolution() {
+        let json = serde_json::json!({
+            "id": "1234567890",
+            "application_id": "1234567890",
+            "type": 2,
+            "data": {
+                "id": "1234567890",
+                "name": "workflow",
+                "type": 1,
+                "options": [
+                    {
+                        "name": "status",
+                        "type": 1,
+                        "options": []
+                    }
+                ]
+            },
+            "guild_id": "1234567890",
+            "channel_id": "1234567890",
+            "user": {
+                "id": "1234567890",
+                "username": "tech_lead",
+                "discriminator": "0001",
+                "avatar": null
+            },
+            "token": "interaction_token",
+            "version": 1,
+            "locale": "en-US",
+            "entitlements": [],
+            "attachment_size_limit": 26214400
+        });
+
+        let cmd: serenity::model::application::CommandInteraction =
+            serde_json::from_value(json).expect("deserialize CommandInteraction");
+
+        let parsed = extract_workflow_subcommand_options(&cmd)
+            .expect("status without workflow_run_id must reach Runtime");
+
+        assert_eq!(parsed.subcommand, WorkflowSubcommand::Status);
+        assert_eq!(parsed.options.workflow_run_id, None);
+        assert_eq!(parsed.options.expected_revision, None);
+    }
+
+    #[test]
+    fn workflow_agents_without_workflow_run_id_is_accepted_for_runtime_resolution() {
+        let json = serde_json::json!({
+            "id": "1234567890",
+            "application_id": "1234567890",
+            "type": 2,
+            "data": {
+                "id": "1234567890",
+                "name": "workflow",
+                "type": 1,
+                "options": []
+            },
+            "guild_id": "1234567890",
+            "channel_id": "1234567890",
+            "user": {
+                "id": "1234567890",
+                "username": "tech_lead",
+                "discriminator": "0001",
+                "avatar": null
+            },
+            "token": "interaction_token",
+            "version": 1,
+            "locale": "en-US",
+            "entitlements": [],
+            "attachment_size_limit": 26214400
+        });
+
+        // Serenity requires the subcommand wrapper even with zero nested options.
+        let mut value = json;
+        value["data"]["options"] = serde_json::json!([
+            {
+                "name": "agents",
+                "type": 1,
+                "options": []
+            }
+        ]);
+
+        let cmd: serenity::model::application::CommandInteraction =
+            serde_json::from_value(value).expect("deserialize CommandInteraction");
+
+        let parsed = extract_workflow_subcommand_options(&cmd)
+            .expect("agents without workflow_run_id must reach Runtime");
+
+        assert_eq!(parsed.subcommand, WorkflowSubcommand::Agents);
+        assert_eq!(parsed.options.workflow_run_id, None);
+        assert_eq!(parsed.options.expected_revision, None);
+    }
+
+    #[test]
+    fn workflow_mutation_without_workflow_run_id_still_fails_closed() {
+        let json = serde_json::json!({
+            "id": "1234567890",
+            "application_id": "1234567890",
+            "type": 2,
+            "data": {
+                "id": "1234567890",
+                "name": "workflow",
+                "type": 1,
+                "options": [
+                    {
+                        "name": "reopen-work",
+                        "type": 1,
+                        "options": [
+                            {
+                                "name": "expected_revision",
+                                "type": 4,
+                                "value": 7
+                            },
+                            {
+                                "name": "reason",
+                                "type": 3,
+                                "value": "TECH_LEAD_POST_REVIEW_REOPEN"
+                            }
+                        ]
+                    }
+                ]
+            },
+            "guild_id": "1234567890",
+            "channel_id": "1234567890",
+            "user": {
+                "id": "1234567890",
+                "username": "tech_lead",
+                "discriminator": "0001",
+                "avatar": null
+            },
+            "token": "interaction_token",
+            "version": 1,
+            "locale": "en-US",
+            "entitlements": [],
+            "attachment_size_limit": 26214400
+        });
+
+        let cmd: serenity::model::application::CommandInteraction =
+            serde_json::from_value(json).expect("deserialize CommandInteraction");
+
+        match extract_workflow_subcommand_options(&cmd) {
+            Err(crate::workflow_command::AdapterRejectionReason::MissingWorkflowRunId) => {}
+            Err(other) => panic!("expected missing_workflow_run_id, got {}", other.token()),
+            Ok(_) => panic!("mutation without workflow_run_id must fail closed"),
+        }
     }
 
     #[test]
