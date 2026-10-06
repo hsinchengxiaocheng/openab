@@ -2268,9 +2268,10 @@ impl EventHandler for Handler {
             // through a thin OpenAB adapter (see
             // ``crate::workflow_command::WorkflowCommandAdapter``) into
             // AAP Runtime's existing ``/workflow`` slash-command path
-            // so Runtime remains the sole mutation authority. Every
-            // subcommand requires ``workflow_run_id``; mutations
-            // additionally require ``expected_revision`` and a
+            // so Runtime remains the sole mutation authority. Read-only
+            // subcommands may omit ``workflow_run_id`` and resolve it
+            // through canonical Discord conversation binding; mutations
+            // require ``workflow_run_id``, ``expected_revision`` and a
             // ``reason`` (plus ``correction_spec`` for
             // ``reopen-primary``, and the three canonical agent
             // identities for ``reconfigure``). Runtime owns the
@@ -2769,11 +2770,11 @@ fn workflow_command_discord_registration() -> CreateCommand {
     // shape stays one screen tall. The required/optional flags
     // match Runtime's structural-validation contract:
     //
-    //   * ``workflow_run_id`` — required on every subcommand.
-    //   * ``expected_revision`` — required only on mutation
-    //     subcommands. Read-only ``status`` / ``agents`` must work
-    //     without a CAS token so the operator can discover the
-    //     authoritative current revision before mutating.
+    //   * ``workflow_run_id`` — optional on read-only ``status`` /
+    //     ``agents`` so Runtime can resolve the canonical Discord
+    //     conversation/thread binding; required on mutation commands.
+    //   * ``expected_revision`` — optional on read-only ``status`` /
+    //     ``agents`` and required on mutation commands.
     //   * ``reason`` — required on every mutation subcommand.
     //   * ``correction_spec`` — required only on ``reopen-primary``.
     //   * ``primary``, ``verifier``, ``final_reviewer`` — required
@@ -2781,7 +2782,7 @@ fn workflow_command_discord_registration() -> CreateCommand {
     //   * ``binding`` — optional everywhere; Runtime forwards it
     //     to the B1 binding-identity check.
 
-    let workflow_run_id = || {
+    let workflow_run_id_required = || {
         CreateCommandOption::new(
             CommandOptionType::String,
             "workflow_run_id",
@@ -2789,13 +2790,29 @@ fn workflow_command_discord_registration() -> CreateCommand {
         )
         .required(true)
     };
-    let expected_revision = || {
+    let workflow_run_id_optional = || {
+        CreateCommandOption::new(
+            CommandOptionType::String,
+            "workflow_run_id",
+            "Optional WorkflowRun.run_id; Runtime resolves canonical Discord binding when omitted",
+        )
+        .required(false)
+    };
+    let expected_revision_required = || {
         CreateCommandOption::new(
             CommandOptionType::Integer,
             "expected_revision",
             "WorkflowRun.revision CAS token; Runtime rejects stale dispatches",
         )
         .required(true)
+    };
+    let expected_revision_optional = || {
+        CreateCommandOption::new(
+            CommandOptionType::Integer,
+            "expected_revision",
+            "Optional WorkflowRun.revision guard for read-only workflow inspection",
+        )
+        .required(false)
     };
     let reason = || {
         CreateCommandOption::new(
@@ -2851,7 +2868,8 @@ fn workflow_command_discord_registration() -> CreateCommand {
         "status",
         "Read the canonical Runtime snapshot for a WorkflowRun",
     )
-    .add_sub_option(workflow_run_id())
+    .add_sub_option(workflow_run_id_optional())
+    .add_sub_option(expected_revision_optional())
     .add_sub_option(binding());
 
     let agents_subcommand = CreateCommandOption::new(
@@ -2859,16 +2877,16 @@ fn workflow_command_discord_registration() -> CreateCommand {
         "agents",
         "List the canonical primary/verifier/final_reviewer tuple",
     )
-    .add_sub_option(workflow_run_id())
-    .add_sub_option(binding());
+    .add_sub_option(workflow_run_id_optional())
+    .add_sub_option(expected_revision_optional());
 
     let reopen_primary_subcommand = CreateCommandOption::new(
         CommandOptionType::SubCommand,
         "reopen-primary",
         "Bounded-defect correction (VERIFIER_ACTIVE → PRIMARY_ACTIVE)",
     )
-    .add_sub_option(workflow_run_id())
-    .add_sub_option(expected_revision())
+    .add_sub_option(workflow_run_id_required())
+    .add_sub_option(expected_revision_required())
     .add_sub_option(reason())
     .add_sub_option(correction_spec())
     .add_sub_option(binding());
@@ -2878,8 +2896,8 @@ fn workflow_command_discord_registration() -> CreateCommand {
         "reopen-work",
         "Tech Lead reopen of a TECH_LEAD_WAIT workflow run",
     )
-    .add_sub_option(workflow_run_id())
-    .add_sub_option(expected_revision())
+    .add_sub_option(workflow_run_id_required())
+    .add_sub_option(expected_revision_required())
     .add_sub_option(reason())
     .add_sub_option(binding());
 
@@ -2888,8 +2906,8 @@ fn workflow_command_discord_registration() -> CreateCommand {
         "reconfigure",
         "Reassign the canonical primary/verifier/final_reviewer tuple",
     )
-    .add_sub_option(workflow_run_id())
-    .add_sub_option(expected_revision())
+    .add_sub_option(workflow_run_id_required())
+    .add_sub_option(expected_revision_required())
     .add_sub_option(reason())
     .add_sub_option(primary())
     .add_sub_option(verifier())
@@ -7389,6 +7407,139 @@ mod tests {
             }
             Ok(_) => panic!("mutation without expected_revision must fail closed"),
         }
+    }
+
+    #[test]
+    fn workflow_command_registration_matches_runtime_contract() {
+        let payload = serde_json::to_value(workflow_command_discord_registration())
+            .expect("serialize /workflow registration descriptor");
+
+        assert_eq!(payload["name"], "workflow");
+
+        let command_description = payload["description"]
+            .as_str()
+            .expect("workflow command description");
+        assert!((1..=100).contains(&command_description.chars().count()));
+
+        let subcommands = payload["options"].as_array().expect("workflow subcommands");
+
+        let find_subcommand = |name: &str| {
+            subcommands
+                .iter()
+                .find(|item| item["name"] == name)
+                .unwrap_or_else(|| panic!("missing /workflow {name} subcommand"))
+        };
+
+        let option_map = |subcommand: &serde_json::Value| {
+            subcommand["options"]
+                .as_array()
+                .expect("subcommand options")
+                .iter()
+                .map(|option| {
+                    (
+                        option["name"].as_str().expect("option name").to_string(),
+                        option.clone(),
+                    )
+                })
+                .collect::<std::collections::HashMap<String, serde_json::Value>>()
+        };
+
+        let assert_description_lengths = |value: &serde_json::Value| {
+            let description = value["description"].as_str().expect("description");
+            assert!(
+                (1..=100).contains(&description.chars().count()),
+                "Discord description exceeds schema limit: {description:?}"
+            );
+        };
+
+        for subcommand in subcommands {
+            assert_description_lengths(subcommand);
+
+            if let Some(options) = subcommand["options"].as_array() {
+                for option in options {
+                    assert_description_lengths(option);
+                }
+            }
+        }
+
+        let status = option_map(find_subcommand("status"));
+        assert_eq!(status["workflow_run_id"]["required"].as_bool(), Some(false));
+        assert_eq!(
+            status["expected_revision"]["required"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(status["binding"]["required"].as_bool(), Some(false));
+        assert_eq!(status.len(), 3);
+
+        let agents = option_map(find_subcommand("agents"));
+        assert_eq!(agents["workflow_run_id"]["required"].as_bool(), Some(false));
+        assert_eq!(
+            agents["expected_revision"]["required"].as_bool(),
+            Some(false)
+        );
+        assert!(!agents.contains_key("binding"));
+        assert_eq!(agents.len(), 2);
+
+        let reopen_primary = option_map(find_subcommand("reopen-primary"));
+        for required in [
+            "workflow_run_id",
+            "expected_revision",
+            "reason",
+            "correction_spec",
+        ] {
+            assert_eq!(
+                reopen_primary[required]["required"].as_bool(),
+                Some(true),
+                "{required} must remain required for reopen-primary"
+            );
+        }
+        assert_eq!(reopen_primary["binding"]["required"].as_bool(), Some(false));
+        assert_eq!(reopen_primary.len(), 5);
+
+        let reopen_work = option_map(find_subcommand("reopen-work"));
+        for required in ["workflow_run_id", "expected_revision", "reason"] {
+            assert_eq!(
+                reopen_work[required]["required"].as_bool(),
+                Some(true),
+                "{required} must remain required for reopen-work"
+            );
+        }
+        assert_eq!(reopen_work["binding"]["required"].as_bool(), Some(false));
+        assert_eq!(reopen_work.len(), 4);
+
+        let reconfigure = option_map(find_subcommand("reconfigure"));
+        for required in [
+            "workflow_run_id",
+            "expected_revision",
+            "reason",
+            "primary",
+            "verifier",
+            "final_reviewer",
+        ] {
+            assert_eq!(
+                reconfigure[required]["required"].as_bool(),
+                Some(true),
+                "{required} must remain required for reconfigure"
+            );
+        }
+        assert_eq!(reconfigure["binding"]["required"].as_bool(), Some(false));
+        assert_eq!(reconfigure.len(), 7);
+
+        let names = subcommands
+            .iter()
+            .map(|subcommand| subcommand["name"].as_str().expect("subcommand name"))
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(
+            names,
+            std::collections::HashSet::from([
+                "status",
+                "agents",
+                "reopen-primary",
+                "reopen-work",
+                "reconfigure",
+            ])
+        );
     }
 
     #[test]
