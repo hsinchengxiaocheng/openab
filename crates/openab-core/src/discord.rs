@@ -2428,6 +2428,10 @@ impl EventHandler for Handler {
 /// Returned by :func:`extract_workflow_subcommand_options` so
 /// :func:`Handler::handle_workflow_command` can pass a typed bundle
 /// to the dispatcher.
+const WORKFLOW_RECONFIGURE_PRESET_OPTION: &str = "preset";
+const WORKFLOW_RECONFIGURE_PRESET_STANDARD: &str = "STANDARD_3_AGENT";
+const WORKFLOW_RECONFIGURE_PRESET_DEGRADED: &str = "DEGRADED_CODEX_GEMINI_2_AGENT";
+
 struct ParsedWorkflowCommand {
     subcommand: WorkflowSubcommand,
     /// Pre-flight validation surface only. The Runtime seam owns the
@@ -2490,10 +2494,34 @@ fn extract_workflow_subcommand_options(
         _ => return Err(AdapterRejectionReason::UnknownSubcommand),
     };
 
+    let reconfigure_preset = if subcommand == WorkflowSubcommand::Reconfigure {
+        sub_options
+            .iter()
+            .find(|opt| opt.name == WORKFLOW_RECONFIGURE_PRESET_OPTION)
+            .and_then(|opt| match &opt.value {
+                serenity::model::application::CommandDataOptionValue::String(value) => {
+                    Some(value.trim().to_string())
+                }
+                _ => None,
+            })
+            .filter(|value| !value.is_empty())
+    } else {
+        None
+    };
+
     let mut options = WorkflowCommandOptions::new();
 
     for opt in sub_options.iter() {
         let name = opt.name.as_str();
+
+        // ``preset`` is Discord/OpenAB presentation-only. It MUST
+        // never enter Runtime's canonical closed option vocabulary.
+        if subcommand == WorkflowSubcommand::Reconfigure
+            && name == WORKFLOW_RECONFIGURE_PRESET_OPTION
+        {
+            continue;
+        }
+
         match &opt.value {
             serenity::model::application::CommandDataOptionValue::String(s) => match name {
                 OPTION_WORKFLOW_RUN_ID => options.workflow_run_id = Some(s.clone()),
@@ -2592,11 +2620,13 @@ fn extract_workflow_subcommand_options(
             if workflow_run_id_missing {
                 return Err(AdapterRejectionReason::MissingWorkflowRunId);
             }
+
             if options.expected_revision.is_none() {
                 return Err(AdapterRejectionReason::MissingRequiredOption(
                     OPTION_EXPECTED_REVISION,
                 ));
             }
+
             if options
                 .reason
                 .as_ref()
@@ -2605,35 +2635,56 @@ fn extract_workflow_subcommand_options(
             {
                 return Err(AdapterRejectionReason::MissingRequiredOption(OPTION_REASON));
             }
-            if options
+
+            let primary_present = options
                 .primary
                 .as_ref()
-                .map(|s| s.trim().is_empty())
-                .unwrap_or(true)
-            {
-                return Err(AdapterRejectionReason::MissingRequiredOption(
-                    OPTION_PRIMARY,
-                ));
-            }
-            if options
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            let verifier_present = options
                 .verifier
                 .as_ref()
-                .map(|s| s.trim().is_empty())
-                .unwrap_or(true)
-            {
-                return Err(AdapterRejectionReason::MissingRequiredOption(
-                    OPTION_VERIFIER,
-                ));
-            }
-            if options
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            let final_reviewer_present = options
                 .final_reviewer
                 .as_ref()
-                .map(|s| s.trim().is_empty())
-                .unwrap_or(true)
-            {
-                return Err(AdapterRejectionReason::MissingRequiredOption(
-                    OPTION_FINAL_REVIEWER,
-                ));
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+
+            match reconfigure_preset.as_deref() {
+                Some(
+                    WORKFLOW_RECONFIGURE_PRESET_STANDARD | WORKFLOW_RECONFIGURE_PRESET_DEGRADED,
+                ) => {
+                    if primary_present || verifier_present || final_reviewer_present {
+                        return Err(AdapterRejectionReason::RuntimeMalformed(
+                            "reconfigure preset cannot be combined with manual primary/verifier/final_reviewer options"
+                                .to_string(),
+                        ));
+                    }
+                }
+                Some(other) => {
+                    return Err(AdapterRejectionReason::RuntimeMalformed(format!(
+                        "unsupported reconfigure preset: {other}"
+                    )));
+                }
+                None => {
+                    if !primary_present {
+                        return Err(AdapterRejectionReason::MissingRequiredOption(
+                            OPTION_PRIMARY,
+                        ));
+                    }
+                    if !verifier_present {
+                        return Err(AdapterRejectionReason::MissingRequiredOption(
+                            OPTION_VERIFIER,
+                        ));
+                    }
+                    if !final_reviewer_present {
+                        return Err(AdapterRejectionReason::MissingRequiredOption(
+                            OPTION_FINAL_REVIEWER,
+                        ));
+                    }
+                }
             }
         }
     }
@@ -2653,6 +2704,106 @@ fn extract_workflow_subcommand_options(
 /// Reinsert ONLY the canonical APPLICATION_COMMAND discriminator (2);
 /// every other field remains Serenity's serialization of the received
 /// interaction.
+fn expand_reconfigure_preset(
+    payload: &mut serde_json::Value,
+) -> Result<(), crate::workflow_command::AdapterRejectionReason> {
+    use crate::workflow_command::AdapterRejectionReason;
+
+    let Some(root_options) = payload
+        .get_mut("data")
+        .and_then(|data| data.get_mut("options"))
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+
+    let Some(reconfigure) = root_options.iter_mut().find(|option| {
+        option.get("name").and_then(serde_json::Value::as_str) == Some("reconfigure")
+    }) else {
+        return Ok(());
+    };
+
+    let options = reconfigure
+        .get_mut("options")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| {
+            AdapterRejectionReason::RuntimeMalformed(
+                "serialized reconfigure option block was not an array".to_string(),
+            )
+        })?;
+
+    let Some(preset_index) = options.iter().position(|option| {
+        option.get("name").and_then(serde_json::Value::as_str)
+            == Some(WORKFLOW_RECONFIGURE_PRESET_OPTION)
+    }) else {
+        // Manual mode is already canonical Runtime grammar.
+        return Ok(());
+    };
+
+    let preset = options[preset_index]
+        .get("value")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            AdapterRejectionReason::RuntimeMalformed(
+                "reconfigure preset value was not a string".to_string(),
+            )
+        })?;
+
+    let (primary, verifier, final_reviewer) = match preset {
+        WORKFLOW_RECONFIGURE_PRESET_STANDARD => ("ArthurClaude", "ArthurCodex", "ArthurGemini"),
+        WORKFLOW_RECONFIGURE_PRESET_DEGRADED => ("ArthurCodex", "ArthurGemini", "ArthurGemini"),
+        other => {
+            return Err(AdapterRejectionReason::RuntimeMalformed(format!(
+                "unsupported reconfigure preset: {other}"
+            )));
+        }
+    };
+
+    if options.iter().any(|option| {
+        matches!(
+            option.get("name").and_then(serde_json::Value::as_str),
+            Some("primary" | "verifier" | "final_reviewer")
+        )
+    }) {
+        return Err(AdapterRejectionReason::RuntimeMalformed(
+            "reconfigure preset cannot be combined with manual \
+primary/verifier/final_reviewer options"
+                .to_string(),
+        ));
+    }
+
+    options.remove(preset_index);
+
+    let canonical = [
+        serde_json::json!({
+            "name": "primary",
+            "type": 3,
+            "value": primary,
+        }),
+        serde_json::json!({
+            "name": "verifier",
+            "type": 3,
+            "value": verifier,
+        }),
+        serde_json::json!({
+            "name": "final_reviewer",
+            "type": 3,
+            "value": final_reviewer,
+        }),
+    ];
+
+    let insert_at = options
+        .iter()
+        .position(|option| {
+            option.get("name").and_then(serde_json::Value::as_str) == Some("binding")
+        })
+        .unwrap_or(options.len());
+
+    options.splice(insert_at..insert_at, canonical);
+
+    Ok(())
+}
+
 fn serialize_workflow_command_interaction(
     cmd: &serenity::model::application::CommandInteraction,
 ) -> Result<String, crate::workflow_command::AdapterRejectionReason> {
@@ -2669,6 +2820,8 @@ fn serialize_workflow_command_interaction(
     })?;
 
     object.insert("type".to_string(), serde_json::json!(2));
+
+    expand_reconfigure_preset(&mut payload)?;
 
     serde_json::to_string(&payload).map_err(|error| {
         crate::workflow_command::AdapterRejectionReason::RuntimeMalformed(format!(
@@ -2886,13 +3039,30 @@ fn workflow_command_discord_registration() -> CreateCommand {
         )
         .required(true)
     };
+    let reconfigure_preset = || {
+        CreateCommandOption::new(
+            CommandOptionType::String,
+            WORKFLOW_RECONFIGURE_PRESET_OPTION,
+            "Optional assisted topology preset; omit for manual agent selection",
+        )
+        .required(false)
+        .add_string_choice(
+            "Standard 3-agent: Claude / Codex / Gemini",
+            WORKFLOW_RECONFIGURE_PRESET_STANDARD,
+        )
+        .add_string_choice(
+            "Degraded 2-agent: Codex / Gemini shared review",
+            WORKFLOW_RECONFIGURE_PRESET_DEGRADED,
+        )
+    };
+
     let primary = || {
         CreateCommandOption::new(
             CommandOptionType::String,
             "primary",
             "Canonical primary agent identity (ArthurClaude|ArthurCodex|ArthurGemini)",
         )
-        .required(true)
+        .required(false)
         .add_string_choice("ArthurClaude", "ArthurClaude")
         .add_string_choice("ArthurCodex", "ArthurCodex")
         .add_string_choice("ArthurGemini", "ArthurGemini")
@@ -2903,7 +3073,7 @@ fn workflow_command_discord_registration() -> CreateCommand {
             "verifier",
             "Canonical verifier agent identity (ArthurClaude|ArthurCodex|ArthurGemini)",
         )
-        .required(true)
+        .required(false)
         .add_string_choice("ArthurClaude", "ArthurClaude")
         .add_string_choice("ArthurCodex", "ArthurCodex")
         .add_string_choice("ArthurGemini", "ArthurGemini")
@@ -2914,7 +3084,7 @@ fn workflow_command_discord_registration() -> CreateCommand {
             "final_reviewer",
             "Canonical final_reviewer agent identity (ArthurClaude|ArthurCodex|ArthurGemini)",
         )
-        .required(true)
+        .required(false)
         .add_string_choice("ArthurClaude", "ArthurClaude")
         .add_string_choice("ArthurCodex", "ArthurCodex")
         .add_string_choice("ArthurGemini", "ArthurGemini")
@@ -2974,6 +3144,7 @@ fn workflow_command_discord_registration() -> CreateCommand {
     .add_sub_option(workflow_run_id_required())
     .add_sub_option(expected_revision_required())
     .add_sub_option(reconfigure_reason())
+    .add_sub_option(reconfigure_preset())
     .add_sub_option(primary())
     .add_sub_option(verifier())
     .add_sub_option(final_reviewer())
@@ -7634,22 +7805,24 @@ WorkflowRun 'wfr-test' is terminal; topology reconfiguration refused."
         assert_eq!(reopen_work.len(), 4);
 
         let reconfigure = option_map(find_subcommand("reconfigure"));
-        for required in [
-            "workflow_run_id",
-            "expected_revision",
-            "reason",
-            "primary",
-            "verifier",
-            "final_reviewer",
-        ] {
+
+        for required in ["workflow_run_id", "expected_revision", "reason"] {
             assert_eq!(
                 reconfigure[required]["required"].as_bool(),
                 Some(true),
                 "{required} must remain required for reconfigure"
             );
         }
-        assert_eq!(reconfigure["binding"]["required"].as_bool(), Some(false));
-        assert_eq!(reconfigure.len(), 7);
+
+        for optional in ["preset", "primary", "verifier", "final_reviewer", "binding"] {
+            assert_eq!(
+                reconfigure[optional]["required"].as_bool(),
+                Some(false),
+                "{optional} must remain optional for assisted reconfigure"
+            );
+        }
+
+        assert_eq!(reconfigure.len(), 8);
 
         let choice_values = |option: &serde_json::Value| {
             option["choices"]
@@ -7683,6 +7856,14 @@ WorkflowRun 'wfr-test' is terminal; topology reconfiguration refused."
         );
 
         assert_eq!(
+            choice_values(&reconfigure["preset"]),
+            vec![
+                WORKFLOW_RECONFIGURE_PRESET_STANDARD.to_string(),
+                WORKFLOW_RECONFIGURE_PRESET_DEGRADED.to_string(),
+            ]
+        );
+
+        assert_eq!(
             choice_values(&reopen_primary["reason"]),
             vec!["BOUNDED_DEFECT_LOOP_TECH_LEAD_CORRECTION".to_string()]
         );
@@ -7707,6 +7888,157 @@ WorkflowRun 'wfr-test' is terminal; topology reconfiguration refused."
                 "reconfigure",
             ])
         );
+    }
+
+    #[test]
+    fn workflow_reconfigure_preset_expands_to_canonical_runtime_options() {
+        let json = serde_json::json!({
+            "id": "1234567890",
+            "application_id": "1234567890",
+            "type": 2,
+            "data": {
+                "id": "1234567890",
+                "name": "workflow",
+                "type": 1,
+                "options": [{
+                    "name": "reconfigure",
+                    "type": 1,
+                    "options": [
+                        {
+                            "name": "workflow_run_id",
+                            "type": 3,
+                            "value": "wfr-123"
+                        },
+                        {
+                            "name": "expected_revision",
+                            "type": 4,
+                            "value": 7
+                        },
+                        {
+                            "name": "reason",
+                            "type": 3,
+                            "value": "PROVIDER_UNAVAILABLE"
+                        },
+                        {
+                            "name": "preset",
+                            "type": 3,
+                            "value": "DEGRADED_CODEX_GEMINI_2_AGENT"
+                        }
+                    ]
+                }]
+            },
+            "guild_id": "1234567890",
+            "channel_id": "1234567890",
+            "user": {
+                "id": "1234567890",
+                "username": "tech_lead",
+                "discriminator": "0001",
+                "avatar": null
+            },
+            "token": "interaction_token",
+            "version": 1,
+            "locale": "en-US",
+            "entitlements": [],
+            "attachment_size_limit": 26214400
+        });
+
+        let cmd: serenity::model::application::CommandInteraction =
+            serde_json::from_value(json).expect("deserialize CommandInteraction");
+
+        extract_workflow_subcommand_options(&cmd)
+            .expect("preset-only reconfigure must pass OpenAB preflight");
+
+        let body =
+            serialize_workflow_command_interaction(&cmd).expect("serialize preset reconfigure");
+
+        let forwarded: serde_json::Value =
+            serde_json::from_str(&body).expect("parse forwarded interaction");
+
+        let options = forwarded["data"]["options"][0]["options"]
+            .as_array()
+            .expect("reconfigure options");
+
+        let value = |name: &str| {
+            options
+                .iter()
+                .find(|option| option["name"] == name)
+                .and_then(|option| option["value"].as_str())
+        };
+
+        assert_eq!(value("preset"), None);
+        assert_eq!(value("primary"), Some("ArthurCodex"));
+        assert_eq!(value("verifier"), Some("ArthurGemini"));
+        assert_eq!(value("final_reviewer"), Some("ArthurGemini"));
+        assert_eq!(value("reason"), Some("PROVIDER_UNAVAILABLE"));
+    }
+
+    #[test]
+    fn workflow_reconfigure_preset_rejects_mixed_manual_agents() {
+        let json = serde_json::json!({
+            "id": "1234567890",
+            "application_id": "1234567890",
+            "type": 2,
+            "data": {
+                "id": "1234567890",
+                "name": "workflow",
+                "type": 1,
+                "options": [{
+                    "name": "reconfigure",
+                    "type": 1,
+                    "options": [
+                        {
+                            "name": "workflow_run_id",
+                            "type": 3,
+                            "value": "wfr-123"
+                        },
+                        {
+                            "name": "expected_revision",
+                            "type": 4,
+                            "value": 7
+                        },
+                        {
+                            "name": "reason",
+                            "type": 3,
+                            "value": "PROVIDER_UNAVAILABLE"
+                        },
+                        {
+                            "name": "preset",
+                            "type": 3,
+                            "value": "STANDARD_3_AGENT"
+                        },
+                        {
+                            "name": "primary",
+                            "type": 3,
+                            "value": "ArthurClaude"
+                        }
+                    ]
+                }]
+            },
+            "guild_id": "1234567890",
+            "channel_id": "1234567890",
+            "user": {
+                "id": "1234567890",
+                "username": "tech_lead",
+                "discriminator": "0001",
+                "avatar": null
+            },
+            "token": "interaction_token",
+            "version": 1,
+            "locale": "en-US",
+            "entitlements": [],
+            "attachment_size_limit": 26214400
+        });
+
+        let cmd: serenity::model::application::CommandInteraction =
+            serde_json::from_value(json).expect("deserialize CommandInteraction");
+
+        match extract_workflow_subcommand_options(&cmd) {
+            Err(crate::workflow_command::AdapterRejectionReason::RuntimeMalformed(detail)) => {
+                assert!(detail.contains("preset cannot be combined with manual"));
+            }
+            Err(other) => panic!("expected mixed-mode rejection, got {}", other.token()),
+            Ok(_) => panic!("mixed preset/manual mode must fail closed"),
+        }
     }
 
     #[test]
