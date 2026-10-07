@@ -2619,6 +2619,20 @@ fn extract_workflow_subcommand_options(
                 return Err(AdapterRejectionReason::MissingRequiredOption(OPTION_REASON));
             }
         }
+        WorkflowSubcommand::Recover => {
+            // Recovery is a mutation, but Runtime may resolve the run
+            // from the canonical Discord thread binding and the durable
+            // intervention state machine owns idempotency. There is no
+            // WorkflowRun expected_revision CAS on this command.
+            if options
+                .reason
+                .as_ref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+            {
+                return Err(AdapterRejectionReason::MissingRequiredOption(OPTION_REASON));
+            }
+        }
         WorkflowSubcommand::Reconfigure => {
             if workflow_run_id_missing {
                 return Err(AdapterRejectionReason::MissingWorkflowRunId);
@@ -3021,6 +3035,16 @@ fn workflow_command_discord_registration() -> CreateCommand {
             "TECH_LEAD_POST_REVIEW_REOPEN",
         )
     };
+    let recover_reason = || {
+        CreateCommandOption::new(
+            CommandOptionType::String,
+            "reason",
+            "Canonical durable intervention recovery reason",
+        )
+        .required(true)
+        .add_string_choice("operator_recovery", "operator_recovery")
+    };
+
     let reconfigure_reason = || {
         CreateCommandOption::new(
             CommandOptionType::String,
@@ -3156,6 +3180,15 @@ fn workflow_command_discord_registration() -> CreateCommand {
     .add_sub_option(reopen_work_reason())
     .add_sub_option(binding());
 
+    let recover_subcommand = CreateCommandOption::new(
+        CommandOptionType::SubCommand,
+        "recover",
+        "Forward-complete durable topology interventions for this workflow",
+    )
+    .add_sub_option(workflow_run_id_optional())
+    .add_sub_option(recover_reason())
+    .add_sub_option(binding());
+
     let reconfigure_subcommand = CreateCommandOption::new(
         CommandOptionType::SubCommand,
         "reconfigure",
@@ -3178,6 +3211,7 @@ fn workflow_command_discord_registration() -> CreateCommand {
         .add_option(agents_subcommand)
         .add_option(reopen_primary_subcommand)
         .add_option(reopen_work_subcommand)
+        .add_option(recover_subcommand)
         .add_option(reconfigure_subcommand)
 }
 
@@ -7837,6 +7871,16 @@ WorkflowRun 'wfr-test' is terminal; topology reconfiguration refused."
         assert_eq!(reopen_work["binding"]["required"].as_bool(), Some(false));
         assert_eq!(reopen_work.len(), 4);
 
+        let recover = option_map(find_subcommand("recover"));
+        assert_eq!(
+            recover["workflow_run_id"]["required"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(recover["reason"]["required"].as_bool(), Some(true));
+        assert_eq!(recover["binding"]["required"].as_bool(), Some(false));
+        assert!(!recover.contains_key("expected_revision"));
+        assert_eq!(recover.len(), 3);
+
         let reconfigure = option_map(find_subcommand("reconfigure"));
 
         for required in ["workflow_run_id", "expected_revision", "reason"] {
@@ -7906,6 +7950,11 @@ WorkflowRun 'wfr-test' is terminal; topology reconfiguration refused."
             vec!["TECH_LEAD_POST_REVIEW_REOPEN".to_string()]
         );
 
+        assert_eq!(
+            choice_values(&recover["reason"]),
+            vec!["operator_recovery".to_string()]
+        );
+
         let names = subcommands
             .iter()
             .map(|subcommand| subcommand["name"].as_str().expect("subcommand name"))
@@ -7920,6 +7969,7 @@ WorkflowRun 'wfr-test' is terminal; topology reconfiguration refused."
                 "agents",
                 "reopen-primary",
                 "reopen-work",
+                "recover",
                 "reconfigure",
             ])
         );

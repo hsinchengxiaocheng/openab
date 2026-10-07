@@ -107,6 +107,7 @@ pub enum WorkflowSubcommand {
     Agents,
     ReopenPrimary,
     ReopenWork,
+    Recover,
     Reconfigure,
 }
 
@@ -120,6 +121,7 @@ impl WorkflowSubcommand {
             WorkflowSubcommand::Agents => "agents",
             WorkflowSubcommand::ReopenPrimary => "reopen-primary",
             WorkflowSubcommand::ReopenWork => "reopen-work",
+            WorkflowSubcommand::Recover => "recover",
             WorkflowSubcommand::Reconfigure => "reconfigure",
         }
     }
@@ -135,6 +137,7 @@ impl WorkflowSubcommand {
             "agents" => Some(WorkflowSubcommand::Agents),
             "reopen-primary" => Some(WorkflowSubcommand::ReopenPrimary),
             "reopen-work" => Some(WorkflowSubcommand::ReopenWork),
+            "recover" => Some(WorkflowSubcommand::Recover),
             "reconfigure" => Some(WorkflowSubcommand::Reconfigure),
             _ => None,
         }
@@ -148,6 +151,7 @@ impl WorkflowSubcommand {
             self,
             WorkflowSubcommand::ReopenPrimary
                 | WorkflowSubcommand::ReopenWork
+                | WorkflowSubcommand::Recover
                 | WorkflowSubcommand::Reconfigure
         )
     }
