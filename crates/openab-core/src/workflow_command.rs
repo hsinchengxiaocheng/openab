@@ -97,11 +97,12 @@ pub const DISCORD_NATIVE_INTERACTION_KEY_ENV: &str = "ARTHUR_OPENAB_DISCORD_NATI
 ///
 /// Mirrors :class:`runtime.integrations.workflow_command_router.WorkflowCommandName`
 /// in AAP Runtime. The string form is the canonical Discord subcommand
-/// name (``status`` / ``agents`` / ``reopen-primary`` / ``reopen-work``
-/// / ``reconfigure``).
+/// name (``status`` / ``diagnose`` / ``agents`` / ``reopen-primary`` /
+/// ``reopen-work`` / ``reconfigure``).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkflowSubcommand {
     Status,
+    Diagnose,
     Agents,
     ReopenPrimary,
     ReopenWork,
@@ -113,6 +114,7 @@ impl WorkflowSubcommand {
     pub fn as_str(&self) -> &'static str {
         match self {
             WorkflowSubcommand::Status => "status",
+            WorkflowSubcommand::Diagnose => "diagnose",
             WorkflowSubcommand::Agents => "agents",
             WorkflowSubcommand::ReopenPrimary => "reopen-primary",
             WorkflowSubcommand::ReopenWork => "reopen-work",
@@ -126,6 +128,7 @@ impl WorkflowSubcommand {
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "status" => Some(WorkflowSubcommand::Status),
+            "diagnose" => Some(WorkflowSubcommand::Diagnose),
             "agents" => Some(WorkflowSubcommand::Agents),
             "reopen-primary" => Some(WorkflowSubcommand::ReopenPrimary),
             "reopen-work" => Some(WorkflowSubcommand::ReopenWork),
@@ -972,6 +975,7 @@ mod tests {
     fn subcommand_round_trip() {
         for sc in [
             WorkflowSubcommand::Status,
+            WorkflowSubcommand::Diagnose,
             WorkflowSubcommand::Agents,
             WorkflowSubcommand::ReopenPrimary,
             WorkflowSubcommand::ReopenWork,
@@ -992,8 +996,10 @@ mod tests {
     #[test]
     fn mutation_classification_matches_runtime() {
         // Runtime gates only ``reopen-*`` and ``reconfigure`` as
-        // mutation commands; ``status`` and ``agents`` are read-only.
+        // mutation commands; ``status``, ``diagnose``, and ``agents``
+        // are read-only.
         assert!(!WorkflowSubcommand::Status.is_mutation());
+        assert!(!WorkflowSubcommand::Diagnose.is_mutation());
         assert!(!WorkflowSubcommand::Agents.is_mutation());
         assert!(WorkflowSubcommand::ReopenPrimary.is_mutation());
         assert!(WorkflowSubcommand::ReopenWork.is_mutation());
@@ -1011,6 +1017,20 @@ mod tests {
         };
         let text = build_slash_command_message(WorkflowSubcommand::Status, &opts).unwrap();
         assert_eq!(text, "/workflow status wfr-123 --binding binding-abc");
+    }
+
+    #[test]
+    fn build_diagnose_without_expected_revision() {
+        let opts = WorkflowCommandOptions {
+            workflow_run_id: Some("wfr-diagnose".to_string()),
+            binding: Some("binding-diagnose".to_string()),
+            ..WorkflowCommandOptions::default()
+        };
+        let text = build_slash_command_message(WorkflowSubcommand::Diagnose, &opts).unwrap();
+        assert_eq!(
+            text,
+            "/workflow diagnose wfr-diagnose --binding binding-diagnose"
+        );
     }
 
     #[test]
