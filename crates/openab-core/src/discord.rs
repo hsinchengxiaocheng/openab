@@ -3185,8 +3185,8 @@ fn workflow_command_discord_registration() -> CreateCommand {
         "recover",
         "Forward-complete durable topology interventions for this workflow",
     )
-    .add_sub_option(workflow_run_id_optional())
     .add_sub_option(recover_reason())
+    .add_sub_option(workflow_run_id_optional())
     .add_sub_option(binding());
 
     let reconfigure_subcommand = CreateCommandOption::new(
@@ -7809,8 +7809,23 @@ WorkflowRun 'wfr-test' is terminal; topology reconfiguration refused."
             assert_description_lengths(subcommand);
 
             if let Some(options) = subcommand["options"].as_array() {
+                let mut optional_seen = false;
+
                 for option in options {
                     assert_description_lengths(option);
+
+                    let required = option["required"].as_bool().unwrap_or(false);
+
+                    if required {
+                        assert!(
+                            !optional_seen,
+                            "Discord requires required options before optional options: \
+                             subcommand={:?} option={:?}",
+                            subcommand["name"], option["name"]
+                        );
+                    } else {
+                        optional_seen = true;
+                    }
                 }
             }
         }
