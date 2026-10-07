@@ -2841,13 +2841,29 @@ fn workflow_command_discord_registration() -> CreateCommand {
         )
         .required(false)
     };
-    let reason = || {
+    let reopen_primary_reason = || {
         CreateCommandOption::new(
             CommandOptionType::String,
             "reason",
-            "Canonical reason token (see Runtime SUPPORTED_*_REASONS)",
+            "Canonical bounded-defect reopen-primary reason",
         )
         .required(true)
+        .add_string_choice(
+            "BOUNDED_DEFECT_LOOP_TECH_LEAD_CORRECTION",
+            "BOUNDED_DEFECT_LOOP_TECH_LEAD_CORRECTION",
+        )
+    };
+    let reopen_work_reason = || {
+        CreateCommandOption::new(
+            CommandOptionType::String,
+            "reason",
+            "Canonical post-review reopen-work reason",
+        )
+        .required(true)
+        .add_string_choice(
+            "TECH_LEAD_POST_REVIEW_REOPEN",
+            "TECH_LEAD_POST_REVIEW_REOPEN",
+        )
     };
     let reconfigure_reason = || {
         CreateCommandOption::new(
@@ -2936,7 +2952,7 @@ fn workflow_command_discord_registration() -> CreateCommand {
     )
     .add_sub_option(workflow_run_id_required())
     .add_sub_option(expected_revision_required())
-    .add_sub_option(reason())
+    .add_sub_option(reopen_primary_reason())
     .add_sub_option(correction_spec())
     .add_sub_option(binding());
 
@@ -2947,7 +2963,7 @@ fn workflow_command_discord_registration() -> CreateCommand {
     )
     .add_sub_option(workflow_run_id_required())
     .add_sub_option(expected_revision_required())
-    .add_sub_option(reason())
+    .add_sub_option(reopen_work_reason())
     .add_sub_option(binding());
 
     let reconfigure_subcommand = CreateCommandOption::new(
@@ -7666,20 +7682,14 @@ WorkflowRun 'wfr-test' is terminal; topology reconfiguration refused."
             ]
         );
 
-        let has_static_choices = |option: &serde_json::Value| {
-            option
-                .get("choices")
-                .and_then(|choices| choices.as_array())
-                .is_some_and(|choices| !choices.is_empty())
-        };
-
-        assert!(
-            !has_static_choices(&reopen_primary["reason"]),
-            "reopen-primary reason vocabulary must remain Runtime-owned"
+        assert_eq!(
+            choice_values(&reopen_primary["reason"]),
+            vec!["BOUNDED_DEFECT_LOOP_TECH_LEAD_CORRECTION".to_string()]
         );
-        assert!(
-            !has_static_choices(&reopen_work["reason"]),
-            "reopen-work reason vocabulary must remain Runtime-owned"
+
+        assert_eq!(
+            choice_values(&reopen_work["reason"]),
+            vec!["TECH_LEAD_POST_REVIEW_REOPEN".to_string()]
         );
 
         let names = subcommands
