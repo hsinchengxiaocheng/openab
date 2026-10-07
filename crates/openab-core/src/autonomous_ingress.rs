@@ -575,6 +575,10 @@ pub struct AutonomousIngressCandidate {
 pub struct AutonomousIngressRequest {
     pub protocol: &'static str, // "openab"
     pub project_id: String,
+    /// Canonical project root paired with a trusted thread-pinned project.
+    /// Absent for legacy and anonymous-workspace ingress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<String>,
     pub transport: &'static str, // "DISCORD"
     pub conversation_key: String,
     /// Phase 6.4.6 — typed **original** human prompt at the moment
@@ -1215,6 +1219,7 @@ mod tests {
         let req = AutonomousIngressRequest {
             protocol: "openab",
             project_id: "arthur-ai-platform".into(),
+            project_root: None,
             transport: "DISCORD",
             conversation_key: "discord:thread-1".into(),
             original_human_prompt: "do the work".into(),
@@ -1246,6 +1251,37 @@ mod tests {
             !obj.contains_key("final_reviewer_agent"),
             "implicit topology must omit final_reviewer_agent"
         );
+        assert!(
+            !obj.contains_key("project_root"),
+            "legacy unpinned ingress must omit project_root"
+        );
+    }
+
+    #[test]
+    fn autonomous_ingress_request_serializes_trusted_project_root_when_present() {
+        let req = AutonomousIngressRequest {
+            protocol: "openab",
+            project_id: "openab".into(),
+            project_root: Some("/canonical/openab/worktree".into()),
+            transport: "DISCORD",
+            conversation_key: "discord:thread-1".into(),
+            original_human_prompt: "do the work".into(),
+            user_objective: "do the work".into(),
+            title: None,
+            trace_id: "trace-project-root".into(),
+            task_id: None,
+            target_workflow_id: None,
+            primary_agent: None,
+            verifier_agent: None,
+            final_reviewer_agent: None,
+            language: None,
+            metadata: AutonomousIngressMetadata::default(),
+            delivery_destination: None,
+        };
+
+        let value = serde_json::to_value(&req).expect("serialize");
+        assert_eq!(value["project_id"], "openab");
+        assert_eq!(value["project_root"], "/canonical/openab/worktree");
     }
 
     #[test]
@@ -1404,6 +1440,7 @@ mod tests {
         let req = AutonomousIngressRequest {
             protocol: "openab",
             project_id: "arthur-ai-platform".into(),
+            project_root: None,
             transport: "DISCORD",
             conversation_key: "discord:c:1".into(),
             original_human_prompt: "fix it".into(),
@@ -1430,6 +1467,7 @@ mod tests {
         let req = AutonomousIngressRequest {
             protocol: "openab",
             project_id: "arthur-ai-platform".into(),
+            project_root: None,
             transport: "DISCORD",
             conversation_key: "discord:c:1".into(),
             original_human_prompt: "fix it".into(),
@@ -1554,6 +1592,7 @@ mod tests {
         let req = AutonomousIngressRequest {
             protocol: "openab",
             project_id: "arthur-ai-platform".into(),
+            project_root: None,
             transport: "DISCORD",
             conversation_key: "discord:c:1".into(),
             original_human_prompt: "do the work".into(),
@@ -1584,6 +1623,7 @@ mod tests {
         let req = AutonomousIngressRequest {
             protocol: "openab",
             project_id: "arthur-ai-platform".into(),
+            project_root: None,
             transport: "DISCORD",
             conversation_key: "discord:c:1".into(),
             original_human_prompt: "Canonical title: Phase 7.1 — Obsidian MCP\n\ndo the work"
@@ -1619,6 +1659,7 @@ mod tests {
         let req = AutonomousIngressRequest {
             protocol: "openab",
             project_id: "arthur-ai-platform".into(),
+            project_root: None,
             transport: "DISCORD",
             conversation_key: "discord:c:1".into(),
             original_human_prompt: "no header here".into(),
@@ -1688,6 +1729,7 @@ mod tests {
         let req = AutonomousIngressRequest {
             protocol: "openab",
             project_id: "arthur-ai-platform".into(),
+            project_root: None,
             transport: "DISCORD",
             conversation_key: "discord:c:1".into(),
             original_human_prompt: original.into(),
@@ -1972,6 +2014,7 @@ mod tests {
         let req = AutonomousIngressRequest {
             protocol: "openab",
             project_id: "arthur-ai-platform".into(),
+            project_root: None,
             transport: "DISCORD",
             conversation_key: "discord:c:1".into(),
             original_human_prompt: prompt_text.into(),
@@ -2026,6 +2069,7 @@ mod tests {
         let req = AutonomousIngressRequest {
             protocol: "openab",
             project_id: "arthur-ai-platform".into(),
+            project_root: None,
             transport: "DISCORD",
             conversation_key: "discord:c:1".into(),
             original_human_prompt: prompt_text.into(),
@@ -2378,6 +2422,7 @@ mod phase8_continuation_identity_tests {
         let req = AutonomousIngressRequest {
             protocol: "openab",
             project_id: "arthur-ai-platform".into(),
+            project_root: None,
             transport: "DISCORD",
             conversation_key: "discord:c:1".into(),
             original_human_prompt: "Canonical workflow: wfr629e138f1defa7e9\n\ndo the work".into(),
@@ -2409,6 +2454,7 @@ mod phase8_continuation_identity_tests {
         let req = AutonomousIngressRequest {
             protocol: "openab",
             project_id: "arthur-ai-platform".into(),
+            project_root: None,
             transport: "DISCORD",
             conversation_key: "discord:c:1".into(),
             original_human_prompt: "do the work".into(),

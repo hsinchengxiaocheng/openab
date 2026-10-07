@@ -218,6 +218,12 @@ pub trait DispatchTarget: Send + Sync + 'static {
     /// do not pin and therefore return `None`.
     async fn pinned_project_root(&self, session_key: &str) -> Option<std::path::PathBuf>;
 
+    /// Return the complete trusted project context pinned for this session.
+    /// Anonymous workspace hints are not pinned project authority.
+    async fn pinned_project(&self, _session_key: &str) -> Option<ProjectContext> {
+        None
+    }
+
     /// Return the set of Discord numeric user IDs authorised as the
     /// Tech Lead for the A13 workflow-role bypass path. Sourced
     /// from `[workflow] tech_lead_user_ids` in `config.toml`. Empty
@@ -328,10 +334,13 @@ impl DispatchTarget for AdapterRouter {
     }
 
     async fn pinned_project_root(&self, session_key: &str) -> Option<std::path::PathBuf> {
-        self.pool()
-            .get_pinned_project(session_key)
+        self.pinned_project(session_key)
             .await
             .map(|p| p.project_root)
+    }
+
+    async fn pinned_project(&self, session_key: &str) -> Option<ProjectContext> {
+        self.pool().get_pinned_project(session_key).await
     }
 
     fn tech_lead_user_ids(&self) -> std::collections::HashSet<u64> {
@@ -1723,9 +1732,18 @@ async fn dispatch_batch(
                 // this fix and still ship a ``language`` string
                 // are honored verbatim.
                 let language: Option<String> = None;
+                let pinned_project = target.pinned_project(&session_key).await;
                 let request = crate::autonomous_ingress::AutonomousIngressRequest {
                     protocol: "openab",
-                    project_id: aap_cfg.map(|c| c.project_id.clone()).unwrap_or_default(),
+                    project_id: pinned_project
+                        .as_ref()
+                        .map(|project| project.project_id.clone())
+                        .unwrap_or_else(|| {
+                            aap_cfg.map(|c| c.project_id.clone()).unwrap_or_default()
+                        }),
+                    project_root: pinned_project
+                        .as_ref()
+                        .map(|project| project.project_root.display().to_string()),
                     transport: "DISCORD",
                     conversation_key: thread_channel.session_pool_key(),
                     original_human_prompt,
@@ -2835,6 +2853,7 @@ mod tests {
         /// Phase 6.4: optional daemon agent identity override (when not
         /// driven by `ARTHUR_AGENT_NAME`).
         autonomous_ingress_agent_identity: Option<String>,
+        pinned_project: Option<ProjectContext>,
         /// Phase 6.4: Tech Lead user-id set consulted by the A13 gate's
         /// `is_tech_lead_authorized` check.
         tech_lead_user_ids: std::collections::HashSet<u64>,
@@ -2855,6 +2874,7 @@ mod tests {
                 autonomous_ingress_config: None,
                 workflow_reopen_client: None,
                 autonomous_ingress_agent_identity: None,
+                pinned_project: None,
                 tech_lead_user_ids: std::collections::HashSet::new(),
             }
         }
@@ -2909,6 +2929,11 @@ mod tests {
             self.tech_lead_user_ids = ids;
             self
         }
+
+        fn with_pinned_project(mut self, project: ProjectContext) -> Self {
+            self.pinned_project = Some(project);
+            self
+        }
     }
 
     #[async_trait]
@@ -2944,7 +2969,11 @@ mod tests {
         async fn reset_session(&self, _session_key: &str) {}
 
         async fn pinned_project_root(&self, _session_key: &str) -> Option<std::path::PathBuf> {
-            None
+            self.pinned_project.as_ref().map(|p| p.project_root.clone())
+        }
+
+        async fn pinned_project(&self, _session_key: &str) -> Option<ProjectContext> {
+            self.pinned_project.clone()
         }
 
         fn tech_lead_user_ids(&self) -> std::collections::HashSet<u64> {
@@ -5090,6 +5119,40 @@ mod tests {
         mock.calls()
     }
 
+    async fn run_phase64_with_pinned_project(
+        msg: BufferedMessage,
+        client: Arc<dyn crate::autonomous_ingress::AutonomousIngressClient>,
+        config: crate::config::AutonomousIngressConfig,
+        agent: &str,
+        tech_lead_ids: std::collections::HashSet<u64>,
+        project: ProjectContext,
+    ) -> Vec<RecordedDispatch> {
+        let mock = Arc::new(
+            MockDispatchTarget::new()
+                .with_autonomous_ingress(client, config, agent)
+                .with_tech_lead_user_ids(tech_lead_ids)
+                .with_pinned_project(project),
+        );
+        let target: Arc<dyn DispatchTarget> = mock.clone();
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let (tx, rx) = tokio::sync::mpsc::channel::<BufferedMessage>(1);
+        tx.send(msg).await.unwrap();
+        drop(tx);
+        consumer_loop(
+            "mock:T".into(),
+            make_channel("T"),
+            rx,
+            target,
+            None,
+            adapter,
+            1,
+            100,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        mock.calls()
+    }
+
     /// Phase 6.4.9 (Round 2) — multi-message variant of
     /// ``run_phase64``. Drives the same dispatch loop with a
     /// pre-populated mpsc holding a batch of multiple
@@ -6324,6 +6387,49 @@ mod tests {
             recorded.final_reviewer_agent, None,
             "implicit topology must leave FINAL_REVIEWER authority to AAP Runtime"
         );
+        assert_eq!(
+            recorded.project_root, None,
+            "legacy unpinned ingress must not invent a project root"
+        );
+    }
+
+    #[tokio::test]
+    async fn phase64_pinned_project_context_overrides_config_and_reaches_ingress() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let canonical_root = std::fs::canonicalize(directory.path()).expect("canonical root");
+        let tech_lead_id: u64 = 645496545805991947;
+        let mut tech_lead_ids = std::collections::HashSet::new();
+        tech_lead_ids.insert(tech_lead_id);
+        let fake = crate::autonomous_ingress::FakeAutonomousIngressClient::always_accept();
+        let client: Arc<dyn crate::autonomous_ingress::AutonomousIngressClient> = fake.clone();
+
+        let calls = run_phase64_with_pinned_project(
+            make_msg_with_sender(
+                "run the pinned project",
+                10,
+                tech_lead_sender_json(tech_lead_id),
+            ),
+            client,
+            phase64_config(&["ArthurClaude"], false),
+            "ArthurClaude",
+            tech_lead_ids,
+            ProjectContext {
+                project_id: "openab".into(),
+                project_root: canonical_root.clone(),
+            },
+        )
+        .await;
+
+        assert!(
+            calls.is_empty(),
+            "accepted ingress must suppress ordinary ACP"
+        );
+        let recorded = &fake.calls.lock().unwrap()[0];
+        assert_eq!(recorded.project_id, "openab");
+        assert_eq!(
+            recorded.project_root.as_deref(),
+            Some(canonical_root.to_string_lossy().as_ref())
+        );
     }
 
     #[tokio::test]
@@ -6990,6 +7096,7 @@ mod tests {
         let req = crate::autonomous_ingress::AutonomousIngressRequest {
             protocol: "openab",
             project_id: "openab".into(),
+            project_root: None,
             transport: "DISCORD",
             conversation_key: "discord:c:1".into(),
             original_human_prompt: prompt_text.into(),
@@ -7033,6 +7140,7 @@ mod tests {
         let req = crate::autonomous_ingress::AutonomousIngressRequest {
             protocol: "openab",
             project_id: "openab".into(),
+            project_root: None,
             transport: "DISCORD",
             conversation_key: "discord:c:1".into(),
             original_human_prompt: prompt_text.into(),
@@ -7118,6 +7226,7 @@ mod tests {
         let req = crate::autonomous_ingress::AutonomousIngressRequest {
             protocol: "openab",
             project_id: "openab".into(),
+            project_root: None,
             transport: "DISCORD",
             conversation_key: "discord:c:1".into(),
             original_human_prompt: prompt_text.into(),
@@ -7507,6 +7616,7 @@ mod tests {
         let req = crate::autonomous_ingress::AutonomousIngressRequest {
             protocol: "openab",
             project_id: "openab".into(),
+            project_root: None,
             transport: "DISCORD",
             conversation_key: "discord:c:1".into(),
             original_human_prompt: prompt_text.into(),
