@@ -2568,7 +2568,10 @@ fn extract_workflow_subcommand_options(
         // Read-only commands may omit workflow_run_id. AAP Runtime
         // resolves the authoritative WorkflowRun from the canonical
         // Discord conversation/thread binding.
-        WorkflowSubcommand::Status | WorkflowSubcommand::Diagnose | WorkflowSubcommand::Agents => {}
+        WorkflowSubcommand::Status
+        | WorkflowSubcommand::Diagnose
+        | WorkflowSubcommand::History
+        | WorkflowSubcommand::Agents => {}
 
         WorkflowSubcommand::ReopenPrimary => {
             if workflow_run_id_missing {
@@ -2935,8 +2938,8 @@ fn render_runtime_response(payload: &serde_json::Value) -> Option<String> {
 
 /// Build the bounded ``/workflow`` Discord Application Command
 /// registration. Returns a single :class:`serenity::builder::CreateCommand`
-/// carrying six ``SubCommand`` options (`status`, `diagnose`, `agents`,
-/// `reopen-primary`, `reopen-work`, `reconfigure`).
+/// carrying seven ``SubCommand`` options (`status`, `diagnose`, `history`,
+/// `agents`, `reopen-primary`, `reopen-work`, `reconfigure`).
 ///
 /// The closed option grammar mirrors Runtime's
 /// :func:`runtime.integrations.workflow_command_router.parse_workflow_slash_command`
@@ -2951,10 +2954,10 @@ fn workflow_command_discord_registration() -> CreateCommand {
     // match Runtime's structural-validation contract:
     //
     //   * ``workflow_run_id`` — optional on read-only ``status`` /
-    //     ``diagnose`` / ``agents`` so Runtime can resolve the canonical Discord
+    //     ``diagnose`` / ``history`` / ``agents`` so Runtime can resolve the canonical Discord
     //     conversation/thread binding; required on mutation commands.
     //   * ``expected_revision`` — optional on read-only ``status`` /
-    //     ``diagnose`` / ``agents`` and required on mutation commands.
+    //     ``diagnose`` / ``history`` / ``agents`` and required on mutation commands.
     //   * ``reason`` — required on every mutation subcommand.
     //   * ``correction_spec`` — required only on ``reopen-primary``.
     //   * ``primary``, ``verifier``, ``final_reviewer`` — required
@@ -3115,6 +3118,15 @@ fn workflow_command_discord_registration() -> CreateCommand {
     .add_sub_option(workflow_run_id_optional())
     .add_sub_option(expected_revision_optional());
 
+    let history_subcommand = CreateCommandOption::new(
+        CommandOptionType::SubCommand,
+        "history",
+        "Show the five most recent workflow-control audit events",
+    )
+    .add_sub_option(workflow_run_id_optional())
+    .add_sub_option(expected_revision_optional())
+    .add_sub_option(binding());
+
     let agents_subcommand = CreateCommandOption::new(
         CommandOptionType::SubCommand,
         "agents",
@@ -3162,6 +3174,7 @@ fn workflow_command_discord_registration() -> CreateCommand {
         .description("M24 Phase 1.7 workflow control surface (Tech Lead only)")
         .add_option(status_subcommand)
         .add_option(diagnose_subcommand)
+        .add_option(history_subcommand)
         .add_option(agents_subcommand)
         .add_option(reopen_primary_subcommand)
         .add_option(reopen_work_subcommand)
@@ -7903,6 +7916,7 @@ WorkflowRun 'wfr-test' is terminal; topology reconfiguration refused."
             std::collections::HashSet::from([
                 "status",
                 "diagnose",
+                "history",
                 "agents",
                 "reopen-primary",
                 "reopen-work",
@@ -8169,6 +8183,75 @@ WorkflowRun 'wfr-test' is terminal; topology reconfiguration refused."
         let diagnose_options = root_options[0]["options"]
             .as_array()
             .expect("diagnose options");
+        assert!(
+            diagnose_options.is_empty(),
+            "omitted workflow identity must remain omitted on native serialization"
+        );
+    }
+
+    #[test]
+    fn workflow_history_without_workflow_run_id_is_accepted_for_runtime_resolution() {
+        let json = serde_json::json!({
+            "id": "1234567890",
+            "application_id": "1234567890",
+            "type": 2,
+            "data": {
+                "id": "1234567890",
+                "name": "workflow",
+                "type": 1,
+                "options": [
+                    {
+                        "name": "history",
+                        "type": 1,
+                        "options": []
+                    }
+                ]
+            },
+            "guild_id": "1234567890",
+            "channel_id": "1234567890",
+            "user": {
+                "id": "1234567890",
+                "username": "tech_lead",
+                "discriminator": "0001",
+                "avatar": null
+            },
+            "token": "interaction_token",
+            "version": 1,
+            "locale": "en-US",
+            "entitlements": [],
+            "attachment_size_limit": 26214400
+        });
+
+        let cmd: serenity::model::application::CommandInteraction =
+            serde_json::from_value(json).expect("deserialize CommandInteraction");
+
+        let parsed = extract_workflow_subcommand_options(&cmd)
+            .expect("history without workflow_run_id must reach Runtime");
+
+        assert_eq!(parsed.subcommand, WorkflowSubcommand::History);
+        assert_eq!(parsed.options.workflow_run_id, None);
+        assert_eq!(parsed.options.expected_revision, None);
+
+        // The production handler forwards the serialized native
+        // CommandInteraction directly to AAP Runtime. Omitted read
+        // identity must remain omitted here; OpenAB must not invent
+        // a WorkflowRun identity before Runtime binding resolution.
+        let serialized =
+            serialize_workflow_command_interaction(&cmd).expect("serialize history interaction");
+        let payload: serde_json::Value =
+            serde_json::from_str(&serialized).expect("decode serialized history interaction");
+
+        assert_eq!(payload["type"], serde_json::json!(2));
+
+        let root_options = payload["data"]["options"]
+            .as_array()
+            .expect("workflow root options");
+        assert_eq!(root_options.len(), 1);
+        assert_eq!(root_options[0]["name"], "history");
+
+        let diagnose_options = root_options[0]["options"]
+            .as_array()
+            .expect("history options");
         assert!(
             diagnose_options.is_empty(),
             "omitted workflow identity must remain omitted on native serialization"

@@ -103,6 +103,7 @@ pub const DISCORD_NATIVE_INTERACTION_KEY_ENV: &str = "ARTHUR_OPENAB_DISCORD_NATI
 pub enum WorkflowSubcommand {
     Status,
     Diagnose,
+    History,
     Agents,
     ReopenPrimary,
     ReopenWork,
@@ -115,6 +116,7 @@ impl WorkflowSubcommand {
         match self {
             WorkflowSubcommand::Status => "status",
             WorkflowSubcommand::Diagnose => "diagnose",
+            WorkflowSubcommand::History => "history",
             WorkflowSubcommand::Agents => "agents",
             WorkflowSubcommand::ReopenPrimary => "reopen-primary",
             WorkflowSubcommand::ReopenWork => "reopen-work",
@@ -129,6 +131,7 @@ impl WorkflowSubcommand {
         match name {
             "status" => Some(WorkflowSubcommand::Status),
             "diagnose" => Some(WorkflowSubcommand::Diagnose),
+            "history" => Some(WorkflowSubcommand::History),
             "agents" => Some(WorkflowSubcommand::Agents),
             "reopen-primary" => Some(WorkflowSubcommand::ReopenPrimary),
             "reopen-work" => Some(WorkflowSubcommand::ReopenWork),
@@ -976,6 +979,7 @@ mod tests {
         for sc in [
             WorkflowSubcommand::Status,
             WorkflowSubcommand::Diagnose,
+            WorkflowSubcommand::History,
             WorkflowSubcommand::Agents,
             WorkflowSubcommand::ReopenPrimary,
             WorkflowSubcommand::ReopenWork,
@@ -1000,6 +1004,7 @@ mod tests {
         // are read-only.
         assert!(!WorkflowSubcommand::Status.is_mutation());
         assert!(!WorkflowSubcommand::Diagnose.is_mutation());
+        assert!(!WorkflowSubcommand::History.is_mutation());
         assert!(!WorkflowSubcommand::Agents.is_mutation());
         assert!(WorkflowSubcommand::ReopenPrimary.is_mutation());
         assert!(WorkflowSubcommand::ReopenWork.is_mutation());
@@ -1030,6 +1035,22 @@ mod tests {
         assert_eq!(
             text,
             "/workflow diagnose wfr-diagnose --binding binding-diagnose"
+        );
+    }
+
+    #[test]
+    fn build_history_without_expected_revision() {
+        let opts = WorkflowCommandOptions {
+            workflow_run_id: Some("wfr-history".to_string()),
+            binding: Some("binding-history".to_string()),
+            ..WorkflowCommandOptions::default()
+        };
+
+        let text = build_slash_command_message(WorkflowSubcommand::History, &opts).unwrap();
+
+        assert_eq!(
+            text,
+            "/workflow history wfr-history --binding binding-history"
         );
     }
 
