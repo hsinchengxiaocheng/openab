@@ -1209,10 +1209,56 @@ async fn dispatch_batch(
     // flows through the project-context seam without binding a project_id. The
     // pool's immutability invariant for anonymous contexts (stored > anonymous
     // path > config) preserves the existing per-thread workspace stickiness.
-    let project_override: Option<ProjectContext> = ws_resolved
+    let directive_project_override: Option<ProjectContext> = ws_resolved
         .as_ref()
         .and_then(|r| r.as_ref().ok())
         .map(|path| ProjectContext::anonymous(std::path::PathBuf::from(path)));
+
+    // Native workflow project authority is structured metadata supplied by AAP.
+    // It MUST take precedence over prompt-authored [[ws:...]] directives and over
+    // the daemon-wide [agent].working_dir fallback. A partial structured pair is
+    // rejected fail-closed rather than silently degrading to configured cwd.
+    let native_project_override: Option<ProjectContext> = match native_workflow.as_ref() {
+        Some(metadata) => {
+            let project_id = metadata
+                .project_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let project_root = metadata
+                .project_root
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+
+            match (project_id, project_root) {
+                (Some(project_id), Some(project_root)) => Some(ProjectContext {
+                    project_id: project_id.to_string(),
+                    project_root: std::path::PathBuf::from(project_root),
+                }),
+                (None, None) => None,
+                _ => {
+                    let error =
+                        "native workflow project authority requires project_id and project_root together";
+                    let _ = adapter
+                        .send_message(&dispatch_channel, &format!("⚠️ {error}"))
+                        .await;
+                    error!(
+                        session_key,
+                        workflow_run_id = %metadata.workflow_run_id,
+                        dispatch_id = %metadata.dispatch_id,
+                        "native project authority rejected: {error}"
+                    );
+                    return;
+                }
+            }
+        }
+        None => None,
+    };
+
+    let project_override = native_project_override
+        .as_ref()
+        .or(directive_project_override.as_ref());
 
     // Ensure session exists. The create_gate mutex inside get_or_create serializes
     // concurrent callers — only the winner gets created_now == true.
@@ -1233,7 +1279,7 @@ async fn dispatch_batch(
             }
         });
     let created_now = match target
-        .ensure_session(&session_key, project_override.as_ref(), write_policy_token)
+        .ensure_session(&session_key, project_override, write_policy_token)
         .await
     {
         Ok(created) => created,
@@ -2840,6 +2886,11 @@ mod tests {
         /// session-pool key it was invoked with. Tests assert this vector to
         /// prove the actual key the SessionPool would receive.
         session_keys_seen: Mutex<Vec<String>>,
+        /// Records the project context supplied to `ensure_session`.
+        /// This closes the native-work regression gap where tests verified
+        /// only the execution-session key while silently ignoring project
+        /// authority and therefore allowed fallback to `[agent].working_dir`.
+        projects_seen: Mutex<Vec<Option<ProjectContext>>>,
         /// Phase 6.4: optional AAP autonomous ingress client injected
         /// into the dispatch target. Tests use this to assert accept /
         /// reject / unavailable / auth-missing behavior.
@@ -2870,6 +2921,7 @@ mod tests {
                 stream_err: Mutex::new(None),
                 next_hook: Mutex::new(None),
                 session_keys_seen: Mutex::new(Vec::new()),
+                projects_seen: Mutex::new(Vec::new()),
                 autonomous_ingress_client: None,
                 autonomous_ingress_config: None,
                 workflow_reopen_client: None,
@@ -2890,6 +2942,10 @@ mod tests {
         /// to slip through).
         fn session_keys(&self) -> Vec<String> {
             self.session_keys_seen.lock().unwrap().clone()
+        }
+
+        fn projects_seen(&self) -> Vec<Option<ProjectContext>> {
+            self.projects_seen.lock().unwrap().clone()
         }
 
         /// Inject the hook that `stream_prompt_blocks` will return on the
@@ -2953,13 +3009,14 @@ mod tests {
         async fn ensure_session(
             &self,
             session_key: &str,
-            _project: Option<&ProjectContext>,
+            project: Option<&ProjectContext>,
             _write_policy: Option<&str>,
         ) -> Result<bool> {
             self.session_keys_seen
                 .lock()
                 .unwrap()
                 .push(session_key.to_string());
+            self.projects_seen.lock().unwrap().push(project.cloned());
             if let Some(msg) = self.ensure_err.lock().unwrap().take() {
                 return Err(anyhow::anyhow!(msg));
             }
@@ -4872,6 +4929,178 @@ mod tests {
                 .iter()
                 .any(|(message_id, _)| message_id == "222222222222222222"),
             "ordinary Discord turns must retain reaction calls: {reaction_calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_agent_work_passes_structured_project_context_to_session_pool() {
+        let mock = Arc::new(MockDispatchTarget::new());
+        let target: Arc<dyn DispatchTarget> = mock.clone();
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+
+        let project_root = tempfile::tempdir().unwrap();
+        let canonical_root = std::fs::canonicalize(project_root.path()).unwrap();
+
+        let mut msg = make_native_msg_targeted(
+            "implement the requested change",
+            "ArthurClaude",
+            "dispatch-project-context",
+            "1539923659345502208",
+        );
+
+        let metadata = msg
+            .native_workflow
+            .as_mut()
+            .expect("native metadata must exist");
+        metadata.project_id = Some("openab-workspace-persistence-20261007".into());
+        metadata.project_root = Some(canonical_root.display().to_string());
+
+        let dispatcher = Arc::new(Dispatcher::with_idle_timeout(
+            target,
+            10,
+            24_000,
+            BatchGrouping::Thread,
+            Duration::from_secs(60),
+        ));
+
+        dispatcher
+            .submit(
+                "native-project-context".into(),
+                make_channel("1539923659345502208"),
+                adapter,
+                msg,
+            )
+            .await
+            .expect("native submit should succeed");
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let projects = mock.projects_seen();
+        assert_eq!(projects.len(), 1);
+
+        let project = projects[0]
+            .as_ref()
+            .expect("native project context must reach ensure_session");
+
+        assert_eq!(project.project_id, "openab-workspace-persistence-20261007");
+        assert_eq!(project.project_root, canonical_root);
+    }
+
+    #[tokio::test]
+    async fn native_structured_project_context_overrides_ws_directive() {
+        let mock = Arc::new(MockDispatchTarget::new());
+        let target: Arc<dyn DispatchTarget> = mock.clone();
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+
+        let native_root = tempfile::tempdir().unwrap();
+        let directive_root = tempfile::tempdir().unwrap();
+
+        let native_root = std::fs::canonicalize(native_root.path()).unwrap();
+        let directive_root = std::fs::canonicalize(directive_root.path()).unwrap();
+
+        let mut msg = make_native_msg_targeted(
+            &format!(
+                "[[ws:{}]]\nimplement the requested change",
+                directive_root.display()
+            ),
+            "ArthurClaude",
+            "dispatch-project-precedence",
+            "1539923659345502208",
+        );
+
+        let metadata = msg
+            .native_workflow
+            .as_mut()
+            .expect("native metadata must exist");
+        metadata.project_id = Some("canonical-native-project".into());
+        metadata.project_root = Some(native_root.display().to_string());
+
+        let dispatcher = Arc::new(Dispatcher::with_idle_timeout(
+            target,
+            10,
+            24_000,
+            BatchGrouping::Thread,
+            Duration::from_secs(60),
+        ));
+
+        dispatcher
+            .submit(
+                "native-project-precedence".into(),
+                make_channel("1539923659345502208"),
+                adapter,
+                msg,
+            )
+            .await
+            .expect("native submit should succeed");
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let projects = mock.projects_seen();
+        assert_eq!(projects.len(), 1);
+
+        let project = projects[0]
+            .as_ref()
+            .expect("native project context must reach ensure_session");
+
+        assert_eq!(project.project_id, "canonical-native-project");
+        assert_eq!(
+            project.project_root, native_root,
+            "structured native project_root must outrank prompt-authored [[ws]]"
+        );
+        assert_ne!(project.project_root, directive_root);
+    }
+
+    #[tokio::test]
+    async fn native_partial_project_authority_fails_closed_before_session_creation() {
+        let mock = Arc::new(MockDispatchTarget::new());
+        let target: Arc<dyn DispatchTarget> = mock.clone();
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+
+        let mut msg = make_native_msg_targeted(
+            "implement the requested change",
+            "ArthurClaude",
+            "dispatch-partial-project",
+            "1539923659345502208",
+        );
+
+        let metadata = msg
+            .native_workflow
+            .as_mut()
+            .expect("native metadata must exist");
+        metadata.project_id = Some("project-without-root".into());
+        metadata.project_root = None;
+
+        let dispatcher = Arc::new(Dispatcher::with_idle_timeout(
+            target,
+            10,
+            24_000,
+            BatchGrouping::Thread,
+            Duration::from_secs(60),
+        ));
+
+        dispatcher
+            .submit(
+                "native-partial-project".into(),
+                make_channel("1539923659345502208"),
+                adapter,
+                msg,
+            )
+            .await
+            .expect("dispatcher admission itself should succeed");
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        assert!(
+            mock.session_keys().is_empty(),
+            "partial native project authority must fail before ensure_session"
+        );
+        assert!(
+            mock.projects_seen().is_empty(),
+            "partial native project authority must never reach the pool"
+        );
+        assert!(
+            mock.calls().is_empty(),
+            "partial native project authority must never start an ACP turn"
         );
     }
 
