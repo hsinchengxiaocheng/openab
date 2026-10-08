@@ -205,7 +205,12 @@ pub trait DispatchTarget: Send + Sync + 'static {
     ) -> Result<bool>;
 
     /// Destroy the session for `session_key` (used to rollback on directive failure).
-    async fn reset_session(&self, session_key: &str);
+    /// Keeps the thread's stored workspace and project binding: the rolled-back
+    /// turn did not create either, so rolling back must not orphan the next
+    /// message into the default `working_dir` or lose the project's fail-closed
+    /// mismatch authority. To explicitly forget the binding, the user issues
+    /// `reset_session` on the pool directly.
+    async fn discard_session(&self, session_key: &str);
 
     /// Return the canonical absolute path of the **pinned** project
     /// for `session_key`, or `None` if no project-pinned session
@@ -329,8 +334,8 @@ impl DispatchTarget for AdapterRouter {
         Ok(created)
     }
 
-    async fn reset_session(&self, session_key: &str) {
-        let _ = self.pool().reset_session(session_key).await;
+    async fn discard_session(&self, session_key: &str) {
+        let _ = self.pool().discard_session(session_key).await;
     }
 
     async fn pinned_project_root(&self, session_key: &str) -> Option<std::path::PathBuf> {
@@ -1301,10 +1306,13 @@ async fn dispatch_batch(
                 let title_to_apply = pr.metadata.title.clone();
 
                 // If workspace resolution failed on a NEW session, rollback and abort.
-                // Reset FIRST to minimize TOCTOU window (擺渡 F1), then rename.
+                // Discard FIRST to minimize TOCTOU window (擺渡 F1), then rename.
+                // discard_session keeps the thread's stored workspace and project
+                // binding — this turn never owned them, so we must not orphan the
+                // next message into the default working_dir.
                 if let Some(Err(e)) = ws_resolved {
-                    target.reset_session(&session_key).await;
-                    // Apply title after reset so the thread is identifiable.
+                    target.discard_session(&session_key).await;
+                    // Apply title after the discard so the thread is identifiable.
                     if let Some(ref title) = title_to_apply {
                         if !title.is_empty() {
                             let _ = adapter.rename_thread(&dispatch_channel, title).await;
@@ -3023,7 +3031,7 @@ mod tests {
             Ok(true)
         }
 
-        async fn reset_session(&self, _session_key: &str) {}
+        async fn discard_session(&self, _session_key: &str) {}
 
         async fn pinned_project_root(&self, _session_key: &str) -> Option<std::path::PathBuf> {
             self.pinned_project.as_ref().map(|p| p.project_root.clone())
@@ -4735,7 +4743,7 @@ mod tests {
         ) -> Result<bool> {
             Ok(true)
         }
-        async fn reset_session(&self, _session_key: &str) {}
+        async fn discard_session(&self, _session_key: &str) {}
         async fn pinned_project_root(&self, _session_key: &str) -> Option<std::path::PathBuf> {
             None
         }

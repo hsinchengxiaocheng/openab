@@ -546,8 +546,8 @@ async fn drive_native_turn(
             }
             Ok(created)
         }
-        async fn reset_session(&self, session_key: &str) {
-            let _ = self.0.pool().reset_session(session_key).await;
+        async fn discard_session(&self, session_key: &str) {
+            let _ = self.0.pool().discard_session(session_key).await;
         }
         async fn pinned_project_root(&self, session_key: &str) -> Option<PathBuf> {
             self.0

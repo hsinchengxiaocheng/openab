@@ -654,15 +654,28 @@ fn resolve_effective_workdir(
     (wd, None)
 }
 ///
-/// The single implementation for both hung eviction and [`SessionPool::reset_session`]; the latter
-/// removes `active` itself and then calls this. It used to be a second copy of the same list, which
-/// is how the two could drift — and the line most likely to be lost from a copy is the one below
-/// about the creating gate, because it says *not* to remove something.
+/// The single implementation for hung eviction and [`SessionPool::discard_session`]
+/// (the directive rollback path); both leave the thread's workspace and project
+/// binding in place. [`SessionPool::reset_session`] (the explicit user `/reset`
+/// path) instead goes through [`purge_for_reset`], which composes this helper
+/// with workspace + project-binding removal. Sharing the body rather than
+/// keeping a second copy is what keeps the two paths from drifting — the lines
+/// most likely to be lost from a duplicate are the ones that say *not* to
+/// remove something.
 ///
-/// Hung eviction must NOT leave the session resumable: the old streaming task still holds an Arc
-/// clone of the connection, so the agent process may be alive and mid-turn. If the session id
-/// stayed in `suspended`/`persisted`, the next message would `session/load` the same session while
-/// the old process still owns an in-flight turn.
+/// Hung eviction must NOT leave the session resumable: the old streaming task
+/// still holds an Arc clone of the connection, so the agent process may be
+/// alive and mid-turn. If the session id stayed in `suspended`/`persisted`,
+/// the next message would `session/load` the same session while the old
+/// process still owns an in-flight turn.
+///
+/// Workspace + project binding: per upstream semantic 99c11ec1 the
+/// anonymous workspace (`[[ws:...]]`) belongs to the *thread*, not to one
+/// ACP session, so it stays across hung/idle eviction and across directive
+/// rollback. A *pinned* project pair (non-empty `project_id`) is also kept
+/// across these non-user teardown paths so the existing project authority
+/// and the fail-closed mismatch check survive a hung rebuild — explicit
+/// `reset_session` is the only path that forgets them.
 fn purge_session_entries(state: &mut PoolState, key: &str) {
     state.cancel_handles.remove(key);
     state.activity.remove(key);
@@ -673,11 +686,25 @@ fn purge_session_entries(state: &mut PoolState, key: &str) {
     // state. Removing it while a holder still owns the old gate Arc would let
     // a concurrent get_or_create mint a fresh gate and run two creations for
     // the same key.
+    //
+    // Do NOT remove `session_workdirs` either: it is the thread's chosen
+    // workspace (anonymous `[[ws:...]]` or, when paired with `session_projects`,
+    // the pinned project root). Without it the replacement session starts in the
+    // default `working_dir`.
+    //
+    // Do NOT remove `session_projects`: it is the persisted project authority
+    // for the thread. Clearing it would (a) make a pinned rebuild silently fall
+    // back to the configured `working_dir` and (b) defeat the fail-closed
+    // mismatch check on the next pinned turn. Explicit `reset_session` clears
+    // it via [`purge_for_reset`].
+}
+
+/// [`purge_session_entries`], plus the thread's workspace and project binding.
+/// This is the *explicit* user-reset path: after it runs, the next
+/// `get_or_create` for `key` may pin a brand-new project from scratch.
+fn purge_for_reset(state: &mut PoolState, key: &str) {
+    purge_session_entries(state, key);
     state.session_workdirs.remove(key);
-    // Project bindings must be cleared alongside session_workdirs so a
-    // re-acquired thread key cannot accidentally inherit a stale project
-    // identity from a previous (different) session for the same key. The
-    // mismatch check is the live gate; persistence is the cross-restart one.
     state.session_projects.remove(key);
 }
 
@@ -711,6 +738,11 @@ async fn kill_pgid_after_grace(pgid: Option<i32>) {
 /// Remove a hung session from all pool maps. Returns true if the exact
 /// connection captured at classification time was still registered; when a
 /// fresh replacement exists for the key, nothing is touched.
+///
+/// Per upstream semantic 99c11ec1 the thread's workspace and project binding
+/// are NOT cleared here; only the resumable session state and the
+/// connection-discard locks are. Explicit `reset_session` is the only path
+/// that forgets the workspace / binding.
 ///
 /// Note: this helper intentionally does NOT touch
 /// `untrusted_project_keys`. The caller (the cleanup_idle loop) holds
@@ -780,13 +812,34 @@ impl SessionPool {
         default_config_options: HashMap<String, String>,
     ) -> Result<Self> {
         let openab_dir = Self::production_persistence_root()?;
-        Ok(Self::from_persistence_root(
+        Ok(Self::new_in(
             config,
             max_sessions,
             hung_threshold_secs,
             default_config_options,
             openab_dir,
         ))
+    }
+
+    /// [`Self::new`] with the persistence directory given explicitly.
+    /// Production callers use [`Self::new`]; tests use this constructor so
+    /// the on-disk `thread_map.json` / `session_meta.json` /
+    /// `session_projects.json` files live in a `tempfile::tempdir()` instead
+    /// of the user's real `~/.openab`.
+    fn new_in(
+        config: AgentConfig,
+        max_sessions: usize,
+        hung_threshold_secs: u64,
+        default_config_options: HashMap<String, String>,
+        openab_dir: PathBuf,
+    ) -> Self {
+        Self::from_persistence_root(
+            config,
+            max_sessions,
+            hung_threshold_secs,
+            default_config_options,
+            openab_dir,
+        )
     }
 
     /// Resolve and create the production persistence namespace.
@@ -1840,6 +1893,36 @@ impl SessionPool {
             state.session_workdirs.get(thread_id).cloned()
         };
 
+        // Phase 99c11ec1: when a stored workspace outranks a fresh
+        // directive (`[[ws:...]]` or a different project root), the user
+        // probably expected the new directive to win. Log a warning so the
+        // not-silent override is visible in dispatch traces and so
+        // `docs/workspaces.md`'s `/reset` guidance surfaces naturally.
+        //
+        // Suppress the warn when:
+        //   * there is no incoming project at all (legacy `None` path), or
+        //   * the incoming project_root matches the stored workspace
+        //     (the user is asking for the same thing they already have),
+        //   * the incoming project is the same pinned binding that
+        //     originally set the stored workspace (a re-pinned session
+        //     is expected to keep its workspace).
+        if let Some(incoming) = project {
+            let incoming_root = incoming.project_root.to_string_lossy().to_string();
+            let stored_matches_incoming = stored_workdir
+                .as_deref()
+                .map(|s| s == incoming_root)
+                .unwrap_or(false);
+            if !stored_matches_incoming && stored_workdir.is_some() {
+                warn!(
+                    thread_id = %crate::redact::redact_session_ids(thread_id),
+                    stored = %stored_workdir.as_deref().unwrap_or(""),
+                    incoming = %incoming_root,
+                    "stored workspace outranks incoming directive; thread keeps \
+                     its stored workspace until /reset is issued"
+                );
+            }
+        }
+
         // Use the pre-canonicalized form from Phase 2. resolve_effective_workdir
         // no longer re-validates the path; the canonical form is the
         // authoritative workdir AND the binding we will persist.
@@ -2542,10 +2625,54 @@ impl SessionPool {
     }
 
     /// Reset a session: cancel any in-flight operation, remove the active connection,
-    /// and clear all suspended state. The ACP process will be killed once the last
-    /// Arc reference is dropped (after streaming finishes). The next message will
-    /// trigger a fresh `get_or_create` with a new ACP session.
+    /// clear all suspended state, and forget the thread's workspace AND project
+    /// binding so the next message can pin a brand-new project. The ACP process
+    /// will be killed once the last Arc reference is dropped (after streaming
+    /// finishes). The next message will trigger a fresh `get_or_create` with a
+    /// new ACP session.
     pub async fn reset_session(&self, thread_id: &str) -> Result<()> {
+        if self.tear_down(thread_id, "reset", purge_for_reset).await? {
+            info!(thread_id = %crate::redact::redact_session_ids(thread_id), "session reset");
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "no session for thread {}",
+                crate::redact::redact_session_ids(thread_id)
+            ))
+        }
+    }
+
+    /// Tear down a session the current turn just created, for the directive
+    /// rollback path in `dispatch_batch`. Unlike [`Self::reset_session`] it
+    /// keeps the thread's workspace and project binding: on that path
+    /// `get_or_create` got no user override, so any stored binding predates
+    /// this turn and the user did not ask us to forget it.
+    ///
+    /// Always returns `Ok(())`: the directive-rollback path does not need
+    /// the "nothing to tear down" distinction that [`Self::reset_session`]
+    /// reports back to its caller.
+    pub async fn discard_session(&self, thread_id: &str) -> Result<()> {
+        self.tear_down(thread_id, "discard", purge_session_entries)
+            .await?;
+        Ok(())
+    }
+
+    /// Cancel any in-flight turn, drop the active connection, run `purge`,
+    /// and persist. `op` labels the call in the log. Returns whether the
+    /// thread had any of: an active connection, a resumable session id, a
+    /// stored workspace, or a stored project binding — anything that the
+    /// caller could legitimately call "this thread had session state".
+    ///
+    /// `purge` is either [`purge_session_entries`] (which keeps workspace +
+    /// project binding) or [`purge_for_reset`] (which forgets them); using a
+    /// function pointer rather than a second copy of the cleanup list keeps
+    /// the two paths from drifting.
+    async fn tear_down(
+        &self,
+        thread_id: &str,
+        op: &'static str,
+        purge: fn(&mut PoolState, &str),
+    ) -> Result<bool> {
         // Send session/cancel via the lock-free stdin handle first.
         // This stops in-flight streaming even while with_connection() holds the
         // connection mutex, so the old process finishes promptly.
@@ -2558,7 +2685,7 @@ impl SessionPool {
                 "method": "session/cancel",
                 "params": {"sessionId": session_id}
             }))?;
-            tracing::info!(session_id = %crate::redact::redact_session_ids(&session_id), "reset: sending session/cancel");
+            tracing::info!(session_id = %crate::redact::redact_session_ids(&session_id), "{op}: sending session/cancel");
             use tokio::io::AsyncWriteExt;
             let mut w = stdin.lock().await;
             let _ = w.write_all(data.as_bytes()).await;
@@ -2567,40 +2694,40 @@ impl SessionPool {
         }
 
         let mut state = self.state.write().await;
-        let had_active = state.active.remove(thread_id).is_some();
-        // Everything else a reset clears is exactly what hung eviction clears, including the rule
-        // that the creating gate survives. Call the one implementation rather than keeping a second
-        // copy of the list: the copies are what let the two drift, and the gate rule is precisely
-        // the kind of line that gets dropped from a duplicate without anyone noticing.
-        purge_session_entries(&mut state, thread_id);
-        // Resetting a hung session drops the map's Arc but not the one the stuck task holds, so the
-        // guard cannot revoke — do it synchronously here too (F3).
+        // Read the five membership flags BEFORE purge: purge_session_entries
+        // does not touch active, but purge_for_reset removes the workspace
+        // and project binding. A thread that had no active connection can
+        // still hold a resumable session id or a stored binding; that is
+        // "had state" for the reset path.
+        let had_active = state.active.contains_key(thread_id);
+        let had_suspended = state.suspended.contains_key(thread_id);
+        let had_persisted = state.persisted.contains_key(thread_id);
+        let had_workdir = state.session_workdirs.contains_key(thread_id);
+        let had_project = state.session_projects.contains_key(thread_id);
+        state.active.remove(thread_id);
+        purge(&mut state, thread_id);
+        // Resetting / discarding a hung session drops the map's Arc but not
+        // the one the stuck task holds, so the guard cannot revoke — do it
+        // synchronously here too (F3).
         #[cfg(feature = "acp-mcp")]
         revoke_facade_token_for_key(&mut state, thread_id, self.session_registrar.as_ref());
         self.save_mapping(&state.persisted);
         self.save_meta(&state.session_workdirs);
-        // Project binding must be cleared on reset so the next message can pin
-        // a fresh project context. Without this, a reset under thread_key T
-        // would carry over the previous session's project binding, and the
-        // mismatch check would refuse the new context against the OLD pin.
         self.save_projects(&state.session_projects);
-        // Drop the state write lock before touching the untrusted set.
+        // Drop the state write lock before touching the untrusted set
+        // (avoid nested write locks — the `untrusted_project_keys`
+        // RwLock is a separate lock that the gate consults and that
+        // test seams write to).
         drop(state);
-        // A reset removes this key's session entirely. The untrusted
-        // marker is tied to "this key might have a wrong binding for
-        // a resumable session"; once the session is gone, the marker
-        // is no longer relevant — a subsequent fresh pinned
-        // get_or_create under this key starts a clean slate.
+        // Both reset_session and discard_session take the key out of the
+        // untrusted set: the untrusted marker is "this key might have a
+        // wrong binding for a resumable session". Once the session id is
+        // gone, a subsequent pinned get_or_create under this key starts
+        // a clean slate and is no longer fail-closed.
         self.untrusted_project_keys.write().await.remove(thread_id);
-        if had_active {
-            info!(thread_id = %crate::redact::redact_session_ids(thread_id), "session reset");
-            Ok(())
-        } else {
-            Err(anyhow!(
-                "no session for thread {}",
-                crate::redact::redact_session_ids(thread_id)
-            ))
-        }
+
+        let had_state = had_active || had_suspended || had_persisted || had_workdir || had_project;
+        Ok(had_state)
     }
 
     pub async fn cleanup_idle(&self, ttl_secs: u64) {
@@ -2725,13 +2852,16 @@ impl SessionPool {
                     state.persisted.insert(key.clone(), sid.clone());
                     state.suspended.insert(key, sid);
                 } else {
+                    // No resumable session id: the connection was idle and
+                    // there is nothing to session/load back. The thread's
+                    // workspace (`[[ws:...]]`) and project binding
+                    // (`session_projects`) belong to the thread, not to the
+                    // evicted session — they survive here so the next
+                    // message lands in the same workspace and the
+                    // fail-closed mismatch gate still has a binding to
+                    // compare against. Explicit `reset_session` is the only
+                    // path that forgets them.
                     state.persisted.remove(&key);
-                    state.session_workdirs.remove(&key);
-                    // An idle-evicted session loses its project binding too:
-                    // the session is gone, and a future get_or_create under the
-                    // same thread_key must NOT inherit a project_id the new
-                    // call did not ask for.
-                    state.session_projects.remove(&key);
                     // The untrusted marker is also tied to "this key
                     // has a resumable session whose binding might be
                     // wrong". When the session is fully evicted (no
@@ -2752,11 +2882,12 @@ impl SessionPool {
                 // leaves `facade_tokens` alone.
                 #[cfg(feature = "acp-mcp")]
                 revoke_facade_token_for_key(&mut state, &key, self.session_registrar.as_ref());
-                // The key's project binding was just purged alongside the
-                // session state. The untrusted marker is no longer
-                // relevant: future calls under this key start fresh.
-                // Defer the untrusted-set removal to AFTER the state
-                // write lock is dropped (see post-loop block).
+                // Hung eviction kept the thread's workspace and project
+                // binding intact (semantic from upstream 99c11ec1), but the
+                // session id is gone. The untrusted marker is keyed off the
+                // "resumable session might have a wrong binding" predicate
+                // and is no longer relevant: capture the key for the
+                // post-state-lock removal below.
                 fully_evicted_keys.push(key);
             } else {
                 warn!(thread_id = %crate::redact::redact_session_ids(&key), "hung session was replaced before eviction; maps untouched");
@@ -2834,7 +2965,7 @@ impl SessionPool {
 mod tests {
     use super::{
         better_candidate, classify_hung, classify_idle, entry_phase, format_native_dispatch_key,
-        get_or_insert_gate, is_native_dispatch_key, phase_force_set, phase_load,
+        get_or_insert_gate, is_native_dispatch_key, phase_force_set, phase_load, purge_for_reset,
         purge_session_entries, remove_if_same_handle, PoolState, SessionPool, SessionPoolTestState,
     };
     use crate::acp::connection::SessionActivity;
@@ -3342,7 +3473,7 @@ mod tests {
     }
 
     #[test]
-    fn purge_session_entries_drops_all_entries_for_evicted_key_only() {
+    fn purge_session_entries_drops_resumable_state_for_evicted_key_only() {
         let mut state = PoolState {
             active: HashMap::new(),
             cancel_handles: HashMap::new(),
@@ -3374,7 +3505,14 @@ mod tests {
         assert!(!state.pgids.contains_key("hung"));
         assert!(!state.suspended.contains_key("hung"));
         assert!(!state.persisted.contains_key("hung"));
-        assert!(!state.session_workdirs.contains_key("hung"));
+        // Phase 99c11ec1: workspace belongs to the thread, not the evicted
+        // session. The replacement session must land back in it.
+        assert_eq!(
+            state.session_workdirs.get("hung").map(String::as_str),
+            Some("/tmp/ws"),
+        );
+        // No project binding was set in this fixture: anonymous workspace
+        // (no .pin / non-anonymous ProjectContext) → nothing to drop.
         assert!(!state.session_projects.contains_key("hung"));
         // The creating gate is concurrency control, not session state: it must
         // survive so an in-flight get_or_create holder stays serialized.
@@ -3580,10 +3718,14 @@ mod tests {
         );
     }
 
-    /// Project bindings survive a `purge_session_entries` call (req #F,
-    /// matches `purge_session_entries_drops_all_entries_for_evicted_key_only`).
+    /// Phase 99c11ec1: project bindings are NOT cleared by
+    /// `purge_session_entries` (the hung/idle eviction + directive-rollback
+    /// path). Explicit `purge_for_reset` IS the path that forgets them. This
+    /// test pins the new contract: the non-user teardown path keeps the
+    /// project binding so the fail-closed mismatch gate survives the next
+    /// pinned turn.
     #[test]
-    fn purge_session_entries_clears_project_binding() {
+    fn purge_session_entries_keeps_project_binding_for_evicted_key() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = PoolState {
             active: HashMap::new(),
@@ -3608,8 +3750,383 @@ mod tests {
         purge_session_entries(&mut state, "evicted");
 
         assert!(
+            state.session_projects.contains_key("evicted"),
+            "project binding must survive hung/idle eviction so the fail-closed \
+             mismatch gate still has a binding to compare against on the next turn; \
+             purge_for_reset is the explicit-user-reset path that forgets it"
+        );
+
+        // Confirm the explicit reset path DOES clear the binding.
+        purge_for_reset(&mut state, "evicted");
+        assert!(
             !state.session_projects.contains_key("evicted"),
-            "project binding must be cleared alongside other session state"
+            "purge_for_reset (used by reset_session) clears the binding"
+        );
+    }
+
+    // --- Phase 99c11ec1 (semantic) regression coverage ---
+    //
+    // The original bug (workflow #1556) was that hung eviction of a thread
+    // dropped its `[[ws:...]]` workspace, so the replacement session (e.g.
+    // a cron fire) started in the configured `working_dir` instead of the
+    // thread's chosen workspace. The fix splits the user-facing teardown
+    // into `reset_session` (forgets workspace + binding) and
+    // `discard_session` (keeps workspace + binding) and routes the
+    // directive rollback in `dispatch_batch` through `discard_session`.
+    //
+    // The tests below exercise the contract through `SessionPool::new_in`
+    // so the persistence files land in a tempdir rather than the user's
+    // real `~/.openab`.
+
+    /// A pool whose `thread_map.json` / `session_meta.json` /
+    /// `session_projects.json` live in `dir`, with these anonymous
+    /// `(thread, workspace)` pairs already stored and optional pinned
+    /// `(thread, project_id, project_root)` triples for non-anonymous
+    /// `ProjectContext` bindings. No active session is started for any
+    /// of the keys.
+    async fn pool_with_persisted_state(
+        dir: &std::path::Path,
+        anon_workspaces: &[(&str, &str)],
+        pinned: &[(&str, &str, &str)],
+    ) -> super::SessionPool {
+        let mut session_workdirs: HashMap<String, String> = anon_workspaces
+            .iter()
+            .map(|(thread, ws)| (thread.to_string(), ws.to_string()))
+            .collect();
+        let mut session_projects: HashMap<String, ProjectContext> = HashMap::new();
+        for (thread, project_id, project_root) in pinned {
+            let pc = ProjectContext {
+                project_id: (*project_id).into(),
+                project_root: std::path::PathBuf::from(*project_root),
+            };
+            session_workdirs.insert((*thread).to_string(), (*project_root).to_string());
+            session_projects.insert((*thread).to_string(), pc);
+        }
+        let pool = super::SessionPool::new_in(
+            crate::config::AgentConfig::default(),
+            1,
+            60,
+            HashMap::new(),
+            dir.to_path_buf(),
+        );
+        {
+            let mut state = pool.state.write().await;
+            state.session_workdirs = session_workdirs;
+            state.session_projects = session_projects;
+        }
+        pool
+    }
+
+    async fn workspaces_on_disk(dir: &std::path::Path) -> HashMap<String, String> {
+        serde_json::from_str(&std::fs::read_to_string(dir.join("session_meta.json")).unwrap())
+            .unwrap()
+    }
+
+    async fn projects_on_disk(dir: &std::path::Path) -> HashMap<String, ProjectContext> {
+        serde_json::from_str(&std::fs::read_to_string(dir.join("session_projects.json")).unwrap())
+            .unwrap()
+    }
+
+    /// Phase 99c11ec1 / req "Anonymous session workspace must survive
+    /// non-user teardown/eviction": after `discard_session` (the directive
+    /// rollback path), the thread's anonymous workspace is preserved —
+    /// both in memory and on disk. The replacement session must land
+    /// back in it, not the configured default.
+    #[tokio::test]
+    async fn discard_session_keeps_the_thread_workspace_and_project_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned_dir = tempfile::tempdir().unwrap();
+        let pinned_root = pinned_dir.path().to_string_lossy().to_string();
+        let pool = pool_with_persisted_state(
+            dir.path(),
+            &[("anon_thread", "/ws/anon"), ("anon_only", "/ws/anon2")],
+            &[("pinned_thread", "openab", &pinned_root)],
+        )
+        .await;
+
+        // Workspace + binding survive in-memory.
+        pool.discard_session("anon_thread").await.unwrap();
+        pool.discard_session("pinned_thread").await.unwrap();
+
+        let state = pool.state.read().await;
+        assert_eq!(
+            state
+                .session_workdirs
+                .get("anon_thread")
+                .map(String::as_str),
+            Some("/ws/anon"),
+            "anonymous workspace must survive discard_session"
+        );
+        assert_eq!(
+            state.session_workdirs.get("anon_only").map(String::as_str),
+            Some("/ws/anon2"),
+            "untouched thread survives"
+        );
+        assert!(
+            state.session_projects.contains_key("pinned_thread"),
+            "pinned project binding survives discard_session (matches upstream semantic)"
+        );
+        assert_eq!(
+            state
+                .session_projects
+                .get("pinned_thread")
+                .and_then(|p| Some(p.project_id.as_str())),
+            Some("openab"),
+            "project_id preserved"
+        );
+        drop(state);
+
+        // Workspace + binding also survive the durable snapshot.
+        let on_disk_ws = workspaces_on_disk(dir.path()).await;
+        assert_eq!(
+            on_disk_ws.get("anon_thread").map(String::as_str),
+            Some("/ws/anon"),
+            "anonymous workspace must persist across discard_session"
+        );
+        let on_disk_projects = projects_on_disk(dir.path()).await;
+        assert!(
+            on_disk_projects.contains_key("pinned_thread"),
+            "pinned project binding must persist across discard_session"
+        );
+    }
+
+    /// Phase 99c11ec1 / req "Explicit user reset must clear the session
+    /// so a new project can be pinned": after `reset_session`, BOTH the
+    /// anonymous workspace AND the pinned project binding are gone for
+    /// the reset thread only.
+    #[tokio::test]
+    async fn reset_session_forgets_the_workspace_and_project_binding_of_the_reset_thread_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned_dir = tempfile::tempdir().unwrap();
+        let pinned_root = pinned_dir.path().to_string_lossy().to_string();
+        let pool = pool_with_persisted_state(
+            dir.path(),
+            &[("anon_thread", "/ws/anon"), ("anon_only", "/ws/anon2")],
+            &[("pinned_thread", "openab", &pinned_root)],
+        )
+        .await;
+
+        // Reset the anonymous thread: workspace is forgotten, no project
+        // binding existed so nothing to clear there.
+        pool.reset_session("anon_thread")
+            .await
+            .expect("reset_session succeeds when workspace is the only state");
+
+        // Reset the pinned thread: workspace AND project binding cleared
+        // together (the "pinned pair cleared together" rule).
+        pool.reset_session("pinned_thread")
+            .await
+            .expect("reset_session succeeds when binding is the only state");
+
+        let state = pool.state.read().await;
+        assert!(!state.session_workdirs.contains_key("anon_thread"));
+        assert!(!state.session_projects.contains_key("anon_thread"));
+        assert!(!state.session_workdirs.contains_key("pinned_thread"));
+        assert!(!state.session_projects.contains_key("pinned_thread"));
+        // Untouched thread survives.
+        assert_eq!(
+            state.session_workdirs.get("anon_only").map(String::as_str),
+            Some("/ws/anon2")
+        );
+        drop(state);
+
+        // Persistence reflects the in-memory state.
+        let on_disk_ws = workspaces_on_disk(dir.path()).await;
+        assert!(!on_disk_ws.contains_key("anon_thread"));
+        assert!(!on_disk_ws.contains_key("pinned_thread"));
+        assert_eq!(
+            on_disk_ws.get("anon_only").map(String::as_str),
+            Some("/ws/anon2")
+        );
+        let on_disk_projects = projects_on_disk(dir.path()).await;
+        assert!(!on_disk_projects.contains_key("pinned_thread"));
+    }
+
+    /// `/reset` for a thread that only holds a resumable session id (no
+    /// active connection) is a successful reset: the session id is
+    /// cleared, and the new `reset_session` contract reports success
+    /// rather than the old "no active" error. Both `suspended` and
+    /// `persisted` map members are accepted as "had state".
+    #[tokio::test]
+    async fn reset_session_succeeds_for_a_thread_that_only_has_a_resumable_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool_with_persisted_state(dir.path(), &[], &[]).await;
+        {
+            let mut state = pool.state.write().await;
+            state
+                .suspended
+                .insert("suspended".to_string(), "session-1".to_string());
+            state
+                .persisted
+                .insert("persisted".to_string(), "session-2".to_string());
+        }
+
+        pool.reset_session("suspended")
+            .await
+            .expect("suspended-only thread is a successful reset");
+        pool.reset_session("persisted")
+            .await
+            .expect("persisted-only thread is a successful reset");
+
+        let state = pool.state.read().await;
+        assert!(!state.suspended.contains_key("suspended"));
+        assert!(!state.persisted.contains_key("persisted"));
+    }
+
+    /// A persisted project binding is itself resettable state even if a
+    /// damaged/legacy snapshot is missing the matching session_workdirs entry.
+    /// Reset must clear the binding and report success rather than claiming
+    /// that the thread had no session state.
+    #[tokio::test]
+    async fn reset_session_succeeds_for_a_thread_with_only_a_project_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned_dir = tempfile::tempdir().unwrap();
+        let pinned_root = pinned_dir.path().to_string_lossy().to_string();
+
+        let pool = pool_with_persisted_state(dir.path(), &[], &[]).await;
+
+        {
+            let mut state = pool.state.write().await;
+            state.session_projects.insert(
+                "binding_only".to_string(),
+                ProjectContext {
+                    project_id: "openab".into(),
+                    project_root: std::path::PathBuf::from(&pinned_root),
+                },
+            );
+        }
+
+        pool.reset_session("binding_only")
+            .await
+            .expect("project-binding-only state is a successful reset");
+
+        let state = pool.state.read().await;
+        assert!(!state.session_projects.contains_key("binding_only"));
+        drop(state);
+
+        let on_disk_projects = projects_on_disk(dir.path()).await;
+        assert!(!on_disk_projects.contains_key("binding_only"));
+    }
+
+    /// `/reset` for a thread the pool holds nothing for returns Err so the
+    /// `/reset` command handlers can reply with "no active session to
+    /// reset". Even with concurrent unrelated workspace / binding state, the
+    /// unknown-key path returns Err and leaves the unrelated state intact.
+    #[tokio::test]
+    async fn reset_session_fails_for_a_thread_with_no_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned_dir = tempfile::tempdir().unwrap();
+        let pinned_root = pinned_dir.path().to_string_lossy().to_string();
+        let pool = pool_with_persisted_state(
+            dir.path(),
+            &[("other", "/ws/other")],
+            &[("pinned_other", "openab", &pinned_root)],
+        )
+        .await;
+
+        let err = pool
+            .reset_session("unknown_thread")
+            .await
+            .expect_err("reset_session must error when the thread has no state");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no session") && msg.contains("unknown_thread"),
+            "error message must name the thread: {msg}"
+        );
+
+        // Unrelated state untouched.
+        let state = pool.state.read().await;
+        assert!(state.session_workdirs.contains_key("other"));
+        assert!(state.session_projects.contains_key("pinned_other"));
+    }
+
+    /// Hung-eviction simulation via `purge_session_entries`: the thread's
+    /// anonymous workspace AND pinned project binding survive the
+    /// non-user teardown, so a future message lands back in the same
+    /// workspace and the fail-closed mismatch gate still has a binding
+    /// to compare against. This is the regression test for issue #1556.
+    #[test]
+    fn hung_eviction_purge_keeps_workspace_and_pinned_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned_root = dir.path().to_string_lossy().to_string();
+        let mut state = PoolState {
+            active: HashMap::new(),
+            cancel_handles: HashMap::new(),
+            #[cfg(feature = "acp-mcp")]
+            facade_tokens: HashMap::new(),
+            activity: HashMap::from([("hung".to_string(), Arc::new(SessionActivity::new()))]),
+            pgids: HashMap::from([("hung".to_string(), 4321)]),
+            suspended: HashMap::from([("hung".to_string(), "session-hung".to_string())]),
+            persisted: HashMap::from([("hung".to_string(), "session-hung".to_string())]),
+            creating: HashMap::new(),
+            session_workdirs: HashMap::from([
+                ("anon".to_string(), "/ws/anon".to_string()),
+                ("pinned".to_string(), pinned_root.clone()),
+            ]),
+            session_projects: HashMap::from([(
+                "pinned".to_string(),
+                ProjectContext {
+                    project_id: "openab".into(),
+                    project_root: std::path::PathBuf::from(&pinned_root),
+                },
+            )]),
+        };
+
+        purge_session_entries(&mut state, "anon");
+        purge_session_entries(&mut state, "pinned");
+
+        // Resumable state gone for both.
+        assert!(!state.suspended.contains_key("anon"));
+        assert!(!state.persisted.contains_key("anon"));
+        assert!(!state.suspended.contains_key("pinned"));
+        assert!(!state.persisted.contains_key("pinned"));
+        // Workspace + binding survived for both.
+        assert_eq!(
+            state.session_workdirs.get("anon").map(String::as_str),
+            Some("/ws/anon")
+        );
+        assert_eq!(
+            state.session_workdirs.get("pinned").map(String::as_str),
+            Some(pinned_root.as_str())
+        );
+        assert!(
+            state.session_projects.contains_key("pinned"),
+            "pinned project binding survives hung eviction"
+        );
+    }
+
+    /// `dispatch_batch`'s directive-rollback path calls
+    /// `DispatchTarget::discard_session`, which delegates to
+    /// `SessionPool::discard_session`. The trait-method contract is
+    /// pinned by the `AdapterRouter` impl in dispatch.rs; this test
+    /// confirms the rename stuck by verifying the workspace + binding
+    /// survive the pool-level rollback (the trait delegation test would
+    /// require spinning up a full `AdapterRouter`, which is covered by
+    /// integration tests in the dispatch module).
+    #[tokio::test]
+    async fn pool_discard_session_keeps_workspace_and_pinned_binding_for_directive_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned_dir = tempfile::tempdir().unwrap();
+        let pinned_root = pinned_dir.path().to_string_lossy().to_string();
+        let pool = pool_with_persisted_state(
+            dir.path(),
+            &[("thread", "/ws/thread")],
+            &[("pinned_thread", "openab", &pinned_root)],
+        )
+        .await;
+
+        pool.discard_session("thread").await.unwrap();
+        pool.discard_session("pinned_thread").await.unwrap();
+
+        let state = pool.state.read().await;
+        assert_eq!(
+            state.session_workdirs.get("thread").map(String::as_str),
+            Some("/ws/thread"),
+            "anonymous workspace survives the directive-rollback path"
+        );
+        assert!(
+            state.session_projects.contains_key("pinned_thread"),
+            "pinned binding survives the directive-rollback path"
         );
     }
 
@@ -4453,13 +4970,17 @@ done
         // for T and starts a fresh session.
         //
         // `reset_session` returns `Err("no session for thread T")` when
-        // there is no active connection (the test seed has only
-        // persisted/suspended entries, no active), but it still
-        // executes `purge_session_entries` as a side effect — which is
-        // what clears the persisted entry. The .ok() here ignores the
-        // "no active" error so the test exercises the recovery path,
-        // not the no-op path.
-        let _ = pool.reset_session("T").await; // may be Err (no active); side effect clears persisted
+        // there is nothing to tear down (no active connection, no
+        // resumable session id, no stored workspace, no project
+        // binding). In this test seed T has a persisted session id
+        // (and any corresponding workdir / project binding), so the
+        // reset is `Ok(())` and the side effect clears the persisted
+        // entry AND forgets the binding. The .expect() below pins the
+        // "must succeed" path so future regressions cannot silently
+        // turn this reset into a no-op.
+        pool.reset_session("T")
+            .await
+            .expect("reset_session must succeed: T holds a persisted session");
         let created = pool
             .get_or_create("T", Some(&project))
             .await
