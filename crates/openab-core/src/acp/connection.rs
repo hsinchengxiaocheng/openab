@@ -1,8 +1,9 @@
 use crate::acp::protocol::{
-    parse_config_options, parse_usage_report, ConfigOption, JsonRpcMessage, JsonRpcRequest,
-    JsonRpcResponse, UsageReport,
+    parse_config_options, parse_usage_report, ConfigOption, JsonRpcErrorResponse, JsonRpcId,
+    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, UsageReport,
 };
 use anyhow::{anyhow, Result};
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -11,7 +12,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 /// Pick the most permissive selectable permission option from ACP options.
 fn pick_best_option(options: &[Value]) -> Option<String> {
@@ -633,6 +634,19 @@ fn build_agent_env(
 /// and forwards notifications + stale id-bearing messages to the active
 /// subscriber. Extracted as a free generic function so unit tests can drive
 /// it with `tokio::io::duplex()` halves instead of a real child process.
+async fn write_json_rpc_reply<W, T>(writer: &Arc<Mutex<W>>, reply: &T)
+where
+    W: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    if let Ok(mut data) = serde_json::to_vec(reply) {
+        data.push(b'\n');
+        let mut writer = writer.lock().await;
+        let _ = writer.write_all(&data).await;
+        let _ = writer.flush().await;
+    }
+}
+
 pub(crate) async fn run_reader_loop<R, W>(
     reader: R,
     writer: Arc<Mutex<W>>,
@@ -655,15 +669,23 @@ pub(crate) async fn run_reader_loop<R, W>(
                 break;
             }
         }
-        let msg: JsonRpcMessage = match serde_json::from_str(line.trim()) {
+        // Preserve field presence before typed deserialization:
+        // Option<Value> cannot distinguish result:null from an absent result.
+        let raw: Value = match serde_json::from_str(line.trim()) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let has_result = raw.get("result").is_some();
+        let has_error = raw.get("error").is_some();
+        let msg: JsonRpcMessage = match serde_json::from_value(raw) {
             Ok(m) => m,
             Err(_) => continue,
         };
         debug!(line = line.trim(), "acp_recv");
 
-        // Auto-reply session/request_permission
-        if msg.method.as_deref() == Some("session/request_permission") {
-            if let Some(id) = msg.id {
+        // Reverse requests must be classified before responses.
+        if let (Some(method), Some(agent_request_id)) = (msg.method.as_deref(), msg.id.clone()) {
+            if method == "session/request_permission" {
                 let title = msg
                     .params
                     .as_ref()
@@ -672,48 +694,82 @@ pub(crate) async fn run_reader_loop<R, W>(
                     .and_then(|t| t.as_str())
                     .unwrap_or("?");
 
+                // Preserve fork-specific permission policy.
                 let outcome = build_permission_response_with_policy(
                     msg.params.as_ref(),
                     write_policy_guard.as_deref(),
                 );
+
                 let policy_label = write_policy_guard
                     .as_deref()
                     .map(|g| g.label())
                     .unwrap_or("<unset>");
-                info!(title, write_policy = %policy_label, %outcome, "auto-respond permission");
-                let reply = JsonRpcResponse::new(id, outcome);
-                if let Ok(data) = serde_json::to_string(&reply) {
-                    let mut w = writer.lock().await;
-                    let _ = w.write_all(format!("{data}\n").as_bytes()).await;
-                    let _ = w.flush().await;
-                }
+
+                info!(
+                    title,
+                    write_policy = %policy_label,
+                    %outcome,
+                    "auto-respond permission"
+                );
+
+                let reply = JsonRpcResponse::new(agent_request_id, outcome);
+
+                write_json_rpc_reply(&writer, &reply).await;
+                continue;
             }
+
+            warn!(
+                method,
+                "unsupported agent-to-client request; replying -32601"
+            );
+
+            let reply = JsonRpcErrorResponse::new(
+                agent_request_id,
+                -32601,
+                format!("unsupported agent request method `{method}`"),
+            );
+
+            write_json_rpc_reply(&writer, &reply).await;
             continue;
         }
 
-        // Response (has id) → resolve pending AND forward to subscriber
-        if let Some(id) = msg.id {
-            let mut map = pending.lock().await;
-            if let Some(tx) = map.remove(&id) {
-                // Forward to subscriber so they see the completion
-                let sub = notify_tx.lock().await;
-                if let Some(ntx) = sub.as_ref() {
-                    // Clone the essential fields for the subscriber
-                    let _ = ntx.send(JsonRpcMessage {
-                        id: Some(id),
-                        method: None,
-                        result: msg.result.clone(),
-                        error: msg.error.clone(),
-                        params: None,
-                    });
+        // A response must contain exactly one of result or error.
+        // Explicit result:null is valid; error:null is not a valid error.
+        // Never allow malformed responses to resolve pending prompts or
+        // reach the adapter subscriber as terminal completions.
+        if msg.method.is_none()
+            && msg.id.is_some()
+            && (has_result == has_error || (has_error && msg.error.is_none()))
+        {
+            warn!("dropping malformed id-bearing response");
+            continue;
+        }
+
+        // Only numeric response IDs match outbound requests.
+        if msg.method.is_none() {
+            if let Some(id) = msg.id.as_ref().and_then(JsonRpcId::as_u64) {
+                let mut map = pending.lock().await;
+                if let Some(tx) = map.remove(&id) {
+                    // Forward to subscriber so they see the completion
+                    let sub = notify_tx.lock().await;
+                    if let Some(ntx) = sub.as_ref() {
+                        // Clone the essential fields for the subscriber
+                        let _ = ntx.send(JsonRpcMessage {
+                            id: msg.id.clone(),
+                            method: None,
+                            result: msg.result.clone(),
+                            error: msg.error.clone(),
+                            params: None,
+                        });
+                    }
+                    let _ = tx.send(msg);
+                    continue;
                 }
-                let _ = tx.send(msg);
-                continue;
+                // Stale id (#732): pending was already abandoned. Falls through
+                // to subscriber forwarding; the adapter recv loop filters by
+                // request_id so it can't leak into the next prompt.
+                trace!(request_id = id, "stale id-bearing message after abandon");
             }
-            // Stale id (#732): pending was already abandoned. Falls through
-            // to subscriber forwarding; the adapter recv loop filters by
-            // request_id so it can't leak into the next prompt.
-            trace!(request_id = id, "stale id-bearing message after abandon");
         }
 
         // Notification → forward to subscriber
@@ -2251,6 +2307,436 @@ mod reader_loop_tests {
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{mpsc, oneshot, Mutex};
 
+    /// An agent reverse request with the same numeric ID as an outbound
+    /// prompt must receive its own error reply without resolving that prompt.
+    #[tokio::test]
+    async fn reverse_request_id_collision_preserves_pending_response() {
+        let (mut agent_out, agent_in) = duplex(8192);
+        let (client_out, client_in) = duplex(8192);
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let notifications = Arc::new(Mutex::new(None));
+        let (tx, mut rx) = oneshot::channel();
+
+        pending.lock().await.insert(7, tx);
+
+        let handle = tokio::spawn(run_reader_loop(
+            agent_in,
+            Arc::new(Mutex::new(client_out)),
+            pending.clone(),
+            notifications,
+            None,
+        ));
+
+        agent_out
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"agent/unsupported\"}\n")
+            .await
+            .unwrap();
+
+        let mut reply_reader = BufReader::new(client_in);
+        let mut reply = String::new();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reply_reader.read_line(&mut reply),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let reply: serde_json::Value = serde_json::from_str(reply.trim()).unwrap();
+
+        assert_eq!(reply["id"], 7);
+        assert_eq!(reply["error"]["code"], -32601);
+        assert!(pending.lock().await.contains_key(&7));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        agent_out
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"stopReason\":\"end_turn\"}}\n")
+            .await
+            .unwrap();
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(response.id.unwrap().as_u64(), Some(7));
+        assert!(pending.lock().await.is_empty());
+
+        drop(agent_out);
+        handle.await.unwrap();
+    }
+
+    /// A malformed id-only frame must not resolve pending requests or
+    /// reach the subscriber as a false terminal completion.
+    #[tokio::test]
+    async fn id_only_frame_does_not_complete_or_forward() {
+        let (mut agent_out, agent_in) = duplex(8192);
+        let (client_out, _client_in) = duplex(8192);
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
+        let notifications = Arc::new(Mutex::new(Some(sub_tx)));
+        let (tx, rx) = oneshot::channel();
+
+        pending.lock().await.insert(9, tx);
+
+        let handle = tokio::spawn(run_reader_loop(
+            agent_in,
+            Arc::new(Mutex::new(client_out)),
+            pending.clone(),
+            notifications,
+            None,
+        ));
+
+        agent_out
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":9}\n")
+            .await
+            .unwrap();
+
+        // Send a valid response after the malformed frame to establish
+        // reader progress without relying on timing assumptions.
+        agent_out
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{\"stopReason\":\"end_turn\"}}\n")
+            .await
+            .unwrap();
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(response.id.unwrap().as_u64(), Some(9));
+        assert_eq!(response.result.as_ref().unwrap()["stopReason"], "end_turn");
+
+        let forwarded = tokio::time::timeout(std::time::Duration::from_secs(2), sub_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(forwarded.id.unwrap().as_u64(), Some(9));
+        assert_eq!(forwarded.result.as_ref().unwrap()["stopReason"], "end_turn");
+
+        assert!(sub_rx.try_recv().is_err());
+        assert!(pending.lock().await.is_empty());
+
+        drop(agent_out);
+        handle.await.unwrap();
+    }
+
+    /// Unsupported agent-to-client requests must preserve JSON-RPC IDs
+    /// rather than being mistaken for client-originated responses.
+    #[tokio::test]
+    async fn unsupported_reverse_requests_preserve_json_rpc_ids() {
+        use tokio::io::AsyncBufReadExt as _;
+
+        let (mut agent_out, agent_in) = duplex(8192);
+        let (client_out, client_in) = duplex(8192);
+
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let notifications = Arc::new(Mutex::new(None));
+
+        let handle = tokio::spawn(run_reader_loop(
+            agent_in,
+            Arc::new(Mutex::new(client_out)),
+            pending.clone(),
+            notifications,
+            None,
+        ));
+
+        let mut replies = BufReader::new(client_in);
+
+        for id in [
+            serde_json::json!("agent-request"),
+            serde_json::json!(-1),
+            serde_json::json!(i64::MIN),
+            serde_json::json!((i64::MAX as u64) + 1),
+            serde_json::json!(u64::MAX),
+        ] {
+            let request = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "agent/unsupported"
+            });
+
+            let line = format!("{}\n", request);
+
+            agent_out.write_all(line.as_bytes()).await.unwrap();
+            agent_out.flush().await.unwrap();
+
+            let mut reply_line = String::new();
+
+            let bytes = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                replies.read_line(&mut reply_line),
+            )
+            .await
+            .expect("reverse request reply timeout")
+            .expect("reverse request reply read failed");
+
+            assert!(bytes > 0);
+
+            let reply: serde_json::Value = serde_json::from_str(&reply_line).unwrap();
+
+            assert_eq!(reply["jsonrpc"], "2.0");
+            assert_eq!(reply["id"], id);
+            assert_eq!(reply["error"]["code"], -32601);
+            assert!(reply.get("result").is_none());
+            assert!(pending.lock().await.is_empty());
+        }
+
+        drop(agent_out);
+        handle.await.unwrap();
+    }
+
+    /// A READ_ONLY permission reverse request may reuse the numeric ID
+    /// of a client-originated prompt. It must not resolve that prompt
+    /// and must still enforce the write policy.
+    #[tokio::test]
+    async fn read_only_permission_id_collision_preserves_pending() {
+        use tokio::io::AsyncBufReadExt as _;
+
+        let guard = Arc::new(WritePolicyGuard::new());
+
+        let (mut agent_out, agent_in) = duplex(8192);
+        let (client_out, client_in) = duplex(8192);
+
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let notifications = Arc::new(Mutex::new(None));
+
+        let (tx, mut rx) = oneshot::channel();
+
+        pending.lock().await.insert(7, tx);
+
+        let handle = tokio::spawn(run_reader_loop(
+            agent_in,
+            Arc::new(Mutex::new(client_out)),
+            pending.clone(),
+            notifications,
+            Some(Arc::clone(&guard)),
+        ));
+
+        // Emulate updating the shared guard after reader creation.
+        guard.set(WRITE_POLICY_READ_ONLY);
+
+        // Reverse permission request deliberately collides with
+        // the pending outbound prompt's numeric ID.
+        let permission_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "session/request_permission",
+            "params": {
+                "toolCall": {"title": "Write"},
+                "options": [
+                    {
+                        "kind": "allow_always",
+                        "optionId": "always"
+                    }
+                ]
+            }
+        });
+
+        agent_out
+            .write_all(format!("{permission_request}\n").as_bytes())
+            .await
+            .unwrap();
+
+        agent_out.flush().await.unwrap();
+
+        let mut replies = BufReader::new(client_in);
+        let mut reply_line = String::new();
+
+        let bytes = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            replies.read_line(&mut reply_line),
+        )
+        .await
+        .expect("permission reply timeout")
+        .expect("permission reply read failure");
+
+        assert!(bytes > 0);
+
+        let reply: serde_json::Value = serde_json::from_str(&reply_line).unwrap();
+
+        assert_eq!(reply["jsonrpc"], "2.0");
+        assert_eq!(reply["id"], 7);
+        assert_eq!(
+            reply["result"],
+            serde_json::json!({
+                "outcome": {"outcome": "cancelled"}
+            })
+        );
+
+        // The reverse request must not resolve the prompt.
+        assert!(pending.lock().await.contains_key(&7));
+
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        // Now send the actual response for the pending prompt.
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "result": {
+                "stopReason": "end_turn"
+            }
+        });
+
+        agent_out
+            .write_all(format!("{response}\n").as_bytes())
+            .await
+            .unwrap();
+
+        agent_out.flush().await.unwrap();
+
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+            .await
+            .expect("pending prompt completion timeout")
+            .expect("pending prompt sender dropped");
+
+        assert_eq!(
+            completed
+                .id
+                .as_ref()
+                .and_then(crate::acp::protocol::JsonRpcId::as_u64),
+            Some(7)
+        );
+
+        assert_eq!(completed.result.as_ref().unwrap()["stopReason"], "end_turn");
+
+        assert!(pending.lock().await.is_empty());
+
+        drop(agent_out);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("reader shutdown timeout")
+            .expect("reader task panicked");
+    }
+
+    #[tokio::test]
+    async fn explicit_null_result_resolves_pending() {
+        let (mut agent_out, agent_in) = duplex(8192);
+        let (client_out, _client_in) = duplex(8192);
+
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
+        let notifications = Arc::new(Mutex::new(Some(sub_tx)));
+
+        let (tx, rx) = oneshot::channel();
+        pending.lock().await.insert(7, tx);
+
+        let handle = tokio::spawn(run_reader_loop(
+            agent_in,
+            Arc::new(Mutex::new(client_out)),
+            pending.clone(),
+            notifications,
+            None,
+        ));
+
+        agent_out
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":null}\n")
+            .await
+            .unwrap();
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+            .await
+            .expect("null response timeout")
+            .expect("pending sender dropped");
+
+        assert_eq!(response.id.unwrap().as_u64(), Some(7));
+        assert!(response.result.is_none());
+        assert!(response.error.is_none());
+
+        let forwarded = tokio::time::timeout(std::time::Duration::from_secs(2), sub_rx.recv())
+            .await
+            .expect("subscriber timeout")
+            .expect("subscriber closed");
+
+        assert_eq!(forwarded.id.unwrap().as_u64(), Some(7));
+        assert!(forwarded.error.is_none());
+        assert!(pending.lock().await.is_empty());
+
+        drop(agent_out);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn result_and_error_frame_does_not_complete_pending() {
+        let (mut agent_out, agent_in) = duplex(8192);
+        let (client_out, _client_in) = duplex(8192);
+
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
+        let notifications = Arc::new(Mutex::new(Some(sub_tx)));
+
+        let (tx, rx) = oneshot::channel();
+        pending.lock().await.insert(7, tx);
+
+        let handle = tokio::spawn(run_reader_loop(
+            agent_in,
+            Arc::new(Mutex::new(client_out)),
+            pending.clone(),
+            notifications,
+            None,
+        ));
+
+        agent_out
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":7,\
+                  \"result\":{},\
+                  \"error\":{\"code\":-1,\"message\":\"invalid\"}}\n",
+            )
+            .await
+            .unwrap();
+
+        // A valid response acts as a reader-progress barrier. Its content
+        // proves that the malformed response did not consume pending id=7.
+        agent_out
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":7,\
+                  \"result\":{\"stopReason\":\"end_turn\"}}\n",
+            )
+            .await
+            .unwrap();
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+            .await
+            .expect("valid response timeout")
+            .expect("pending sender dropped");
+
+        assert_eq!(response.result.as_ref().unwrap()["stopReason"], "end_turn");
+        assert!(response.error.is_none());
+
+        let forwarded = tokio::time::timeout(std::time::Duration::from_secs(2), sub_rx.recv())
+            .await
+            .expect("subscriber timeout")
+            .expect("subscriber closed");
+
+        assert_eq!(forwarded.result.as_ref().unwrap()["stopReason"], "end_turn");
+        assert!(forwarded.error.is_none());
+
+        assert!(sub_rx.try_recv().is_err());
+        assert!(pending.lock().await.is_empty());
+
+        drop(agent_out);
+        handle.await.unwrap();
+    }
+
     /// #732 stale-id path: when a response arrives for an id the broker has
     /// already abandoned, the reader must (a) not crash, (b) leave `pending`
     /// untouched, and (c) still forward the message to whoever is currently
@@ -2286,7 +2772,7 @@ mod reader_loop_tests {
             .await
             .expect("subscriber should receive stale message before timeout")
             .expect("subscriber channel should not be closed");
-        assert_eq!(forwarded.id, Some(42));
+        assert_eq!(forwarded.id, Some(JsonRpcId::from(42u64)));
         assert!(pending.lock().await.is_empty());
 
         drop(agent_stdout_writer);
@@ -2330,13 +2816,13 @@ mod reader_loop_tests {
             .await
             .expect("oneshot should resolve")
             .expect("oneshot should not be cancelled");
-        assert_eq!(resolved.id, Some(7));
+        assert_eq!(resolved.id, Some(JsonRpcId::from(7u64)));
 
         let forwarded = tokio::time::timeout(std::time::Duration::from_secs(2), sub_rx.recv())
             .await
             .expect("subscriber should receive forwarded copy")
             .expect("subscriber channel should not be closed");
-        assert_eq!(forwarded.id, Some(7));
+        assert_eq!(forwarded.id, Some(JsonRpcId::from(7u64)));
         assert!(pending.lock().await.is_empty());
 
         drop(agent_stdout_writer);
