@@ -7,11 +7,17 @@ OpenAB registers Discord slash commands for session control and agent management
 | Command | Description | Requires active session? |
 |---------|-------------|--------------------------|
 | `/models` | Select the AI model via dropdown menu | Yes |
+| `/effort` | Select the reasoning effort via dropdown menu | Yes |
 | `/agents` | Select the agent mode via dropdown menu | Yes |
 | `/cancel` | Cancel the current in-flight operation | Yes |
+| `/approve` | Approve the pending operation for this session | Yes |
+| `/deny` | Deny the pending operation for this session | Yes |
+| `/cancel-all` | Cancel the current operation and discard buffered messages | Yes |
 | `/reset` | Reset the conversation session (clear history, start fresh) | Yes |
 | `/auth` | Authenticate the backend agent via device flow (**DM-only**) | No |
 | `/remind` | Set a one-shot delayed reminder to mention users/roles | No |
+| `/usage` | Show backend account usage and billing information | Yes |
+| `/workflow` | Run the bounded workflow control surface | No |
 | `/export-thread` | Export thread/DM as `.txt` (default: last 100 messages) | No |
 
 All responses are **ephemeral** — only the user who invoked the command sees the reply.
@@ -20,17 +26,23 @@ All responses are **ephemeral** — only the user who invoked the command sees t
 
 | Platform | Supported | Notes |
 |----------|-----------|-------|
-| Discord (guild threads) | ✅ | Commands registered per-guild for instant availability |
+| Discord (guild threads) | ✅ | Commands registered globally; may take up to 1 hour to appear after first deploy |
 | Discord (DMs) | ✅ | Commands registered globally; may take up to 1 hour to appear after first deploy |
 | Slack | ❌ | Slack blocks third-party slash commands in threads; see [slack.md](slack.md#slash-commands-are-not-supported-on-slack) |
 
 ## How They Work
 
-### `/models` and `/agents`
+### `/models`, `/effort`, and `/agents`
 
 These read `configOptions` from the ACP `initialize` / `session/new` response and present them as a Discord Select Menu.
 
+`/models` uses the `model` category, `/effort` uses `thought_level`, and `/agents` uses `agent`. Each command is available only when the active backend advertises its category.
+
 When the user picks an option, OpenAB sends `session/set_config_option` to the ACP backend.
+
+#### `/effort` compatibility
+
+`/effort` is available only when the active CLI exposes an ACP `configOptions` entry with the `thought_level` category. OpenAB uses the backend-advertised values rather than hardcoding effort levels. If the category is unavailable, `/effort` shows: `⚠️ No reasoning effort options available. Start a conversation first by @mentioning the bot.`
 
 **Agent support varies:**
 

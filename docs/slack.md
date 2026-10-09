@@ -112,7 +112,7 @@ The bot will reply in a thread. After that, just type in the thread — no @ment
 
 ## Slash commands are not supported on Slack
 
-openab supports `/models`, `/agents`, and `/cancel` on **Discord**, but **not on Slack**. If you previously configured these commands in your Slack app's **Slash Commands** page, you can safely delete them — the Slack adapter ignores both `slash_commands` and `interactive` envelope types.
+openab supports `/models`, `/effort`, `/agents`, and `/cancel` on **Discord**, but **not on Slack**. If you previously configured these commands in your Slack app's **Slash Commands** page, you can safely delete them — the Slack adapter ignores both `slash_commands` and `interactive` envelope types.
 
 The root cause is a combination of three Slack-specific platform constraints, none of which is fixable from openab's side:
 

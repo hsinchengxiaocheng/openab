@@ -2223,88 +2223,7 @@ impl EventHandler for Handler {
         info!(user = %ready.user.name, "discord bot connected");
 
         // Build the shared command list once.
-        let commands = vec![
-            CreateCommand::new("models").description("Select the AI model for this session"),
-            CreateCommand::new("agents").description("Select the agent mode for this session"),
-            CreateCommand::new("cancel").description("Cancel the current operation"),
-            CreateCommand::new("approve")
-                .description("Approve the pending operation for this session"),
-            CreateCommand::new("deny").description("Deny the pending operation for this session"),
-            CreateCommand::new("cancel-all")
-                .description("Cancel current operation and drop all buffered messages"),
-            CreateCommand::new("reset").description("Reset the conversation session"),
-            CreateCommand::new("remind")
-                .description("Set a one-shot reminder to mention users/roles after a delay")
-                .add_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::String,
-                        "targets",
-                        "Users/roles to mention (e.g. @user1 @role1)",
-                    )
-                    .required(true),
-                )
-                .add_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::String,
-                        "message",
-                        "Reminder message",
-                    )
-                    .required(true),
-                )
-                .add_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::String,
-                        "delay",
-                        "Delay before firing (e.g. 30m, 2h, 1d)",
-                    )
-                    .required(true),
-                ),
-            CreateCommand::new("auth").description("Authenticate the backend agent (device flow)"),
-            CreateCommand::new("usage")
-                .description("Show backend account usage and billing information"),
-            // Phase 1.7.1 — native Discord ``/workflow`` Application Command.
-            //
-            // The bounded Tech Lead control surface is dispatched
-            // through a thin OpenAB adapter (see
-            // ``crate::workflow_command::WorkflowCommandAdapter``) into
-            // AAP Runtime's existing ``/workflow`` slash-command path
-            // so Runtime remains the sole mutation authority. Read-only
-            // subcommands may omit ``workflow_run_id`` and resolve it
-            // through canonical Discord conversation binding; mutations
-            // require ``workflow_run_id``, ``expected_revision`` and a
-            // ``reason`` (plus ``correction_spec`` for
-            // ``reopen-primary``, and the three canonical agent
-            // identities for ``reconfigure``). Runtime owns the
-            // CAS, the canonical reason vocabulary, and the
-            // self-verification refusal — OpenAB only registers the
-            // command shape and parses options.
-            //
-            // Subcommand option grammar mirrors Runtime's
-            // ``parse_workflow_slash_command`` closed vocabulary.
-            workflow_command_discord_registration(),
-            CreateCommand::new("export-thread")
-                .description("Download this thread as a text file")
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::Integer,
-                    "limit",
-                    "Export only the most recent N messages (1–5000)",
-                ))
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "since",
-                    "Export messages after this message ID",
-                ))
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::Integer,
-                    "days",
-                    "Export messages from the last N days (1–365)",
-                ))
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::Boolean,
-                    "all",
-                    "Export all messages (up to 5000). Default is last 100.",
-                )),
-        ];
+        let commands = discord_command_registrations();
 
         // Register global commands only. Registering the same commands per-guild
         // makes Discord show duplicate slash commands in guild command pickers.
@@ -2373,12 +2292,14 @@ impl EventHandler for Handler {
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         match interaction {
             Interaction::Command(cmd) if cmd.data.name == "models" => {
-                self.handle_config_command(&ctx, &cmd, "model", "model")
+                self.handle_config_command(&ctx, &cmd, "model").await;
+            }
+            Interaction::Command(cmd) if cmd.data.name == "effort" => {
+                self.handle_config_command(&ctx, &cmd, "thought_level")
                     .await;
             }
             Interaction::Command(cmd) if cmd.data.name == "agents" => {
-                self.handle_config_command(&ctx, &cmd, "agent", "agent")
-                    .await;
+                self.handle_config_command(&ctx, &cmd, "agent").await;
             }
             Interaction::Command(cmd) if cmd.data.name == "cancel" => {
                 self.handle_cancel_command(&ctx, &cmd).await;
@@ -2422,6 +2343,104 @@ impl EventHandler for Handler {
 }
 
 // --- Slash command & interaction handlers ---
+
+fn config_category_label(category: &str) -> Option<&'static str> {
+    match category {
+        "model" => Some("model"),
+        "agent" => Some("agent"),
+        "thought_level" => Some("reasoning effort"),
+        _ => None,
+    }
+}
+
+/// Returns whether a Discord config selection is still advertised by the ACP
+/// session snapshot. Only categories exposed by Discord config commands are
+/// accepted; all other ACP config categories fail closed.
+fn is_advertised_discord_config_selection(
+    options: &[ConfigOption],
+    config_id: &str,
+    selected_value: &str,
+) -> bool {
+    options.iter().any(|option| {
+        option.id == config_id
+            && option
+                .category
+                .as_deref()
+                .is_some_and(|category| matches!(category, "model" | "agent" | "thought_level"))
+            && option
+                .options
+                .iter()
+                .any(|value| value.value == selected_value)
+    })
+}
+
+/// The complete global Discord application-command inventory.
+///
+/// This is deliberately separate from `ready` so descriptor tests exercise the
+/// exact vector passed to `Command::set_global_commands`.
+fn discord_command_registrations() -> Vec<CreateCommand> {
+    vec![
+        CreateCommand::new("models").description("Select the AI model for this session"),
+        CreateCommand::new("effort").description("Select the reasoning effort for this session"),
+        CreateCommand::new("agents").description("Select the agent mode for this session"),
+        CreateCommand::new("cancel").description("Cancel the current operation"),
+        CreateCommand::new("approve").description("Approve the pending operation for this session"),
+        CreateCommand::new("deny").description("Deny the pending operation for this session"),
+        CreateCommand::new("cancel-all")
+            .description("Cancel current operation and drop all buffered messages"),
+        CreateCommand::new("reset").description("Reset the conversation session"),
+        CreateCommand::new("remind")
+            .description("Set a one-shot reminder to mention users/roles after a delay")
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "targets",
+                    "Users/roles to mention (e.g. @user1 @role1)",
+                )
+                .required(true),
+            )
+            .add_option(
+                CreateCommandOption::new(CommandOptionType::String, "message", "Reminder message")
+                    .required(true),
+            )
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "delay",
+                    "Delay before firing (e.g. 30m, 2h, 1d)",
+                )
+                .required(true),
+            ),
+        CreateCommand::new("auth").description("Authenticate the backend agent (device flow)"),
+        CreateCommand::new("usage")
+            .description("Show backend account usage and billing information"),
+        // Phase 1.7.1 — native Discord /workflow Application Command. Runtime owns
+        // mutation authority; OpenAB only registers and parses this bounded surface.
+        workflow_command_discord_registration(),
+        CreateCommand::new("export-thread")
+            .description("Download this thread as a text file")
+            .add_option(CreateCommandOption::new(
+                CommandOptionType::Integer,
+                "limit",
+                "Export only the most recent N messages (1–5000)",
+            ))
+            .add_option(CreateCommandOption::new(
+                CommandOptionType::String,
+                "since",
+                "Export messages after this message ID",
+            ))
+            .add_option(CreateCommandOption::new(
+                CommandOptionType::Integer,
+                "days",
+                "Export messages from the last N days (1–365)",
+            ))
+            .add_option(CreateCommandOption::new(
+                CommandOptionType::Boolean,
+                "all",
+                "Export all messages (up to 5000). Default is last 100.",
+            )),
+    ]
+}
 
 /// Parsed subcommand + options for a Discord ``/workflow`` command.
 ///
@@ -3347,8 +3366,30 @@ impl Handler {
         ctx: &Context,
         cmd: &serenity::model::application::CommandInteraction,
         category: &str,
-        label: &str,
     ) {
+        let Some(label) = config_category_label(category) else {
+            tracing::warn!(category, "unknown config category");
+            return;
+        };
+        // Slash-command user identity is present for both guild and DM
+        // interactions. Reuse the established interaction allowlist policy
+        // before reading any session configuration.
+        if is_denied_user(
+            false,
+            self.allow_all_users,
+            &self.allowed_users,
+            cmd.user.id.get(),
+        ) {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🚫 You are not allowed to use this bot.")
+                    .ephemeral(true),
+            );
+            if let Err(e) = cmd.create_response(&ctx.http, response).await {
+                tracing::error!(error = %e, category, "failed to deny config slash command");
+            }
+            return;
+        }
         let thread_key = format!("discord:{}", cmd.channel_id.get());
         let config_options = self.router.pool().get_config_options(&thread_key).await;
 
@@ -4352,6 +4393,25 @@ impl Handler {
         ctx: &Context,
         comp: &serenity::model::application::ComponentInteraction,
     ) {
+        // Components may outlive the command response. Re-check the same
+        // allowlist at selection time so a menu cannot be handed to, or used
+        // later by, an unauthorized interaction user.
+        if is_denied_user(
+            false,
+            self.allow_all_users,
+            &self.allowed_users,
+            comp.user.id.get(),
+        ) {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🚫 You are not allowed to use this bot.")
+                    .ephemeral(true),
+            );
+            if let Err(e) = comp.create_response(&ctx.http, response).await {
+                tracing::error!(error = %e, "failed to deny config select");
+            }
+            return;
+        }
         let config_id = comp
             .data
             .custom_id
@@ -4372,6 +4432,21 @@ impl Handler {
         };
 
         let thread_key = format!("discord:{}", comp.channel_id.get());
+        let config_options = self.router.pool().get_config_options(&thread_key).await;
+
+        if !is_advertised_discord_config_selection(&config_options, &config_id, &selected_value) {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content(
+                        "⚠️ This configuration option is stale or no longer available. Please reopen the command.",
+                    )
+                    .ephemeral(true),
+            );
+            if let Err(e) = comp.create_response(&ctx.http, response).await {
+                tracing::error!(error = %e, "failed to reject stale config select");
+            }
+            return;
+        }
 
         let result = self
             .router
@@ -4421,8 +4496,25 @@ impl Handler {
             _ => return,
         };
 
-        // Only allow known config categories.
-        if !matches!(category, "model" | "agent") {
+        let Some(label) = config_category_label(category) else {
+            tracing::warn!(category, "unknown config category in pagination");
+            return;
+        };
+
+        if is_denied_user(
+            false,
+            self.allow_all_users,
+            &self.allowed_users,
+            comp.user.id.get(),
+        ) {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🚫 You are not allowed to use this bot.")
+                    .ephemeral(true),
+            );
+            if let Err(e) = comp.create_response(&ctx.http, response).await {
+                tracing::error!(error = %e, "failed to deny config pagination");
+            }
             return;
         }
 
@@ -4432,12 +4524,12 @@ impl Handler {
         let response = match Self::build_config_components(&config_options, category, Some(page)) {
             Some(rows) => CreateInteractionResponse::UpdateMessage(
                 CreateInteractionResponseMessage::new()
-                    .content(format!("🔧 Select a {category}:"))
+                    .content(format!("🔧 Select a {label}:"))
                     .components(rows),
             ),
             None => CreateInteractionResponse::UpdateMessage(
                 CreateInteractionResponseMessage::new()
-                    .content(format!("⚠️ No {category} options available."))
+                    .content(format!("⚠️ No {label} options available."))
                     .components(vec![]),
             ),
         };
@@ -5406,10 +5498,235 @@ fn truncate_to_utf16_budget(body: &str, prefix: &str, suffix: &str, limit: usize
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::protocol::ConfigOptionValue;
     use crate::acp::ContentBlock;
     use crate::admission::{WorkAdmissionAck, WorkAdmissionError};
     use crate::bot_turns::{TurnResult, BOT_TURN_LIMIT_WARNING_PREFIX, HARD_BOT_TURN_LIMIT};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn config_option(category: &str, id: &str, value: &str) -> ConfigOption {
+        ConfigOption {
+            id: id.into(),
+            name: category.into(),
+            description: None,
+            category: Some(category.into()),
+            option_type: "select".into(),
+            current_value: value.into(),
+            options: vec![ConfigOptionValue {
+                value: value.into(),
+                name: value.into(),
+                description: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_select_uses_advertised_thought_level_id_and_value() {
+        let options = vec![config_option(
+            "thought_level",
+            "effort-id",
+            "backend-effort",
+        )];
+
+        let rows = Handler::build_config_components(&options, "thought_level", None).unwrap();
+        let CreateActionRow::SelectMenu(menu) = &rows[0] else {
+            panic!("expected thought_level select menu");
+        };
+        let menu = serde_json::to_value(menu).unwrap();
+        assert_eq!(menu["custom_id"], "acp_config_effort-id");
+        assert_eq!(menu["options"][0]["value"], "backend-effort");
+    }
+
+    #[test]
+    fn config_category_labels_include_thought_level_and_reject_unknown_categories() {
+        assert_eq!(config_category_label("model"), Some("model"));
+        assert_eq!(config_category_label("agent"), Some("agent"));
+        assert_eq!(
+            config_category_label("thought_level"),
+            Some("reasoning effort")
+        );
+        assert_eq!(config_category_label("unknown"), None);
+    }
+
+    #[test]
+    fn advertised_config_selection_accepts_thought_level_id_and_value() {
+        let options = vec![config_option("thought_level", "effort-id", "high")];
+
+        assert!(is_advertised_discord_config_selection(
+            &options,
+            "effort-id",
+            "high"
+        ));
+    }
+
+    #[test]
+    fn advertised_config_selection_rejects_stale_thought_level_id() {
+        let options = vec![config_option("thought_level", "current-effort-id", "high")];
+
+        assert!(!is_advertised_discord_config_selection(
+            &options,
+            "stale-effort-id",
+            "high"
+        ));
+    }
+
+    #[test]
+    fn advertised_config_selection_rejects_stale_thought_level_value() {
+        let options = vec![config_option("thought_level", "effort-id", "high")];
+
+        assert!(!is_advertised_discord_config_selection(
+            &options,
+            "effort-id",
+            "low"
+        ));
+    }
+
+    #[test]
+    fn advertised_config_selection_rejects_unknown_category() {
+        let options = vec![config_option("mode", "mode-id", "bypass")];
+
+        assert!(!is_advertised_discord_config_selection(
+            &options, "mode-id", "bypass"
+        ));
+    }
+
+    #[test]
+    fn advertised_config_selection_preserves_model_and_agent_options() {
+        let options = vec![
+            config_option("model", "model-id", "model-value"),
+            config_option("agent", "agent-id", "agent-value"),
+        ];
+
+        assert!(is_advertised_discord_config_selection(
+            &options,
+            "model-id",
+            "model-value"
+        ));
+        assert!(is_advertised_discord_config_selection(
+            &options,
+            "agent-id",
+            "agent-value"
+        ));
+    }
+
+    #[test]
+    fn advertised_config_selection_rejects_matching_id_in_unexpected_category() {
+        let options = vec![config_option("mode", "model-id", "model-value")];
+
+        assert!(!is_advertised_discord_config_selection(
+            &options,
+            "model-id",
+            "model-value"
+        ));
+    }
+
+    #[test]
+    fn rejected_config_selection_does_not_reach_mutation_decision() {
+        let options = vec![config_option("thought_level", "effort-id", "high")];
+        let mut set_config_option_calls = 0;
+
+        if is_advertised_discord_config_selection(&options, "stale-effort-id", "high") {
+            set_config_option_calls += 1;
+        }
+
+        assert_eq!(set_config_option_calls, 0);
+    }
+
+    #[test]
+    fn missing_thought_level_has_no_menu_without_affecting_model_or_agent_menus() {
+        let options = vec![
+            config_option("model", "model-id", "model-value"),
+            config_option("agent", "agent-id", "agent-value"),
+        ];
+
+        assert!(Handler::build_config_components(&options, "thought_level", None).is_none());
+        assert!(Handler::build_config_components(&options, "model", None).is_some());
+        assert!(Handler::build_config_components(&options, "agent", None).is_some());
+    }
+
+    #[test]
+    fn pagination_accepts_thought_level_category() {
+        assert!(config_category_label("thought_level").is_some());
+    }
+
+    #[test]
+    fn global_command_descriptors_preserve_effort_workflow_and_existing_order() {
+        let commands = serde_json::to_value(discord_command_registrations())
+            .expect("serialize global Discord command descriptors");
+        let commands = commands.as_array().expect("command descriptor array");
+        let names: Vec<_> = commands
+            .iter()
+            .map(|command| command["name"].as_str().expect("command name"))
+            .collect();
+
+        assert_eq!(
+            names,
+            [
+                "models",
+                "effort",
+                "agents",
+                "cancel",
+                "approve",
+                "deny",
+                "cancel-all",
+                "reset",
+                "remind",
+                "auth",
+                "usage",
+                "workflow",
+                "export-thread",
+            ]
+        );
+        assert_eq!(names.iter().filter(|&&name| name == "effort").count(), 1);
+        assert!(names.contains(&"approve"));
+        assert!(names.contains(&"deny"));
+
+        let workflow = commands
+            .iter()
+            .find(|command| command["name"] == "workflow")
+            .expect("/workflow descriptor");
+        let subcommands: Vec<_> = workflow["options"]
+            .as_array()
+            .expect("/workflow subcommands")
+            .iter()
+            .map(|option| option["name"].as_str().expect("workflow subcommand name"))
+            .collect();
+        assert_eq!(
+            subcommands,
+            [
+                "status",
+                "diagnose",
+                "history",
+                "agents",
+                "reopen-primary",
+                "reopen-work",
+                "recover",
+                "reconfigure",
+            ]
+        );
+    }
+
+    #[test]
+    fn config_interaction_allowlist_rejects_denied_users_and_accepts_allowed_users() {
+        let allowed = HashSet::from([100]);
+
+        // CommandInteraction.user and ComponentInteraction.user are the actor
+        // identity for both DMs and guilds. Config commands use this exact
+        // existing helper invocation before pool reads or writes.
+        assert!(is_denied_user(false, false, &allowed, 999));
+        assert!(!is_denied_user(false, false, &allowed, 100));
+        assert!(!is_denied_user(false, true, &allowed, 999));
+    }
+
+    #[test]
+    fn stale_config_menu_cannot_bypass_the_interaction_allowlist() {
+        let allowed = HashSet::from([100]);
+
+        // A component from a menu created by user 100 is authorized from the
+        // clicking interaction's user ID, not the original menu creator.
+        assert!(is_denied_user(false, false, &allowed, 999));
+        assert!(!is_denied_user(false, false, &allowed, 100));
+    }
 
     // -----------------------------------------------------------------
     // Targeted mention normalization — bounded fix regression.
